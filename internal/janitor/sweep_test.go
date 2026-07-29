@@ -354,6 +354,12 @@ func (s *fakeStore) setJanitorLocked(userID string, lockedAt time.Time) {
 	s.janitorLocks[userID] = lockedAt
 }
 
+func (s *fakeStore) setPendingLock(userID string, beganAt time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingLocks[userID] = beganAt
+}
+
 func (s *fakeStore) LockerHighWaterMark(ctx context.Context, key string) (time.Time, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -551,6 +557,33 @@ func TestSweep_DoesNotReverseExternalLockOnVerifiedAccount(t *testing.T) {
 	}
 	if _, found := store.janitorLocks["u-externally-locked"]; found {
 		t.Error("stale janitor provenance was not cleared for the newer external lock")
+	}
+}
+
+func TestSweep_DoesNotAdoptExternalLockAfterAbandonedIntent(t *testing.T) {
+	mas := newFakeMAS("locker-client", "s3cr3t")
+	user := mas.addUser("u-abandoned-intent", "abandonedintent", time.Now().Add(-72*time.Hour))
+	lockedAt := time.Now().Add(-time.Hour)
+	user.lockedAt = &lockedAt
+
+	store := newFakeStore()
+	store.setVerified("@abandonedintent:"+serverName, true)
+	store.setPendingLock("u-abandoned-intent", lockedAt.Add(-2*pendingLockMaxCommitDelay))
+
+	cfg := Config{LockAfterHours: 48}
+	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
+
+	if err := sweeper.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if len(mas.unlockCalls) != 0 {
+		t.Errorf("unlockCalls = %v, want none for external lock after abandoned intent", mas.unlockCalls)
+	}
+	if user.lockedAt == nil {
+		t.Error("external lock after abandoned intent was erased")
+	}
+	if _, found := store.pendingLocks["u-abandoned-intent"]; found {
+		t.Error("abandoned intent was not cleared")
 	}
 }
 

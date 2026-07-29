@@ -17,6 +17,11 @@ import (
 // digestHighWaterKey is the internal/db locker_state row this package reads/advances.
 const digestHighWaterKey = "digest_high_water"
 
+// MAS applies a lock synchronously before returning the HTTP response. Its client timeout is 30s,
+// so a locked_at more than one minute after a durable intent cannot have been produced by that
+// call (for example, the process crashed after writing intent but before sending the request).
+const pendingLockMaxCommitDelay = time.Minute
+
 // Config holds one Sweeper's tunables — see cmd/janitor for how these map to env vars.
 type Config struct {
 	// LockAfterHours: an account must be at least this old, unclaimed, and email-less to be
@@ -165,9 +170,9 @@ func (s *Sweeper) sweepLocks(
 			// A durable intent plus a locked MAS account means an earlier call committed but
 			// crashed/lost its response before confirmation. Adopt the exact observed timestamp.
 			if pending {
-				if u.LockedAt.Before(pendingAt) {
-					// The lock predates our durable intent, so an operator won the race between
-					// the MAS list snapshot and LockUser. Relinquish intent; never adopt/unlock it.
+				if !lockMatchesIntent(*u.LockedAt, pendingAt) {
+					// A timestamp outside the causal request window belongs to an external lock:
+					// it either predates intent, or happened after a crash before the request.
 					if s.cfg.DryRun {
 						log.Info("would clear intent for pre-existing external lock (dry run)")
 					} else if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
@@ -294,9 +299,9 @@ func (s *Sweeper) sweepLocks(
 			log.Error("lock failed", "error", err)
 			continue
 		}
-		if lockedAt.Before(intentAt) {
-			// MAS lock is idempotent. A timestamp older than our pre-call intent proves an
-			// operator locked the user after the list snapshot but before this POST.
+		if !lockMatchesIntent(lockedAt, intentAt) {
+			// MAS lock is idempotent. A timestamp outside the causal request window proves this
+			// response describes an external lock, not a new lock created by this call.
 			log.Warn("external lock won pre-call race; refusing janitor ownership",
 				"locked_at", lockedAt, "intent_at", intentAt)
 			if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
@@ -347,6 +352,11 @@ func (s *Sweeper) sweepLocks(
 	slog.Info("janitor: lock sweep complete",
 		"locked", locked, "unlocked", unlocked, "skipped", skipped,
 		"considered", len(users), "dry_run", s.cfg.DryRun)
+}
+
+func lockMatchesIntent(lockedAt, intentAt time.Time) bool {
+	delay := lockedAt.Sub(intentAt)
+	return delay >= 0 && delay <= pendingLockMaxCommitDelay
 }
 
 // skipReason returns why u should NOT be locked, or "" if it should be.
