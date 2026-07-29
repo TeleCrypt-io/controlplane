@@ -120,7 +120,7 @@ func (s *Sweeper) mxid(username string) string {
 // Errors acting on one account are logged and don't stop the rest of the sweep.
 func (s *Sweeper) sweepLocks(ctx context.Context, users []masadmin.User, hasEmail, verified map[string]bool) {
 	cutoff := time.Now().Add(-time.Duration(s.cfg.LockAfterHours) * time.Hour)
-	locked, unlocked, skipped := 0, 0
+	locked, unlocked, skipped := 0, 0, 0
 
 	for _, u := range users {
 		mxid := s.mxid(u.Username)
