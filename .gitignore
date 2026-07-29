@@ -1,2 +1,4 @@
 /redpill
 *.test
+__pycache__/
+*.py[cod]

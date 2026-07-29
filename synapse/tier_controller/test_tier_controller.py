@@ -5,7 +5,6 @@ Then: docker run --rm --user 0:0 --entrypoint sh tier-controller:test -c
 'python -m pip install pytest==9.0.2 pytest-asyncio==1.4.0 && cd /modules/tier_controller &&
 python -m pytest -v test_tier_controller.py'
 """
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -222,43 +221,21 @@ async def test_db_error_fails_closed_on_room_create():
 
 
 @pytest.mark.asyncio
-async def test_cache_avoids_second_db_call():
-    module, api = make_module(user_types={"@a:x": "unverified"})
-    calls = {"n": 0}
-    original = api.run_db_interaction
+async def test_user_type_grant_and_revocation_are_visible_immediately():
+    module, api = make_module(user_types={"@a:x": None})
+    assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
 
-    async def counting(desc, func):
-        calls["n"] += 1
-        return await original(desc, func)
+    api.user_types["@a:x"] = "verified"
+    assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is True
 
-    api.run_db_interaction = counting
-    await module._get_user_type("@a:x")
-    await module._get_user_type("@a:x")
-    assert calls["n"] == 1
+    api.user_types["@a:x"] = None
+    assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
 
 
 @pytest.mark.asyncio
-async def test_cache_expires_after_ttl(monkeypatch):
-    module, api = make_module(user_types={"@a:x": "unverified"})
-    calls = {"n": 0}
-    original = api.run_db_interaction
-
-    async def counting(desc, func):
-        calls["n"] += 1
-        return await original(desc, func)
-
-    api.run_db_interaction = counting
-    now = {"value": 1000.0}
-    monkeypatch.setattr(time, "monotonic", lambda: now["value"])
-    await module._get_user_type("@a:x")
-    now["value"] += 31.0
-    await module._get_user_type("@a:x")
-    assert calls["n"] == 2
-
-
-@pytest.mark.asyncio
-async def test_db_error_result_not_cached():
+async def test_db_error_recovers_on_next_decision():
     module, api = make_module(user_types={"@a:x": "verified"}, db_error=True)
-    await module._get_user_type("@a:x")
+    assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
+
     api.db_error = False
-    assert await module._get_user_type("@a:x") == "verified"
+    assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is True
