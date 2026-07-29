@@ -253,44 +253,65 @@ func listQuery(after string) string {
 	return v.Encode()
 }
 
-// LockUser locks the given MAS user (by ULID) — reversible, not a deactivation. Returns
-// ErrUserNotFound if MAS reports no such user.
-func (c *Client) LockUser(ctx context.Context, userID string) error {
-	return c.setUserLock(ctx, userID, "lock")
+// LockUser locks the given MAS user (by ULID) — reversible, not a deactivation — and returns
+// MAS's exact locked_at timestamp for durable provenance. Returns ErrUserNotFound if MAS reports
+// no such user.
+func (c *Client) LockUser(ctx context.Context, userID string) (time.Time, error) {
+	attrs, err := c.setUserLock(ctx, userID, "lock")
+	if err != nil {
+		return time.Time{}, err
+	}
+	if attrs.LockedAt == nil {
+		return time.Time{}, fmt.Errorf("masadmin: lock user %s: response had no locked_at", userID)
+	}
+	return *attrs.LockedAt, nil
 }
 
 // UnlockUser removes the reversible lock from the given MAS user (by ULID). It does not
 // reactivate a deactivated user. Returns ErrUserNotFound if MAS reports no such user.
 func (c *Client) UnlockUser(ctx context.Context, userID string) error {
-	return c.setUserLock(ctx, userID, "unlock")
-}
-
-func (c *Client) setUserLock(ctx context.Context, userID, action string) error {
-	token, err := c.token(ctx)
+	attrs, err := c.setUserLock(ctx, userID, "unlock")
 	if err != nil {
 		return err
+	}
+	if attrs.LockedAt != nil {
+		return fmt.Errorf("masadmin: unlock user %s: response still had locked_at", userID)
+	}
+	return nil
+}
+
+func (c *Client) setUserLock(ctx context.Context, userID, action string) (userAttrs, error) {
+	token, err := c.token(ctx)
+	if err != nil {
+		return userAttrs{}, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.baseURL+"/api/admin/v1/users/"+url.PathEscape(userID)+"/"+action, nil)
 	if err != nil {
-		return err
+		return userAttrs{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("masadmin: %s user %s: %w", action, userID, err)
+		return userAttrs{}, fmt.Errorf("masadmin: %s user %s: %w", action, userID, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return fmt.Errorf("%w: %s", ErrUserNotFound, userID)
+		return userAttrs{}, fmt.Errorf("%w: %s", ErrUserNotFound, userID)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("masadmin: %s user %s: %s", action, userID, describeError(resp))
+		return userAttrs{}, fmt.Errorf("masadmin: %s user %s: %s", action, userID, describeError(resp))
 	}
-	return nil
+	var out struct {
+		Data resource[userAttrs] `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return userAttrs{}, fmt.Errorf("masadmin: decode %s user %s: %w", action, userID, err)
+	}
+	return out.Data.Attributes, nil
 }
 
 // get issues an authenticated GET against path (relative to baseURL) and decodes a 200 JSON body

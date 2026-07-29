@@ -134,38 +134,59 @@ func TestJanitorLockProvenance(t *testing.T) {
 	store, _ := newTestStore(t)
 	ctx := context.Background()
 
-	locks, err := store.JanitorLockedUserIDs(ctx)
+	confirmed, pending, err := store.JanitorLockState(ctx)
 	if err != nil {
-		t.Fatalf("JanitorLockedUserIDs (empty): %v", err)
+		t.Fatalf("JanitorLockState (empty): %v", err)
 	}
-	if len(locks) != 0 {
-		t.Fatalf("initial janitor locks = %v, want empty", locks)
+	if len(confirmed) != 0 || len(pending) != 0 {
+		t.Fatalf("initial janitor state = confirmed %v pending %v, want empty", confirmed, pending)
 	}
 
-	if err := store.RecordJanitorLock(ctx, "mas-user-1"); err != nil {
-		t.Fatalf("RecordJanitorLock: %v", err)
+	if _, err := store.BeginJanitorLock(ctx, "mas-user-1"); err != nil {
+		t.Fatalf("BeginJanitorLock: %v", err)
 	}
-	if err := store.RecordJanitorLock(ctx, "mas-user-2"); err != nil {
-		t.Fatalf("RecordJanitorLock second: %v", err)
+	if _, err := store.BeginJanitorLock(ctx, "mas-user-2"); err != nil {
+		t.Fatalf("BeginJanitorLock second: %v", err)
 	}
 
-	locks, err = store.JanitorLockedUserIDs(ctx)
+	confirmed, pending, err = store.JanitorLockState(ctx)
 	if err != nil {
-		t.Fatalf("JanitorLockedUserIDs: %v", err)
+		t.Fatalf("JanitorLockState after begin: %v", err)
 	}
-	if !locks["mas-user-1"] || !locks["mas-user-2"] || len(locks) != 2 {
-		t.Fatalf("janitor locks = %v, want both MAS user IDs", locks)
+	if len(confirmed) != 0 || pending["mas-user-1"].IsZero() || pending["mas-user-2"].IsZero() || len(pending) != 2 {
+		t.Fatalf("janitor state after begin = confirmed %v pending %v, want two intents", confirmed, pending)
+	}
+
+	lockedAt := time.Date(2026, 7, 29, 22, 0, 0, 123456000, time.UTC)
+	if err := store.ConfirmJanitorLock(ctx, "mas-user-1", lockedAt); err != nil {
+		t.Fatalf("ConfirmJanitorLock: %v", err)
+	}
+	confirmed, pending, err = store.JanitorLockState(ctx)
+	if err != nil {
+		t.Fatalf("JanitorLockState after confirm: %v", err)
+	}
+	if !confirmed["mas-user-1"].Equal(lockedAt) || len(confirmed) != 1 {
+		t.Fatalf("confirmed locks = %v, want exact locked_at for mas-user-1", confirmed)
+	}
+	if _, found := pending["mas-user-1"]; found {
+		t.Fatal("confirmation did not atomically clear mas-user-1 intent")
+	}
+	if pending["mas-user-2"].IsZero() || len(pending) != 1 {
+		t.Fatalf("pending locks = %v, want only mas-user-2", pending)
 	}
 
 	if err := store.DeleteJanitorLock(ctx, "mas-user-1"); err != nil {
 		t.Fatalf("DeleteJanitorLock: %v", err)
 	}
-	locks, err = store.JanitorLockedUserIDs(ctx)
-	if err != nil {
-		t.Fatalf("JanitorLockedUserIDs after delete: %v", err)
+	if err := store.DeleteJanitorLock(ctx, "mas-user-2"); err != nil {
+		t.Fatalf("DeleteJanitorLock pending: %v", err)
 	}
-	if locks["mas-user-1"] || !locks["mas-user-2"] || len(locks) != 1 {
-		t.Fatalf("janitor locks after delete = %v, want only mas-user-2", locks)
+	confirmed, pending, err = store.JanitorLockState(ctx)
+	if err != nil {
+		t.Fatalf("JanitorLockState after delete: %v", err)
+	}
+	if len(confirmed) != 0 || len(pending) != 0 {
+		t.Fatalf("janitor state after delete = confirmed %v pending %v, want empty", confirmed, pending)
 	}
 }
 

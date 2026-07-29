@@ -268,11 +268,21 @@ func (f *fakeMASAdmin) handleLock(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	for _, u := range f.users {
 		if u.id == id {
-			now := time.Now().UTC()
-			u.lockedAt = &now
+			if u.lockedAt == nil {
+				now := time.Now().UTC()
+				u.lockedAt = &now
+			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-				"data": map[string]any{"type": "user", "id": u.id},
+				"data": map[string]any{
+					"type": "user",
+					"id":   u.id,
+					"attributes": map[string]any{
+						"username":   u.username,
+						"created_at": u.createdAt,
+						"locked_at":  u.lockedAt,
+					},
+				},
 			})
 			return
 		}
@@ -294,7 +304,15 @@ func (f *fakeMASAdmin) handleUnlock(w http.ResponseWriter, r *http.Request) {
 			u.lockedAt = nil
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-				"data": map[string]any{"type": "user", "id": u.id},
+				"data": map[string]any{
+					"type": "user",
+					"id":   u.id,
+					"attributes": map[string]any{
+						"username":   u.username,
+						"created_at": u.createdAt,
+						"locked_at":  u.lockedAt,
+					},
+				},
 			})
 			return
 		}
@@ -415,8 +433,12 @@ func TestLockUser(t *testing.T) {
 	c := NewClient(srv.URL, "locker-client", "s3cr3t")
 	ctx := context.Background()
 
-	if err := c.LockUser(ctx, "user-1"); err != nil {
+	lockedAt, err := c.LockUser(ctx, "user-1")
+	if err != nil {
 		t.Fatalf("LockUser: %v", err)
+	}
+	if lockedAt.IsZero() {
+		t.Fatal("LockUser returned a zero locked_at timestamp")
 	}
 
 	users, err := c.ListUsers(ctx)
@@ -434,7 +456,7 @@ func TestLockUser_NotFound(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "locker-client", "s3cr3t")
-	err := c.LockUser(context.Background(), "no-such-user")
+	_, err := c.LockUser(context.Background(), "no-such-user")
 	if err == nil {
 		t.Fatal("expected an error locking an unknown user ID")
 	}

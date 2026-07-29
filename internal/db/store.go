@@ -123,46 +123,96 @@ func (s *Store) SetLockerHighWaterMark(ctx context.Context, key string, value ti
 	return nil
 }
 
-const janitorLockKeyPrefix = "janitor-lock:"
+const (
+	janitorLockKeyPrefix       = "janitor-lock:"
+	janitorLockIntentKeyPrefix = "janitor-lock-intent:"
+)
 
-// JanitorLockedUserIDs returns MAS user IDs whose current lock was created by janitor. MAS itself
-// exposes only locked_at, not lock provenance; this state prevents janitor from reversing an
-// operator/security lock merely because that account also has an active entitlement.
-func (s *Store) JanitorLockedUserIDs(ctx context.Context) (map[string]bool, error) {
+// JanitorLockState returns exact confirmed MAS locked_at timestamps plus pre-call intents. MAS
+// exposes no actor/reason for a lock, so timestamp identity prevents janitor from reversing an
+// operator unlock/relock cycle. A durable intent closes the crash/ambiguous-response gap between
+// deciding to lock and persisting MAS's successful response.
+func (s *Store) JanitorLockState(ctx context.Context) (
+	confirmed, pending map[string]time.Time,
+	err error,
+) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT substr(key, length($1) + 1)
+		SELECT 'confirmed', substr(key, length($1) + 1), value
 		FROM locker_state
 		WHERE key LIKE $1 || '%'
-	`, janitorLockKeyPrefix)
+		UNION ALL
+		SELECT 'pending', substr(key, length($2) + 1), value
+		FROM locker_state
+		WHERE key LIKE $2 || '%'
+	`, janitorLockKeyPrefix, janitorLockIntentKeyPrefix)
 	if err != nil {
-		return nil, fmt.Errorf("query janitor lock provenance: %w", err)
+		return nil, nil, fmt.Errorf("query janitor lock state: %w", err)
 	}
 	defer rows.Close()
 
-	userIDs := make(map[string]bool)
+	confirmed = make(map[string]time.Time)
+	pending = make(map[string]time.Time)
 	for rows.Next() {
-		var userID string
-		if err := rows.Scan(&userID); err != nil {
-			return nil, fmt.Errorf("scan janitor lock provenance: %w", err)
+		var kind, userID string
+		var at time.Time
+		if err := rows.Scan(&kind, &userID, &at); err != nil {
+			return nil, nil, fmt.Errorf("scan janitor lock state: %w", err)
 		}
-		userIDs[userID] = true
+		if kind == "confirmed" {
+			confirmed[userID] = at
+		} else {
+			pending[userID] = at
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate janitor lock provenance: %w", err)
+		return nil, nil, fmt.Errorf("iterate janitor lock state: %w", err)
 	}
-	return userIDs, nil
+	return confirmed, pending, nil
 }
 
-// RecordJanitorLock records that janitor successfully locked one MAS user.
-func (s *Store) RecordJanitorLock(ctx context.Context, userID string) error {
-	return s.SetLockerHighWaterMark(ctx, janitorLockKeyPrefix+userID, time.Now().UTC())
+// BeginJanitorLock durably records intent before calling MAS. A later sweep can distinguish a
+// committed-but-response-lost lock from a call that never changed MAS.
+func (s *Store) BeginJanitorLock(ctx context.Context, userID string) (time.Time, error) {
+	beganAt := time.Now().UTC()
+	if err := s.SetLockerHighWaterMark(ctx, janitorLockIntentKeyPrefix+userID, beganAt); err != nil {
+		return time.Time{}, err
+	}
+	return beganAt, nil
 }
 
-// DeleteJanitorLock removes janitor's lock provenance after an unlock or when MAS is already
-// unlocked. It intentionally does not mutate MAS itself.
+// ConfirmJanitorLock atomically stores MAS's exact locked_at timestamp and clears the pre-call
+// intent. On failure the transaction leaves the intent intact for a later sweep to reconcile.
+func (s *Store) ConfirmJanitorLock(ctx context.Context, userID string, lockedAt time.Time) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin janitor lock confirmation %s: %w", userID, err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO locker_state (key, value) VALUES ($1, $2)
+		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+	`, janitorLockKeyPrefix+userID, lockedAt); err != nil {
+		return fmt.Errorf("record confirmed janitor lock %s: %w", userID, err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM locker_state WHERE key = $1`, janitorLockIntentKeyPrefix+userID); err != nil {
+		return fmt.Errorf("clear janitor lock intent %s: %w", userID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit janitor lock confirmation %s: %w", userID, err)
+	}
+	return nil
+}
+
+// DeleteJanitorLock removes both confirmed provenance and any pending intent after an unlock,
+// deactivation transfer, or when MAS is already unlocked. It intentionally does not mutate MAS.
 func (s *Store) DeleteJanitorLock(ctx context.Context, userID string) error {
-	if _, err := s.pool.Exec(ctx, `DELETE FROM locker_state WHERE key = $1`, janitorLockKeyPrefix+userID); err != nil {
-		return fmt.Errorf("delete janitor lock provenance %s: %w", userID, err)
+	if _, err := s.pool.Exec(ctx,
+		`DELETE FROM locker_state WHERE key = $1 OR key = $2`,
+		janitorLockKeyPrefix+userID,
+		janitorLockIntentKeyPrefix+userID,
+	); err != nil {
+		return fmt.Errorf("delete janitor lock state %s: %w", userID, err)
 	}
 	return nil
 }

@@ -43,7 +43,7 @@ type Config struct {
 type masAdminClient interface {
 	ListUsers(ctx context.Context) ([]masadmin.User, error)
 	ListUserEmails(ctx context.Context) ([]masadmin.UserEmail, error)
-	LockUser(ctx context.Context, userID string) error
+	LockUser(ctx context.Context, userID string) (time.Time, error)
 	UnlockUser(ctx context.Context, userID string) error
 }
 
@@ -51,8 +51,9 @@ type masAdminClient interface {
 type store interface {
 	VerifiedMXIDs(ctx context.Context) (map[string]bool, error)
 	IsVerified(ctx context.Context, mxid string) (bool, error)
-	JanitorLockedUserIDs(ctx context.Context) (map[string]bool, error)
-	RecordJanitorLock(ctx context.Context, userID string) error
+	JanitorLockState(ctx context.Context) (confirmed, pending map[string]time.Time, err error)
+	BeginJanitorLock(ctx context.Context, userID string) (time.Time, error)
+	ConfirmJanitorLock(ctx context.Context, userID string, lockedAt time.Time) error
 	DeleteJanitorLock(ctx context.Context, userID string) error
 	LockerHighWaterMark(ctx context.Context, key string) (time.Time, bool, error)
 	SetLockerHighWaterMark(ctx context.Context, key string, value time.Time) error
@@ -102,12 +103,12 @@ func (s *Sweeper) Sweep(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("janitor: load verified mxids: %w", err)
 	}
-	janitorLocked, err := s.store.JanitorLockedUserIDs(ctx)
+	janitorLocked, pendingLocks, err := s.store.JanitorLockState(ctx)
 	if err != nil {
-		return fmt.Errorf("janitor: load lock provenance: %w", err)
+		return fmt.Errorf("janitor: load lock state: %w", err)
 	}
 
-	s.sweepLocks(ctx, users, hasEmail, verified, janitorLocked)
+	s.sweepLocks(ctx, users, hasEmail, verified, janitorLocked, pendingLocks)
 
 	if err := s.sweepDigest(ctx, users, hasEmail); err != nil {
 		slog.Error("janitor: digest failed", "error", err)
@@ -129,7 +130,8 @@ func (s *Sweeper) mxid(username string) string {
 func (s *Sweeper) sweepLocks(
 	ctx context.Context,
 	users []masadmin.User,
-	hasEmail, verified, janitorLocked map[string]bool,
+	hasEmail, verified map[string]bool,
+	janitorLocked, pendingLocks map[string]time.Time,
 ) {
 	cutoff := time.Now().Add(-time.Duration(s.cfg.LockAfterHours) * time.Hour)
 	locked, unlocked, skipped := 0, 0, 0
@@ -137,17 +139,71 @@ func (s *Sweeper) sweepLocks(
 	for _, u := range users {
 		mxid := s.mxid(u.Username)
 		log := slog.With("mxid", mxid, "user_id", u.ID)
+		confirmedAt, confirmed := janitorLocked[u.ID]
+		pendingAt, pending := pendingLocks[u.ID]
 
 		// Deactivation is an independent operator/security state. Never erase its accompanying
-		// lock, even if old janitor provenance remains and a verification grant later appears.
+		// lock. Relinquish janitor provenance so a later operator reactivation cannot make that
+		// same lock eligible for automatic entitlement repair.
 		if u.DeactivatedAt != nil {
+			if confirmed || pending {
+				if s.cfg.DryRun {
+					log.Info("would relinquish janitor lock state for deactivated account (dry run)")
+				} else if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
+					log.Error("failed to relinquish janitor lock state for deactivated account", "error", err)
+				} else {
+					delete(janitorLocked, u.ID)
+					delete(pendingLocks, u.ID)
+				}
+			}
 			log.Debug("skip lock", "reason", "deactivated")
 			skipped++
 			continue
 		}
 
 		if u.LockedAt != nil {
-			if !janitorLocked[u.ID] {
+			// A durable intent plus a locked MAS account means an earlier call committed but
+			// crashed/lost its response before confirmation. Adopt the exact observed timestamp.
+			if pending {
+				if u.LockedAt.Before(pendingAt) {
+					// The lock predates our durable intent, so an operator won the race between
+					// the MAS list snapshot and LockUser. Relinquish intent; never adopt/unlock it.
+					if s.cfg.DryRun {
+						log.Info("would clear intent for pre-existing external lock (dry run)")
+					} else if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
+						log.Error("failed to clear intent for pre-existing external lock", "error", err)
+					} else {
+						delete(pendingLocks, u.ID)
+					}
+					log.Debug("skip lock", "reason", "external lock predates janitor intent")
+					skipped++
+					continue
+				}
+				if s.cfg.DryRun {
+					log.Info("would confirm pending janitor lock (dry run)")
+				} else if err := s.store.ConfirmJanitorLock(ctx, u.ID, *u.LockedAt); err != nil {
+					log.Error("failed to confirm pending janitor lock; leaving lock unchanged", "error", err)
+					skipped++
+					continue
+				}
+				confirmedAt, confirmed = *u.LockedAt, true
+				janitorLocked[u.ID] = *u.LockedAt
+				delete(pendingLocks, u.ID)
+			}
+
+			if !confirmed || !u.LockedAt.Equal(confirmedAt) {
+				// A differing locked_at proves an unlock/relock cycle created a new external lock.
+				// Clear stale janitor state but never unlock the current security/operator lock.
+				if confirmed {
+					if s.cfg.DryRun {
+						log.Info("would clear stale janitor provenance for newer external lock (dry run)")
+					} else if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
+						log.Error("failed to clear stale janitor provenance", "error", err)
+					} else {
+						delete(janitorLocked, u.ID)
+						delete(pendingLocks, u.ID)
+					}
+				}
 				log.Debug("skip lock", "reason", "already locked outside janitor")
 				skipped++
 				continue
@@ -182,20 +238,21 @@ func (s *Sweeper) sweepLocks(
 			continue
 		}
 
-		if janitorLocked[u.ID] {
+		if confirmed || pending {
 			if s.cfg.DryRun {
-				log.Info("would clear stale janitor lock provenance (dry run)")
+				log.Info("would clear stale janitor lock state (dry run)")
 			} else {
 				if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
-					log.Error("failed to clear stale lock provenance; refusing further action", "error", err)
+					log.Error("failed to clear stale lock state; refusing further action", "error", err)
 					skipped++
 					continue
 				}
-				log.Info("cleared stale janitor lock provenance from unlocked account")
+				log.Info("cleared stale janitor lock state from unlocked account")
 			}
 			// Update only the in-memory sweep snapshot in dry-run so later classification
 			// accurately models the action without mutating persisted state.
 			delete(janitorLocked, u.ID)
+			delete(pendingLocks, u.ID)
 		}
 
 		reason := skipReason(u, cutoff, mxid, hasEmail, verified, s.cfg.ExcludeMXIDs)
@@ -223,21 +280,42 @@ func (s *Sweeper) sweepLocks(
 			continue
 		}
 
-		if err := s.mas.LockUser(ctx, u.ID); err != nil {
+		intentAt, err := s.store.BeginJanitorLock(ctx, u.ID)
+		if err != nil {
+			log.Error("failed to persist pre-lock intent; refusing to lock", "error", err)
+			continue
+		}
+		pendingLocks[u.ID] = intentAt
+
+		lockedAt, err := s.mas.LockUser(ctx, u.ID)
+		if err != nil {
+			// Keep the durable intent: the HTTP result is ambiguous, and the next sweep will
+			// either clear it if MAS stayed unlocked or confirm the exact observed locked_at.
 			log.Error("lock failed", "error", err)
 			continue
 		}
-		log.Info("locked stale unclaimed account", "reason", "stale, unclaimed, no email", "created_at", u.CreatedAt)
-		if err := s.store.RecordJanitorLock(ctx, u.ID); err != nil {
-			log.Error("failed to record lock provenance; compensating unlock", "error", err)
-			if err := s.mas.UnlockUser(ctx, u.ID); err != nil {
-				log.Error("unlock after provenance failure failed; manual repair required", "error", err)
+		if lockedAt.Before(intentAt) {
+			// MAS lock is idempotent. A timestamp older than our pre-call intent proves an
+			// operator locked the user after the list snapshot but before this POST.
+			log.Warn("external lock won pre-call race; refusing janitor ownership",
+				"locked_at", lockedAt, "intent_at", intentAt)
+			if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
+				log.Error("failed to clear intent after external lock race", "error", err)
 			} else {
-				unlocked++
+				delete(pendingLocks, u.ID)
 			}
+			skipped++
 			continue
 		}
-		janitorLocked[u.ID] = true
+		log.Info("locked stale unclaimed account", "reason", "stale, unclaimed, no email", "created_at", u.CreatedAt)
+		if err := s.store.ConfirmJanitorLock(ctx, u.ID, lockedAt); err != nil {
+			// The pre-lock intent remains durable and is enough for a later sweep to adopt the
+			// exact timestamp. Continue to the post-lock entitlement check now.
+			log.Error("failed to confirm lock provenance; pending intent retained", "error", err)
+		} else {
+			janitorLocked[u.ID] = lockedAt
+			delete(pendingLocks, u.ID)
+		}
 
 		// A grant may have committed after the pre-lock read but during the external MAS call.
 		// Restore the pre-sweep unlocked state unless a post-lock read proves the account remains
@@ -258,9 +336,10 @@ func (s *Sweeper) sweepLocks(
 			continue
 		}
 		if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
-			log.Error("compensating unlock succeeded but lock provenance cleanup failed", "error", err)
+			log.Error("compensating unlock succeeded but lock state cleanup failed", "error", err)
 		} else {
 			delete(janitorLocked, u.ID)
+			delete(pendingLocks, u.ID)
 		}
 		unlocked++
 	}
