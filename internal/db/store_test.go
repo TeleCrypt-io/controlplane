@@ -130,6 +130,45 @@ func TestLockerHighWaterMark(t *testing.T) {
 	}
 }
 
+func TestJanitorLockProvenance(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+
+	locks, err := store.JanitorLockedUserIDs(ctx)
+	if err != nil {
+		t.Fatalf("JanitorLockedUserIDs (empty): %v", err)
+	}
+	if len(locks) != 0 {
+		t.Fatalf("initial janitor locks = %v, want empty", locks)
+	}
+
+	if err := store.RecordJanitorLock(ctx, "mas-user-1"); err != nil {
+		t.Fatalf("RecordJanitorLock: %v", err)
+	}
+	if err := store.RecordJanitorLock(ctx, "mas-user-2"); err != nil {
+		t.Fatalf("RecordJanitorLock second: %v", err)
+	}
+
+	locks, err = store.JanitorLockedUserIDs(ctx)
+	if err != nil {
+		t.Fatalf("JanitorLockedUserIDs: %v", err)
+	}
+	if !locks["mas-user-1"] || !locks["mas-user-2"] || len(locks) != 2 {
+		t.Fatalf("janitor locks = %v, want both MAS user IDs", locks)
+	}
+
+	if err := store.DeleteJanitorLock(ctx, "mas-user-1"); err != nil {
+		t.Fatalf("DeleteJanitorLock: %v", err)
+	}
+	locks, err = store.JanitorLockedUserIDs(ctx)
+	if err != nil {
+		t.Fatalf("JanitorLockedUserIDs after delete: %v", err)
+	}
+	if locks["mas-user-1"] || !locks["mas-user-2"] || len(locks) != 1 {
+		t.Fatalf("janitor locks after delete = %v, want only mas-user-2", locks)
+	}
+}
+
 func TestIsVerified(t *testing.T) {
 	store, pool := newTestStore(t)
 	ctx := context.Background()

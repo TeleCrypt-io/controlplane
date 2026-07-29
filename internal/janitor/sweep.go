@@ -51,6 +51,9 @@ type masAdminClient interface {
 type store interface {
 	VerifiedMXIDs(ctx context.Context) (map[string]bool, error)
 	IsVerified(ctx context.Context, mxid string) (bool, error)
+	JanitorLockedUserIDs(ctx context.Context) (map[string]bool, error)
+	RecordJanitorLock(ctx context.Context, userID string) error
+	DeleteJanitorLock(ctx context.Context, userID string) error
 	LockerHighWaterMark(ctx context.Context, key string) (time.Time, bool, error)
 	SetLockerHighWaterMark(ctx context.Context, key string, value time.Time) error
 }
@@ -78,9 +81,9 @@ func NewSweeper(mas masAdminClient, store store, mailer Mailer, cfg Config) *Swe
 // sign-ups awaiting review.
 //
 // Only returns an error for failures in the shared setup both halves depend on (listing MAS users
-// / emails, reading the verified set): without those, no lock or skip decision can be made safely,
-// so the sweep fails closed rather than guessing. Per-account lock failures and digest failures are
-// logged, not returned — see sweepLocks and sweepDigest.
+// / emails, reading the verified set and lock provenance): without those, no lock or skip decision
+// can be made safely, so the sweep fails closed rather than guessing. Per-account lock/unlock
+// failures and digest failures are logged, not returned — see sweepLocks and sweepDigest.
 func (s *Sweeper) Sweep(ctx context.Context) error {
 	users, err := s.mas.ListUsers(ctx)
 	if err != nil {
@@ -99,8 +102,12 @@ func (s *Sweeper) Sweep(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("janitor: load verified mxids: %w", err)
 	}
+	janitorLocked, err := s.store.JanitorLockedUserIDs(ctx)
+	if err != nil {
+		return fmt.Errorf("janitor: load lock provenance: %w", err)
+	}
 
-	s.sweepLocks(ctx, users, hasEmail, verified)
+	s.sweepLocks(ctx, users, hasEmail, verified, janitorLocked)
 
 	if err := s.sweepDigest(ctx, users, hasEmail); err != nil {
 		slog.Error("janitor: digest failed", "error", err)
@@ -113,12 +120,17 @@ func (s *Sweeper) mxid(username string) string {
 	return fmt.Sprintf("@%s:%s", username, s.cfg.ServerName)
 }
 
-// sweepLocks locks every account that is stale, unclaimed, and email-less, and repairs any
-// verified account found locked. The full verified set is an efficient first-pass snapshot, but a
-// candidate is checked again immediately around the external MAS mutation. That closes the
-// ordinary snapshot race and makes a race that lands during LockUser convergent via compensation.
-// Errors acting on one account are logged and don't stop the rest of the sweep.
-func (s *Sweeper) sweepLocks(ctx context.Context, users []masadmin.User, hasEmail, verified map[string]bool) {
+// sweepLocks locks every account that is stale, unclaimed, and email-less, and repairs a verified
+// account only when persisted provenance proves janitor created its current lock. The full
+// verified set is an efficient first-pass snapshot, but a candidate is checked again immediately
+// around the external MAS mutation. That closes the ordinary snapshot race and makes a race that
+// lands during LockUser convergent via compensation. Errors acting on one account are logged and
+// don't stop the rest of the sweep.
+func (s *Sweeper) sweepLocks(
+	ctx context.Context,
+	users []masadmin.User,
+	hasEmail, verified, janitorLocked map[string]bool,
+) {
 	cutoff := time.Now().Add(-time.Duration(s.cfg.LockAfterHours) * time.Hour)
 	locked, unlocked, skipped := 0, 0, 0
 
@@ -126,7 +138,20 @@ func (s *Sweeper) sweepLocks(ctx context.Context, users []masadmin.User, hasEmai
 		mxid := s.mxid(u.Username)
 		log := slog.With("mxid", mxid, "user_id", u.ID)
 
+		// Deactivation is an independent operator/security state. Never erase its accompanying
+		// lock, even if old janitor provenance remains and a verification grant later appears.
+		if u.DeactivatedAt != nil {
+			log.Debug("skip lock", "reason", "deactivated")
+			skipped++
+			continue
+		}
+
 		if u.LockedAt != nil {
+			if !janitorLocked[u.ID] {
+				log.Debug("skip lock", "reason", "already locked outside janitor")
+				skipped++
+				continue
+			}
 			isVerified, err := s.store.IsVerified(ctx, mxid)
 			if err != nil {
 				log.Error("verification recheck failed; leaving existing lock unchanged", "error", err)
@@ -147,9 +172,24 @@ func (s *Sweeper) sweepLocks(ctx context.Context, users []masadmin.User, hasEmai
 				log.Error("verified-account unlock failed", "error", err)
 				continue
 			}
+			if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
+				log.Error("unlocked verified account but failed to clear lock provenance", "error", err)
+			} else {
+				delete(janitorLocked, u.ID)
+			}
 			log.Info("unlocked verified account")
 			unlocked++
 			continue
+		}
+
+		if janitorLocked[u.ID] {
+			if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
+				log.Error("failed to clear stale lock provenance; refusing further action", "error", err)
+				skipped++
+				continue
+			}
+			delete(janitorLocked, u.ID)
+			log.Info("cleared stale janitor lock provenance from unlocked account")
 		}
 
 		reason := skipReason(u, cutoff, mxid, hasEmail, verified, s.cfg.ExcludeMXIDs)
@@ -182,6 +222,16 @@ func (s *Sweeper) sweepLocks(ctx context.Context, users []masadmin.User, hasEmai
 			continue
 		}
 		log.Info("locked stale unclaimed account", "reason", "stale, unclaimed, no email", "created_at", u.CreatedAt)
+		if err := s.store.RecordJanitorLock(ctx, u.ID); err != nil {
+			log.Error("failed to record lock provenance; compensating unlock", "error", err)
+			if err := s.mas.UnlockUser(ctx, u.ID); err != nil {
+				log.Error("unlock after provenance failure failed; manual repair required", "error", err)
+			} else {
+				unlocked++
+			}
+			continue
+		}
+		janitorLocked[u.ID] = true
 
 		// A grant may have committed after the pre-lock read but during the external MAS call.
 		// Restore the pre-sweep unlocked state unless a post-lock read proves the account remains
@@ -200,6 +250,11 @@ func (s *Sweeper) sweepLocks(ctx context.Context, users []masadmin.User, hasEmai
 		if err := s.mas.UnlockUser(ctx, u.ID); err != nil {
 			log.Error("compensating unlock failed", "error", err)
 			continue
+		}
+		if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
+			log.Error("compensating unlock succeeded but lock provenance cleanup failed", "error", err)
+		} else {
+			delete(janitorLocked, u.ID)
 		}
 		unlocked++
 	}

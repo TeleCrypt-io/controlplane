@@ -123,6 +123,50 @@ func (s *Store) SetLockerHighWaterMark(ctx context.Context, key string, value ti
 	return nil
 }
 
+const janitorLockKeyPrefix = "janitor-lock:"
+
+// JanitorLockedUserIDs returns MAS user IDs whose current lock was created by janitor. MAS itself
+// exposes only locked_at, not lock provenance; this state prevents janitor from reversing an
+// operator/security lock merely because that account also has an active entitlement.
+func (s *Store) JanitorLockedUserIDs(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT substr(key, length($1) + 1)
+		FROM locker_state
+		WHERE key LIKE $1 || '%'
+	`, janitorLockKeyPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("query janitor lock provenance: %w", err)
+	}
+	defer rows.Close()
+
+	userIDs := make(map[string]bool)
+	for rows.Next() {
+		var userID string
+		if err := rows.Scan(&userID); err != nil {
+			return nil, fmt.Errorf("scan janitor lock provenance: %w", err)
+		}
+		userIDs[userID] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate janitor lock provenance: %w", err)
+	}
+	return userIDs, nil
+}
+
+// RecordJanitorLock records that janitor successfully locked one MAS user.
+func (s *Store) RecordJanitorLock(ctx context.Context, userID string) error {
+	return s.SetLockerHighWaterMark(ctx, janitorLockKeyPrefix+userID, time.Now().UTC())
+}
+
+// DeleteJanitorLock removes janitor's lock provenance after an unlock or when MAS is already
+// unlocked. It intentionally does not mutate MAS itself.
+func (s *Store) DeleteJanitorLock(ctx context.Context, userID string) error {
+	if _, err := s.pool.Exec(ctx, `DELETE FROM locker_state WHERE key = $1`, janitorLockKeyPrefix+userID); err != nil {
+		return fmt.Errorf("delete janitor lock provenance %s: %w", userID, err)
+	}
+	return nil
+}
+
 // IsVerified reports whether mxid has any verification grant. It is suitable for read-only
 // callers; cashier must use the source-specific methods below so it only mutates billing grants.
 func (s *Store) IsVerified(ctx context.Context, mxid string) (bool, error) {

@@ -35,12 +35,13 @@ type fakeUser struct {
 type fakeMAS struct {
 	clientID, clientSecret string
 
-	mu          sync.Mutex
-	users       []*fakeUser
-	emails      map[string]string // user id -> email
-	lockCalls   []string          // ids passed to POST .../lock, in call order
-	unlockCalls []string          // ids passed to POST .../unlock, in call order
-	afterLock   func()
+	mu             sync.Mutex
+	users          []*fakeUser
+	emails         map[string]string // user id -> email
+	lockCalls      []string          // ids passed to POST .../lock, in call order
+	unlockCalls    []string          // ids passed to POST .../unlock, in call order
+	afterLock      func()
+	unlockFailures int
 }
 
 func newFakeMAS(clientID, clientSecret string) *fakeMAS {
@@ -189,6 +190,12 @@ func (f *fakeMAS) handleUnlock(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.unlockCalls = append(f.unlockCalls, id)
+	if f.unlockFailures > 0 {
+		f.unlockFailures--
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `{"errors":[{"title":"injected unlock failure"}]}`)
+		return
+	}
 	for _, u := range f.users {
 		if u.id == id {
 			u.lockedAt = nil
@@ -209,10 +216,12 @@ type verificationResult struct {
 }
 
 type fakeStore struct {
-	mu          sync.Mutex
-	verified    map[string]bool
-	verifyQueue map[string][]verificationResult
-	highWater   map[string]time.Time
+	mu           sync.Mutex
+	verified     map[string]bool
+	verifyQueue  map[string][]verificationResult
+	janitorLocks map[string]bool
+	highWater    map[string]time.Time
+	recordErr    error
 
 	// setErr, when non-nil, is returned by SetLockerHighWaterMark -- used to prove a failed
 	// digest send/store update doesn't advance the mark.
@@ -221,9 +230,10 @@ type fakeStore struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		verified:    map[string]bool{},
-		verifyQueue: map[string][]verificationResult{},
-		highWater:   map[string]time.Time{},
+		verified:     map[string]bool{},
+		verifyQueue:  map[string][]verificationResult{},
+		janitorLocks: map[string]bool{},
+		highWater:    map[string]time.Time{},
 	}
 }
 
@@ -258,6 +268,39 @@ func (s *fakeStore) queueVerification(mxid string, results ...verificationResult
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.verifyQueue[mxid] = append(s.verifyQueue[mxid], results...)
+}
+
+func (s *fakeStore) JanitorLockedUserIDs(ctx context.Context) (map[string]bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]bool, len(s.janitorLocks))
+	for userID, locked := range s.janitorLocks {
+		out[userID] = locked
+	}
+	return out, nil
+}
+
+func (s *fakeStore) RecordJanitorLock(ctx context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.recordErr != nil {
+		return s.recordErr
+	}
+	s.janitorLocks[userID] = true
+	return nil
+}
+
+func (s *fakeStore) DeleteJanitorLock(ctx context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.janitorLocks, userID)
+	return nil
+}
+
+func (s *fakeStore) setJanitorLocked(userID string, locked bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.janitorLocks[userID] = locked
 }
 
 func (s *fakeStore) LockerHighWaterMark(ctx context.Context, key string) (time.Time, bool, error) {
@@ -396,6 +439,7 @@ func TestSweep_UnlocksVerifiedAccountFoundLocked(t *testing.T) {
 
 	store := newFakeStore()
 	store.setVerified("@entitledlocked:"+serverName, true)
+	store.setJanitorLocked("u-entitled-locked", true)
 
 	cfg := Config{LockAfterHours: 48}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
@@ -409,15 +453,42 @@ func TestSweep_UnlocksVerifiedAccountFoundLocked(t *testing.T) {
 	if len(mas.lockCalls) != 0 {
 		t.Errorf("lockCalls = %v, want none", mas.lockCalls)
 	}
+	if user.lockedAt != nil {
+		t.Error("verified janitor-owned account remained locked after repair")
+	}
 }
 
-func TestSweep_LeavesUnverifiedAccountLocked(t *testing.T) {
+func TestSweep_DoesNotReverseExternalLockOnVerifiedAccount(t *testing.T) {
+	mas := newFakeMAS("locker-client", "s3cr3t")
+	user := mas.addUser("u-externally-locked", "externallylocked", time.Now().Add(-72*time.Hour))
+	lockedAt := time.Now().Add(-time.Hour)
+	user.lockedAt = &lockedAt
+
+	store := newFakeStore()
+	store.setVerified("@externallylocked:"+serverName, true)
+
+	cfg := Config{LockAfterHours: 48}
+	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
+
+	if err := sweeper.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if len(mas.unlockCalls) != 0 {
+		t.Errorf("unlockCalls = %v, want none for a lock without janitor provenance", mas.unlockCalls)
+	}
+	if user.lockedAt == nil {
+		t.Error("external/operator lock was erased")
+	}
+}
+
+func TestSweep_LeavesUnverifiedJanitorAccountLocked(t *testing.T) {
 	mas := newFakeMAS("locker-client", "s3cr3t")
 	user := mas.addUser("u-unverified-locked", "unverifiedlocked", time.Now().Add(-72*time.Hour))
 	lockedAt := time.Now().Add(-time.Hour)
 	user.lockedAt = &lockedAt
 
 	store := newFakeStore()
+	store.setJanitorLocked("u-unverified-locked", true)
 	cfg := Config{LockAfterHours: 48}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
@@ -426,6 +497,35 @@ func TestSweep_LeavesUnverifiedAccountLocked(t *testing.T) {
 	}
 	if len(mas.unlockCalls) != 0 {
 		t.Errorf("unlockCalls = %v, want none", mas.unlockCalls)
+	}
+	if user.lockedAt == nil {
+		t.Error("unverified janitor-owned account unexpectedly became unlocked")
+	}
+}
+
+func TestSweep_DoesNotUnlockDeactivatedVerifiedAccount(t *testing.T) {
+	mas := newFakeMAS("locker-client", "s3cr3t")
+	user := mas.addUser("u-deactivated-entitled", "deactivatedentitled", time.Now().Add(-72*time.Hour))
+	lockedAt := time.Now().Add(-time.Hour)
+	deactivatedAt := time.Now().Add(-2 * time.Hour)
+	user.lockedAt = &lockedAt
+	user.deactivatedAt = &deactivatedAt
+
+	store := newFakeStore()
+	store.setVerified("@deactivatedentitled:"+serverName, true)
+	store.setJanitorLocked("u-deactivated-entitled", true)
+
+	cfg := Config{LockAfterHours: 48}
+	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
+
+	if err := sweeper.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if len(mas.unlockCalls) != 0 {
+		t.Errorf("unlockCalls = %v, want none for deactivated account", mas.unlockCalls)
+	}
+	if user.lockedAt == nil {
+		t.Error("deactivated account's independent lock was erased")
 	}
 }
 
@@ -448,6 +548,9 @@ func TestSweep_CompensatesWhenGrantAppearsDuringLock(t *testing.T) {
 	}
 	if got, want := mas.unlockCalls, []string{"u-raced-grant"}; !equalStrSlices(got, want) {
 		t.Errorf("unlockCalls = %v, want compensating %v", got, want)
+	}
+	if mas.users[0].lockedAt != nil {
+		t.Error("account remained locked after compensating unlock")
 	}
 }
 
@@ -473,6 +576,63 @@ func TestSweep_PostLockVerificationErrorCompensates(t *testing.T) {
 	}
 	if got, want := mas.unlockCalls, []string{"u-post-lock-uncertain"}; !equalStrSlices(got, want) {
 		t.Errorf("unlockCalls = %v, want compensating %v", got, want)
+	}
+	if mas.users[0].lockedAt != nil {
+		t.Error("account remained locked after uncertain post-lock read")
+	}
+}
+
+func TestSweep_ProvenanceFailureCompensates(t *testing.T) {
+	mas := newFakeMAS("locker-client", "s3cr3t")
+	user := mas.addUser("u-provenance-failure", "provenancefailure", time.Now().Add(-72*time.Hour))
+
+	store := newFakeStore()
+	store.recordErr = errors.New("database unavailable")
+
+	cfg := Config{LockAfterHours: 48}
+	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
+
+	if err := sweeper.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if got, want := mas.lockCalls, []string{"u-provenance-failure"}; !equalStrSlices(got, want) {
+		t.Errorf("lockCalls = %v, want %v", got, want)
+	}
+	if got, want := mas.unlockCalls, []string{"u-provenance-failure"}; !equalStrSlices(got, want) {
+		t.Errorf("unlockCalls = %v, want compensating %v", got, want)
+	}
+	if user.lockedAt != nil {
+		t.Error("account remained locked after provenance-write failure")
+	}
+}
+
+func TestSweep_FailedCompensationConvergesOnNextSweep(t *testing.T) {
+	mas := newFakeMAS("locker-client", "s3cr3t")
+	user := mas.addUser("u-retry-unlock", "retryunlock", time.Now().Add(-72*time.Hour))
+	mas.unlockFailures = 1
+
+	store := newFakeStore()
+	mxid := "@retryunlock:" + serverName
+	mas.afterLock = func() { store.setVerified(mxid, true) }
+
+	cfg := Config{LockAfterHours: 48}
+	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
+
+	if err := sweeper.Sweep(context.Background()); err != nil {
+		t.Fatalf("first Sweep: %v", err)
+	}
+	if user.lockedAt == nil {
+		t.Fatal("injected unlock failure did not leave the account locked")
+	}
+
+	if err := sweeper.Sweep(context.Background()); err != nil {
+		t.Fatalf("second Sweep: %v", err)
+	}
+	if user.lockedAt != nil {
+		t.Error("janitor-owned verified lock did not converge on the next sweep")
+	}
+	if got, want := mas.unlockCalls, []string{"u-retry-unlock", "u-retry-unlock"}; !equalStrSlices(got, want) {
+		t.Errorf("unlockCalls = %v, want failed attempt then repair %v", got, want)
 	}
 }
 
