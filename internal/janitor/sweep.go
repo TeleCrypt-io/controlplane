@@ -44,11 +44,13 @@ type masAdminClient interface {
 	ListUsers(ctx context.Context) ([]masadmin.User, error)
 	ListUserEmails(ctx context.Context) ([]masadmin.UserEmail, error)
 	LockUser(ctx context.Context, userID string) error
+	UnlockUser(ctx context.Context, userID string) error
 }
 
 // store is the subset of *db.Store that Sweeper needs.
 type store interface {
 	VerifiedMXIDs(ctx context.Context) (map[string]bool, error)
+	IsVerified(ctx context.Context, mxid string) (bool, error)
 	LockerHighWaterMark(ctx context.Context, key string) (time.Time, bool, error)
 	SetLockerHighWaterMark(ctx context.Context, key string, value time.Time) error
 }
@@ -111,19 +113,60 @@ func (s *Sweeper) mxid(username string) string {
 	return fmt.Sprintf("@%s:%s", username, s.cfg.ServerName)
 }
 
-// sweepLocks locks every account that is stale, unclaimed, and email-less. Errors locking one
-// account are logged and don't stop the rest of the sweep.
+// sweepLocks locks every account that is stale, unclaimed, and email-less, and repairs any
+// verified account found locked. The full verified set is an efficient first-pass snapshot, but a
+// candidate is checked again immediately around the external MAS mutation. That closes the
+// ordinary snapshot race and makes a race that lands during LockUser convergent via compensation.
+// Errors acting on one account are logged and don't stop the rest of the sweep.
 func (s *Sweeper) sweepLocks(ctx context.Context, users []masadmin.User, hasEmail, verified map[string]bool) {
 	cutoff := time.Now().Add(-time.Duration(s.cfg.LockAfterHours) * time.Hour)
-	locked, skipped := 0, 0
+	locked, unlocked, skipped := 0, 0
 
 	for _, u := range users {
 		mxid := s.mxid(u.Username)
 		log := slog.With("mxid", mxid, "user_id", u.ID)
 
+		if u.LockedAt != nil {
+			isVerified, err := s.store.IsVerified(ctx, mxid)
+			if err != nil {
+				log.Error("verification recheck failed; leaving existing lock unchanged", "error", err)
+				skipped++
+				continue
+			}
+			if !isVerified {
+				log.Debug("skip lock", "reason", "already locked")
+				skipped++
+				continue
+			}
+			if s.cfg.DryRun {
+				log.Info("would unlock verified account (dry run)")
+				unlocked++
+				continue
+			}
+			if err := s.mas.UnlockUser(ctx, u.ID); err != nil {
+				log.Error("verified-account unlock failed", "error", err)
+				continue
+			}
+			log.Info("unlocked verified account")
+			unlocked++
+			continue
+		}
+
 		reason := skipReason(u, cutoff, mxid, hasEmail, verified, s.cfg.ExcludeMXIDs)
 		if reason != "" {
 			log.Debug("skip lock", "reason", reason)
+			skipped++
+			continue
+		}
+
+		isVerified, err := s.store.IsVerified(ctx, mxid)
+		if err != nil {
+			log.Error("verification recheck failed; refusing to lock", "error", err)
+			skipped++
+			continue
+		}
+		if isVerified {
+			log.Debug("skip lock", "reason", "verified on pre-lock recheck")
 			skipped++
 			continue
 		}
@@ -139,11 +182,31 @@ func (s *Sweeper) sweepLocks(ctx context.Context, users []masadmin.User, hasEmai
 			continue
 		}
 		log.Info("locked stale unclaimed account", "reason", "stale, unclaimed, no email", "created_at", u.CreatedAt)
-		locked++
+
+		// A grant may have committed after the pre-lock read but during the external MAS call.
+		// Restore the pre-sweep unlocked state unless a post-lock read proves the account remains
+		// unverified. A failed read also compensates: janitor cleanup must not leave a possibly
+		// entitled account newly locked just because its own database became unavailable.
+		isVerified, err = s.store.IsVerified(ctx, mxid)
+		if err == nil && !isVerified {
+			locked++
+			continue
+		}
+		if err != nil {
+			log.Error("post-lock verification failed; compensating unlock", "error", err)
+		} else {
+			log.Info("verification appeared during lock; compensating unlock")
+		}
+		if err := s.mas.UnlockUser(ctx, u.ID); err != nil {
+			log.Error("compensating unlock failed", "error", err)
+			continue
+		}
+		unlocked++
 	}
 
 	slog.Info("janitor: lock sweep complete",
-		"locked", locked, "skipped", skipped, "considered", len(users), "dry_run", s.cfg.DryRun)
+		"locked", locked, "unlocked", unlocked, "skipped", skipped,
+		"considered", len(users), "dry_run", s.cfg.DryRun)
 }
 
 // skipReason returns why u should NOT be locked, or "" if it should be.
@@ -151,8 +214,6 @@ func skipReason(u masadmin.User, cutoff time.Time, mxid string, hasEmail, verifi
 	switch {
 	case u.DeactivatedAt != nil:
 		return "deactivated"
-	case u.LockedAt != nil:
-		return "already locked"
 	case !u.CreatedAt.Before(cutoff):
 		return "not stale yet"
 	case hasEmail[u.ID]:

@@ -185,6 +185,9 @@ func TestVerificationGrantProvenance(t *testing.T) {
 	if billing, err := store.HasBillingVerificationGrant(ctx, "@seat:telecrypt.io"); err != nil || !billing {
 		t.Fatalf("billing seat billing grant = %v, %v; want true, nil", billing, err)
 	}
+	if verified, err := store.IsVerified(ctx, "@seat:telecrypt.io"); err != nil || !verified {
+		t.Fatalf("billing-only seat IsVerified = %v, %v; want true, nil", verified, err)
+	}
 
 	// The composite foreign key rejects a grant whose mxid is not an attached seat of team.
 	if err := store.InsertBillingVerificationGrant(ctx, team.ID, "@not-a-seat:telecrypt.io"); err == nil {

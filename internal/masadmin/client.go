@@ -18,9 +18,9 @@
 //   - crates/handlers/src/admin/v1/users/list.rs — GET /api/admin/v1/users returns User
 //     resources: {username, created_at, locked_at, deactivated_at, admin, legacy_guest}. No email
 //     field on User itself — see user_emails below for email presence.
-//   - crates/handlers/src/admin/v1/users/lock.rs — POST /api/admin/v1/users/{ulid}/lock locks the
-//     account. Explicitly reversible: "This DOES NOT invalidate any existing session... all their
-//     existing sessions will work again as soon as they get unlocked." Not deactivation.
+//   - crates/handlers/src/admin/v1/users/{lock,unlock}.rs — POST
+//     /api/admin/v1/users/{ulid}/{lock,unlock} changes the reversible account lock. This is not
+//     deactivation; unlock also leaves a separately deactivated account deactivated.
 //   - crates/handlers/src/admin/v1/user_emails/list.rs — GET /api/admin/v1/user-emails returns
 //     UserEmail resources: {created_at, user_id, email}. Supports filter[user]=<ulid> but is also
 //     listable unfiltered, so ListUserEmails fetches the whole list once per sweep and the caller
@@ -51,7 +51,8 @@ import (
 	"time"
 )
 
-// ErrUserNotFound is returned by LockUser when MAS reports the ULID doesn't exist (404).
+// ErrUserNotFound is returned by LockUser or UnlockUser when MAS reports the ULID doesn't exist
+// (404).
 var ErrUserNotFound = errors.New("masadmin: user not found")
 
 // listPageSize is the page[first] value used for both ListUsers and ListUserEmails. MAS's own
@@ -255,13 +256,23 @@ func listQuery(after string) string {
 // LockUser locks the given MAS user (by ULID) — reversible, not a deactivation. Returns
 // ErrUserNotFound if MAS reports no such user.
 func (c *Client) LockUser(ctx context.Context, userID string) error {
+	return c.setUserLock(ctx, userID, "lock")
+}
+
+// UnlockUser removes the reversible lock from the given MAS user (by ULID). It does not
+// reactivate a deactivated user. Returns ErrUserNotFound if MAS reports no such user.
+func (c *Client) UnlockUser(ctx context.Context, userID string) error {
+	return c.setUserLock(ctx, userID, "unlock")
+}
+
+func (c *Client) setUserLock(ctx context.Context, userID, action string) error {
 	token, err := c.token(ctx)
 	if err != nil {
 		return err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.baseURL+"/api/admin/v1/users/"+url.PathEscape(userID)+"/lock", nil)
+		c.baseURL+"/api/admin/v1/users/"+url.PathEscape(userID)+"/"+action, nil)
 	if err != nil {
 		return err
 	}
@@ -269,7 +280,7 @@ func (c *Client) LockUser(ctx context.Context, userID string) error {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("masadmin: lock user %s: %w", userID, err)
+		return fmt.Errorf("masadmin: %s user %s: %w", action, userID, err)
 	}
 	defer resp.Body.Close()
 
@@ -277,7 +288,7 @@ func (c *Client) LockUser(ctx context.Context, userID string) error {
 		return fmt.Errorf("%w: %s", ErrUserNotFound, userID)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("masadmin: lock user %s: %s", userID, describeError(resp))
+		return fmt.Errorf("masadmin: %s user %s: %s", action, userID, describeError(resp))
 	}
 	return nil
 }

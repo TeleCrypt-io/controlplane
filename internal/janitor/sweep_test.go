@@ -35,10 +35,12 @@ type fakeUser struct {
 type fakeMAS struct {
 	clientID, clientSecret string
 
-	mu        sync.Mutex
-	users     []*fakeUser
-	emails    map[string]string // user id -> email
-	lockCalls []string          // ids passed to POST .../lock, in call order
+	mu          sync.Mutex
+	users       []*fakeUser
+	emails      map[string]string // user id -> email
+	lockCalls   []string          // ids passed to POST .../lock, in call order
+	unlockCalls []string          // ids passed to POST .../unlock, in call order
+	afterLock   func()
 }
 
 func newFakeMAS(clientID, clientSecret string) *fakeMAS {
@@ -57,6 +59,7 @@ func (f *fakeMAS) server() *httptest.Server {
 	mux.HandleFunc("GET /api/admin/v1/users", f.handleListUsers)
 	mux.HandleFunc("GET /api/admin/v1/user-emails", f.handleListEmails)
 	mux.HandleFunc("POST /api/admin/v1/users/{id}/lock", f.handleLock)
+	mux.HandleFunc("POST /api/admin/v1/users/{id}/unlock", f.handleUnlock)
 	return httptest.NewServer(mux)
 }
 
@@ -157,12 +160,38 @@ func (f *fakeMAS) handleLock(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.lockCalls = append(f.lockCalls, id)
 	for _, u := range f.users {
 		if u.id == id {
 			now := time.Now().UTC()
 			u.lockedAt = &now
+			hook := f.afterLock
+			f.mu.Unlock()
+			if hook != nil {
+				hook()
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"type": "user", "id": u.id}}) //nolint:errcheck
+			return
+		}
+	}
+	f.mu.Unlock()
+	w.WriteHeader(http.StatusNotFound)
+	fmt.Fprintf(w, `{"errors":[{"title":"User ID %s not found"}]}`, id)
+}
+
+func (f *fakeMAS) handleUnlock(w http.ResponseWriter, r *http.Request) {
+	if !f.requireBearer(w, r) {
+		return
+	}
+	id := r.PathValue("id")
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unlockCalls = append(f.unlockCalls, id)
+	for _, u := range f.users {
+		if u.id == id {
+			u.lockedAt = nil
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"type": "user", "id": u.id}}) //nolint:errcheck
 			return
@@ -174,9 +203,16 @@ func (f *fakeMAS) handleLock(w http.ResponseWriter, r *http.Request) {
 
 // --- fake store and mailer --------------------------------------------------------------------
 
+type verificationResult struct {
+	verified bool
+	err      error
+}
+
 type fakeStore struct {
-	verified  map[string]bool
-	highWater map[string]time.Time
+	mu          sync.Mutex
+	verified    map[string]bool
+	verifyQueue map[string][]verificationResult
+	highWater   map[string]time.Time
 
 	// setErr, when non-nil, is returned by SetLockerHighWaterMark -- used to prove a failed
 	// digest send/store update doesn't advance the mark.
@@ -184,19 +220,56 @@ type fakeStore struct {
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{verified: map[string]bool{}, highWater: map[string]time.Time{}}
+	return &fakeStore{
+		verified:    map[string]bool{},
+		verifyQueue: map[string][]verificationResult{},
+		highWater:   map[string]time.Time{},
+	}
 }
 
 func (s *fakeStore) VerifiedMXIDs(ctx context.Context) (map[string]bool, error) {
-	return s.verified, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]bool, len(s.verified))
+	for mxid, verified := range s.verified {
+		out[mxid] = verified
+	}
+	return out, nil
+}
+
+func (s *fakeStore) IsVerified(ctx context.Context, mxid string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if queue := s.verifyQueue[mxid]; len(queue) > 0 {
+		result := queue[0]
+		s.verifyQueue[mxid] = queue[1:]
+		return result.verified, result.err
+	}
+	return s.verified[mxid], nil
+}
+
+func (s *fakeStore) setVerified(mxid string, verified bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.verified[mxid] = verified
+}
+
+func (s *fakeStore) queueVerification(mxid string, results ...verificationResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.verifyQueue[mxid] = append(s.verifyQueue[mxid], results...)
 }
 
 func (s *fakeStore) LockerHighWaterMark(ctx context.Context, key string) (time.Time, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	v, ok := s.highWater[key]
 	return v, ok, nil
 }
 
 func (s *fakeStore) SetLockerHighWaterMark(ctx context.Context, key string, value time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.setErr != nil {
 		return s.setErr
 	}
@@ -273,6 +346,133 @@ func TestSweep_LocksOnlyStaleUnclaimedEmaillessAccounts(t *testing.T) {
 
 	if got, want := mas.lockCalls, []string{"u-stale-unclaimed"}; !equalStrSlices(got, want) {
 		t.Errorf("lockCalls = %v, want %v", got, want)
+	}
+}
+
+func TestSweep_PreLockRecheckProtectsNewGrant(t *testing.T) {
+	mas := newFakeMAS("locker-client", "s3cr3t")
+	mas.addUser("u-newly-verified", "newlyverified", time.Now().Add(-72*time.Hour))
+
+	store := newFakeStore()
+	mxid := "@newlyverified:" + serverName
+	// VerifiedMXIDs takes an empty sweep-start snapshot. The per-account read represents a grant
+	// committed after that snapshot but before janitor reaches the candidate.
+	store.queueVerification(mxid, verificationResult{verified: true})
+
+	cfg := Config{LockAfterHours: 48}
+	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
+
+	if err := sweeper.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if len(mas.lockCalls) != 0 {
+		t.Errorf("lockCalls = %v, want none after fresh verification", mas.lockCalls)
+	}
+}
+
+func TestSweep_PreLockRecheckErrorRefusesToLock(t *testing.T) {
+	mas := newFakeMAS("locker-client", "s3cr3t")
+	mas.addUser("u-db-uncertain", "dbuncertain", time.Now().Add(-72*time.Hour))
+
+	store := newFakeStore()
+	store.queueVerification("@dbuncertain:"+serverName, verificationResult{err: errors.New("database unavailable")})
+
+	cfg := Config{LockAfterHours: 48}
+	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
+
+	if err := sweeper.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if len(mas.lockCalls) != 0 {
+		t.Errorf("lockCalls = %v, want none when verification cannot be proved", mas.lockCalls)
+	}
+}
+
+func TestSweep_UnlocksVerifiedAccountFoundLocked(t *testing.T) {
+	mas := newFakeMAS("locker-client", "s3cr3t")
+	user := mas.addUser("u-entitled-locked", "entitledlocked", time.Now().Add(-72*time.Hour))
+	lockedAt := time.Now().Add(-time.Hour)
+	user.lockedAt = &lockedAt
+
+	store := newFakeStore()
+	store.setVerified("@entitledlocked:"+serverName, true)
+
+	cfg := Config{LockAfterHours: 48}
+	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
+
+	if err := sweeper.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if got, want := mas.unlockCalls, []string{"u-entitled-locked"}; !equalStrSlices(got, want) {
+		t.Errorf("unlockCalls = %v, want %v", got, want)
+	}
+	if len(mas.lockCalls) != 0 {
+		t.Errorf("lockCalls = %v, want none", mas.lockCalls)
+	}
+}
+
+func TestSweep_LeavesUnverifiedAccountLocked(t *testing.T) {
+	mas := newFakeMAS("locker-client", "s3cr3t")
+	user := mas.addUser("u-unverified-locked", "unverifiedlocked", time.Now().Add(-72*time.Hour))
+	lockedAt := time.Now().Add(-time.Hour)
+	user.lockedAt = &lockedAt
+
+	store := newFakeStore()
+	cfg := Config{LockAfterHours: 48}
+	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
+
+	if err := sweeper.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if len(mas.unlockCalls) != 0 {
+		t.Errorf("unlockCalls = %v, want none", mas.unlockCalls)
+	}
+}
+
+func TestSweep_CompensatesWhenGrantAppearsDuringLock(t *testing.T) {
+	mas := newFakeMAS("locker-client", "s3cr3t")
+	mas.addUser("u-raced-grant", "racedgrant", time.Now().Add(-72*time.Hour))
+
+	store := newFakeStore()
+	mxid := "@racedgrant:" + serverName
+	mas.afterLock = func() { store.setVerified(mxid, true) }
+
+	cfg := Config{LockAfterHours: 48}
+	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
+
+	if err := sweeper.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if got, want := mas.lockCalls, []string{"u-raced-grant"}; !equalStrSlices(got, want) {
+		t.Errorf("lockCalls = %v, want %v", got, want)
+	}
+	if got, want := mas.unlockCalls, []string{"u-raced-grant"}; !equalStrSlices(got, want) {
+		t.Errorf("unlockCalls = %v, want compensating %v", got, want)
+	}
+}
+
+func TestSweep_PostLockVerificationErrorCompensates(t *testing.T) {
+	mas := newFakeMAS("locker-client", "s3cr3t")
+	mas.addUser("u-post-lock-uncertain", "postlockuncertain", time.Now().Add(-72*time.Hour))
+
+	store := newFakeStore()
+	mxid := "@postlockuncertain:" + serverName
+	store.queueVerification(mxid,
+		verificationResult{verified: false},
+		verificationResult{err: errors.New("database unavailable")},
+	)
+
+	cfg := Config{LockAfterHours: 48}
+	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
+
+	if err := sweeper.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if got, want := mas.lockCalls, []string{"u-post-lock-uncertain"}; !equalStrSlices(got, want) {
+		t.Errorf("lockCalls = %v, want %v", got, want)
+	}
+	if got, want := mas.unlockCalls, []string{"u-post-lock-uncertain"}; !equalStrSlices(got, want) {
+		t.Errorf("unlockCalls = %v, want compensating %v", got, want)
 	}
 }
 
