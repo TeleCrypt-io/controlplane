@@ -130,6 +130,66 @@ func TestLockerHighWaterMark(t *testing.T) {
 	}
 }
 
+func TestJanitorLockProvenance(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+
+	confirmed, pending, err := store.JanitorLockState(ctx)
+	if err != nil {
+		t.Fatalf("JanitorLockState (empty): %v", err)
+	}
+	if len(confirmed) != 0 || len(pending) != 0 {
+		t.Fatalf("initial janitor state = confirmed %v pending %v, want empty", confirmed, pending)
+	}
+
+	if _, err := store.BeginJanitorLock(ctx, "mas-user-1"); err != nil {
+		t.Fatalf("BeginJanitorLock: %v", err)
+	}
+	if _, err := store.BeginJanitorLock(ctx, "mas-user-2"); err != nil {
+		t.Fatalf("BeginJanitorLock second: %v", err)
+	}
+
+	confirmed, pending, err = store.JanitorLockState(ctx)
+	if err != nil {
+		t.Fatalf("JanitorLockState after begin: %v", err)
+	}
+	if len(confirmed) != 0 || pending["mas-user-1"].IsZero() || pending["mas-user-2"].IsZero() || len(pending) != 2 {
+		t.Fatalf("janitor state after begin = confirmed %v pending %v, want two intents", confirmed, pending)
+	}
+
+	lockedAt := time.Date(2026, 7, 29, 22, 0, 0, 123456000, time.UTC)
+	if err := store.ConfirmJanitorLock(ctx, "mas-user-1", lockedAt); err != nil {
+		t.Fatalf("ConfirmJanitorLock: %v", err)
+	}
+	confirmed, pending, err = store.JanitorLockState(ctx)
+	if err != nil {
+		t.Fatalf("JanitorLockState after confirm: %v", err)
+	}
+	if !confirmed["mas-user-1"].Equal(lockedAt) || len(confirmed) != 1 {
+		t.Fatalf("confirmed locks = %v, want exact locked_at for mas-user-1", confirmed)
+	}
+	if _, found := pending["mas-user-1"]; found {
+		t.Fatal("confirmation did not atomically clear mas-user-1 intent")
+	}
+	if pending["mas-user-2"].IsZero() || len(pending) != 1 {
+		t.Fatalf("pending locks = %v, want only mas-user-2", pending)
+	}
+
+	if err := store.DeleteJanitorLock(ctx, "mas-user-1"); err != nil {
+		t.Fatalf("DeleteJanitorLock: %v", err)
+	}
+	if err := store.DeleteJanitorLock(ctx, "mas-user-2"); err != nil {
+		t.Fatalf("DeleteJanitorLock pending: %v", err)
+	}
+	confirmed, pending, err = store.JanitorLockState(ctx)
+	if err != nil {
+		t.Fatalf("JanitorLockState after delete: %v", err)
+	}
+	if len(confirmed) != 0 || len(pending) != 0 {
+		t.Fatalf("janitor state after delete = confirmed %v pending %v, want empty", confirmed, pending)
+	}
+}
+
 func TestIsVerified(t *testing.T) {
 	store, pool := newTestStore(t)
 	ctx := context.Background()
@@ -184,6 +244,9 @@ func TestVerificationGrantProvenance(t *testing.T) {
 	}
 	if billing, err := store.HasBillingVerificationGrant(ctx, "@seat:telecrypt.io"); err != nil || !billing {
 		t.Fatalf("billing seat billing grant = %v, %v; want true, nil", billing, err)
+	}
+	if verified, err := store.IsVerified(ctx, "@seat:telecrypt.io"); err != nil || !verified {
+		t.Fatalf("billing-only seat IsVerified = %v, %v; want true, nil", verified, err)
 	}
 
 	// The composite foreign key rejects a grant whose mxid is not an attached seat of team.

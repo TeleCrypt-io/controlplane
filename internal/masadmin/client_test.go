@@ -26,9 +26,9 @@ type fakeUser struct {
 
 // fakeMASAdmin reproduces just enough of MAS 1.16.0's admin API — POST /oauth2/token
 // (client_credentials, Basic-auth-only), GET /api/admin/v1/users and /user-emails (cursor
-// pagination via page[first]/page[after]), and POST /api/admin/v1/users/{id}/lock — to exercise
-// Client's HTTP mechanics end-to-end. See client.go's package doc for the MAS source files this
-// is modeled on.
+// pagination via page[first]/page[after]), and POST /api/admin/v1/users/{id}/{lock,unlock} — to
+// exercise Client's HTTP mechanics end-to-end. See client.go's package doc for the MAS source
+// files this is modeled on.
 type fakeMASAdmin struct {
 	clientID       string
 	clientSecret   string
@@ -73,6 +73,7 @@ func (f *fakeMASAdmin) server() *httptest.Server {
 	mux.HandleFunc("GET /api/admin/v1/users", f.handleListUsers)
 	mux.HandleFunc("GET /api/admin/v1/user-emails", f.handleListEmails)
 	mux.HandleFunc("POST /api/admin/v1/users/{id}/lock", f.handleLock)
+	mux.HandleFunc("POST /api/admin/v1/users/{id}/unlock", f.handleUnlock)
 	return httptest.NewServer(mux)
 }
 
@@ -267,11 +268,51 @@ func (f *fakeMASAdmin) handleLock(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	for _, u := range f.users {
 		if u.id == id {
-			now := time.Now().UTC()
-			u.lockedAt = &now
+			if u.lockedAt == nil {
+				now := time.Now().UTC()
+				u.lockedAt = &now
+			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-				"data": map[string]any{"type": "user", "id": u.id},
+				"data": map[string]any{
+					"type": "user",
+					"id":   u.id,
+					"attributes": map[string]any{
+						"username":   u.username,
+						"created_at": u.createdAt,
+						"locked_at":  u.lockedAt,
+					},
+				},
+			})
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNotFound)
+	fmt.Fprintf(w, `{"errors":[{"title":"User ID %s not found"}]}`, id)
+}
+
+func (f *fakeMASAdmin) handleUnlock(w http.ResponseWriter, r *http.Request) {
+	if !f.requireBearer(w, r) {
+		return
+	}
+	id := r.PathValue("id")
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, u := range f.users {
+		if u.id == id {
+			u.lockedAt = nil
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+				"data": map[string]any{
+					"type": "user",
+					"id":   u.id,
+					"attributes": map[string]any{
+						"username":   u.username,
+						"created_at": u.createdAt,
+						"locked_at":  u.lockedAt,
+					},
+				},
 			})
 			return
 		}
@@ -392,8 +433,12 @@ func TestLockUser(t *testing.T) {
 	c := NewClient(srv.URL, "locker-client", "s3cr3t")
 	ctx := context.Background()
 
-	if err := c.LockUser(ctx, "user-1"); err != nil {
+	lockedAt, err := c.LockUser(ctx, "user-1")
+	if err != nil {
 		t.Fatalf("LockUser: %v", err)
+	}
+	if lockedAt.IsZero() {
+		t.Fatal("LockUser returned a zero locked_at timestamp")
 	}
 
 	users, err := c.ListUsers(ctx)
@@ -411,9 +456,47 @@ func TestLockUser_NotFound(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "locker-client", "s3cr3t")
-	err := c.LockUser(context.Background(), "no-such-user")
+	_, err := c.LockUser(context.Background(), "no-such-user")
 	if err == nil {
 		t.Fatal("expected an error locking an unknown user ID")
+	}
+	if !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("error = %v, want errors.Is(..., ErrUserNotFound)", err)
+	}
+}
+
+func TestUnlockUser(t *testing.T) {
+	fake := newFakeMASAdmin("locker-client", "s3cr3t")
+	srv := fake.server()
+	defer srv.Close()
+
+	fake.addUser("user-1", "entitled-agent", time.Now().Add(-72*time.Hour), true)
+
+	c := NewClient(srv.URL, "locker-client", "s3cr3t")
+	ctx := context.Background()
+
+	if err := c.UnlockUser(ctx, "user-1"); err != nil {
+		t.Fatalf("UnlockUser: %v", err)
+	}
+
+	users, err := c.ListUsers(ctx)
+	if err != nil {
+		t.Fatalf("ListUsers after unlock: %v", err)
+	}
+	if len(users) != 1 || users[0].LockedAt != nil {
+		t.Fatalf("expected user-1 to be unlocked, got %+v", users)
+	}
+}
+
+func TestUnlockUser_NotFound(t *testing.T) {
+	fake := newFakeMASAdmin("locker-client", "s3cr3t")
+	srv := fake.server()
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "locker-client", "s3cr3t")
+	err := c.UnlockUser(context.Background(), "no-such-user")
+	if err == nil {
+		t.Fatal("expected an error unlocking an unknown user ID")
 	}
 	if !errors.Is(err, ErrUserNotFound) {
 		t.Errorf("error = %v, want errors.Is(..., ErrUserNotFound)", err)

@@ -123,6 +123,100 @@ func (s *Store) SetLockerHighWaterMark(ctx context.Context, key string, value ti
 	return nil
 }
 
+const (
+	janitorLockKeyPrefix       = "janitor-lock:"
+	janitorLockIntentKeyPrefix = "janitor-lock-intent:"
+)
+
+// JanitorLockState returns exact confirmed MAS locked_at timestamps plus pre-call intents. MAS
+// exposes no actor/reason for a lock, so timestamp identity prevents janitor from reversing an
+// operator unlock/relock cycle. A durable intent marks a crash/ambiguous-response gap so janitor
+// can relinquish it rather than later misclassifying an unknown lock as its own.
+func (s *Store) JanitorLockState(ctx context.Context) (
+	confirmed, pending map[string]time.Time,
+	err error,
+) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT 'confirmed', substr(key, length($1) + 1), value
+		FROM locker_state
+		WHERE key LIKE $1 || '%'
+		UNION ALL
+		SELECT 'pending', substr(key, length($2) + 1), value
+		FROM locker_state
+		WHERE key LIKE $2 || '%'
+	`, janitorLockKeyPrefix, janitorLockIntentKeyPrefix)
+	if err != nil {
+		return nil, nil, fmt.Errorf("query janitor lock state: %w", err)
+	}
+	defer rows.Close()
+
+	confirmed = make(map[string]time.Time)
+	pending = make(map[string]time.Time)
+	for rows.Next() {
+		var kind, userID string
+		var at time.Time
+		if err := rows.Scan(&kind, &userID, &at); err != nil {
+			return nil, nil, fmt.Errorf("scan janitor lock state: %w", err)
+		}
+		if kind == "confirmed" {
+			confirmed[userID] = at
+		} else {
+			pending[userID] = at
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterate janitor lock state: %w", err)
+	}
+	return confirmed, pending, nil
+}
+
+// BeginJanitorLock durably records intent before calling MAS. Intent alone never authorizes an
+// unlock; only a successful response can be confirmed with an exact locked_at timestamp.
+func (s *Store) BeginJanitorLock(ctx context.Context, userID string) (time.Time, error) {
+	beganAt := time.Now().UTC()
+	if err := s.SetLockerHighWaterMark(ctx, janitorLockIntentKeyPrefix+userID, beganAt); err != nil {
+		return time.Time{}, err
+	}
+	return beganAt, nil
+}
+
+// ConfirmJanitorLock atomically stores MAS's exact locked_at timestamp and clears the pre-call
+// intent. On failure the transaction leaves the intent intact for a later sweep to reconcile.
+func (s *Store) ConfirmJanitorLock(ctx context.Context, userID string, lockedAt time.Time) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin janitor lock confirmation %s: %w", userID, err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO locker_state (key, value) VALUES ($1, $2)
+		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+	`, janitorLockKeyPrefix+userID, lockedAt); err != nil {
+		return fmt.Errorf("record confirmed janitor lock %s: %w", userID, err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM locker_state WHERE key = $1`, janitorLockIntentKeyPrefix+userID); err != nil {
+		return fmt.Errorf("clear janitor lock intent %s: %w", userID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit janitor lock confirmation %s: %w", userID, err)
+	}
+	return nil
+}
+
+// DeleteJanitorLock removes both confirmed provenance and any pending intent after an unlock,
+// deactivation transfer, or when MAS is already unlocked. It intentionally does not mutate MAS.
+func (s *Store) DeleteJanitorLock(ctx context.Context, userID string) error {
+	if _, err := s.pool.Exec(ctx,
+		`DELETE FROM locker_state WHERE key = $1 OR key = $2`,
+		janitorLockKeyPrefix+userID,
+		janitorLockIntentKeyPrefix+userID,
+	); err != nil {
+		return fmt.Errorf("delete janitor lock state %s: %w", userID, err)
+	}
+	return nil
+}
+
 // IsVerified reports whether mxid has any verification grant. It is suitable for read-only
 // callers; cashier must use the source-specific methods below so it only mutates billing grants.
 func (s *Store) IsVerified(ctx context.Context, mxid string) (bool, error) {
