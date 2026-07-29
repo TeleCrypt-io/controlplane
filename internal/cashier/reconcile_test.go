@@ -76,10 +76,12 @@ func (f *fakeEntitlementStore) DeleteBillingVerificationGrant(_ context.Context,
 }
 
 type fakeSynapse struct {
-	verified []string
-	cleared  []string
-	setErr   error
-	clearErr error
+	verified      []string
+	cleared       []string
+	setErr        error
+	clearErr      error
+	userExists    *bool
+	userExistsErr error
 }
 
 func (f *fakeSynapse) SetUserTypeVerified(_ context.Context, mxid string) error {
@@ -90,6 +92,16 @@ func (f *fakeSynapse) SetUserTypeVerified(_ context.Context, mxid string) error 
 func (f *fakeSynapse) ClearUserType(_ context.Context, mxid string) error {
 	f.cleared = append(f.cleared, mxid)
 	return f.clearErr
+}
+
+func (f *fakeSynapse) UserExists(_ context.Context, _ string) (bool, error) {
+	if f.userExistsErr != nil {
+		return false, f.userExistsErr
+	}
+	if f.userExists != nil {
+		return *f.userExists, nil
+	}
+	return true, nil // default test fake accepts local accounts.
 }
 
 var errTeamNotFound = errUnauthorized

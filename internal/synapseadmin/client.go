@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -17,6 +18,28 @@ type Client struct {
 	homeserverURL string
 	adminToken    string
 	httpClient    *http.Client
+}
+
+// UserExists confirms an MXID is a local Synapse account before cashier lets it consume a seat.
+func (c *Client) UserExists(ctx context.Context, mxid string) (bool, error) {
+	endpoint := fmt.Sprintf("%s/_synapse/admin/v2/users/%s", c.homeserverURL, url.PathEscape(mxid))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.adminToken)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("synapse admin get user: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("synapse admin get user: unexpected status %d", resp.StatusCode)
+	}
+	return true, nil
 }
 
 func NewClient(homeserverURL, adminToken string) *Client {
@@ -48,8 +71,8 @@ func (c *Client) setUserType(ctx context.Context, mxid string, userType *string)
 		return err
 	}
 
-	url := fmt.Sprintf("%s/_synapse/admin/v2/users/%s", c.homeserverURL, mxid)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(b))
+	endpoint := fmt.Sprintf("%s/_synapse/admin/v2/users/%s", c.homeserverURL, url.PathEscape(mxid))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(b))
 	if err != nil {
 		return err
 	}

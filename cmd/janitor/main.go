@@ -47,6 +47,11 @@ func main() {
 		slog.Error("migrate", "error", err)
 		os.Exit(1)
 	}
+	store := db.NewStore(pool)
+	if err := store.BindBillingEnvironment(ctx, cfg.BillingEnv, cfg.MatrixDeployment); err != nil {
+		slog.Error("billing environment guard", "error", err)
+		os.Exit(1)
+	}
 
 	sweeper := build(cfg, pool)
 

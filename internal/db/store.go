@@ -19,8 +19,47 @@ type Store struct {
 	pool *pgxpool.Pool
 }
 
+// ErrSeatCapacityReached and ErrCheckoutInProgress are safe business-condition
+// sentinels for HTTP handlers. They deliberately do not expose database details.
+var (
+	ErrSeatCapacityReached       = errors.New("no paid seats available")
+	ErrCheckoutInProgress        = errors.New("checkout already in progress")
+	ErrSeatCountChangeInProgress = errors.New("seat count change already in progress")
+	ErrLiveSubscription          = errors.New("subscription is already active")
+	ErrStaleSubscription         = errors.New("stale subscription event")
+)
+
 func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
+}
+
+// BindBillingEnvironment permanently assigns this database to one explicit billing-provider
+// environment and Matrix deployment. The singleton row prevents Dodo test and live state—or two
+// Matrix deployments—from ever sharing a database merely because an operator changed env vars.
+func (s *Store) BindBillingEnvironment(ctx context.Context, billingEnv, matrixDeployment string) error {
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO billing_environment_guard (singleton, billing_env, matrix_deployment_id)
+		VALUES (TRUE, $1, $2)
+		ON CONFLICT (singleton) DO NOTHING
+	`, billingEnv, matrixDeployment); err != nil {
+		return fmt.Errorf("bind billing environment: %w", err)
+	}
+
+	var boundEnv, boundDeployment string
+	if err := s.pool.QueryRow(ctx, `
+		SELECT billing_env, matrix_deployment_id
+		FROM billing_environment_guard
+		WHERE singleton = TRUE
+	`).Scan(&boundEnv, &boundDeployment); err != nil {
+		return fmt.Errorf("read billing environment binding: %w", err)
+	}
+	if boundEnv != billingEnv || boundDeployment != matrixDeployment {
+		return fmt.Errorf(
+			"billing database is bound to environment %q and deployment %q, not %q and %q",
+			boundEnv, boundDeployment, billingEnv, matrixDeployment,
+		)
+	}
+	return nil
 }
 
 // VerifiedMXIDs returns the full effective verification set. The legacy verified table is the
@@ -176,6 +215,10 @@ type Team struct {
 	DodoSubscriptionID *string
 	CheckoutSessionID  *string
 	CheckoutStartedAt  *time.Time
+	CheckoutAttemptID  *uuid.UUID
+	PendingPaidSeats   *int
+	SeatCountStartedAt *time.Time
+	SeatCountAttemptID *uuid.UUID
 	SubscriptionStatus string
 	PaidSeats          int
 	CreatedAt          time.Time
@@ -192,9 +235,14 @@ func scanTeam(row pgx.Row) (Team, error) {
 	var t Team
 	var dodoCustomerID, dodoSubID, checkoutSessionID *string
 	var checkoutStartedAt *time.Time
+	var checkoutAttemptID *uuid.UUID
+	var pendingPaidSeats *int
+	var seatCountStartedAt *time.Time
+	var seatCountAttemptID *uuid.UUID
 	err := row.Scan(
 		&t.ID, &t.AdminMXID, &dodoCustomerID, &dodoSubID,
-		&checkoutSessionID, &checkoutStartedAt,
+		&checkoutSessionID, &checkoutStartedAt, &checkoutAttemptID,
+		&pendingPaidSeats, &seatCountStartedAt, &seatCountAttemptID,
 		&t.SubscriptionStatus, &t.PaidSeats, &t.CreatedAt,
 	)
 	if err != nil {
@@ -204,12 +252,17 @@ func scanTeam(row pgx.Row) (Team, error) {
 	t.DodoSubscriptionID = dodoSubID
 	t.CheckoutSessionID = checkoutSessionID
 	t.CheckoutStartedAt = checkoutStartedAt
+	t.CheckoutAttemptID = checkoutAttemptID
+	t.PendingPaidSeats = pendingPaidSeats
+	t.SeatCountStartedAt = seatCountStartedAt
+	t.SeatCountAttemptID = seatCountAttemptID
 	return t, nil
 }
 
 const teamSelectCols = `
 	id, admin_mxid, dodo_customer_id, dodo_subscription_id,
-	checkout_session_id, checkout_started_at,
+	checkout_session_id, checkout_started_at, checkout_attempt_id,
+	pending_paid_seats, seat_count_change_started_at, seat_count_change_attempt_id,
 	subscription_status, paid_seats, created_at
 `
 
@@ -264,11 +317,126 @@ func (s *Store) GetTeamByDodoSubscriptionID(ctx context.Context, subscriptionID 
 	return t, true, nil
 }
 
-// InsertSeat attaches mxid to teamID.
-func (s *Store) InsertSeat(ctx context.Context, teamID uuid.UUID, mxid string) error {
+// AttachSeat atomically checks capacity and attaches mxid.  A process-local mutex is
+// insufficient because cashier can be replicated; the team row lock serializes every writer.
+func (s *Store) AttachSeat(ctx context.Context, teamID uuid.UUID, mxid string) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin attach seat: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var paidSeats int
+	var pendingPaidSeats *int
+	if err := tx.QueryRow(ctx, `SELECT paid_seats, pending_paid_seats FROM teams WHERE id = $1 FOR UPDATE`, teamID).Scan(&paidSeats, &pendingPaidSeats); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("team not found: %w", err)
+		}
+		return fmt.Errorf("lock team for seat attach: %w", err)
+	}
+	var attached int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM seats WHERE team_id = $1`, teamID).Scan(&attached); err != nil {
+		return fmt.Errorf("count seats for attach: %w", err)
+	}
+	effectiveCapacity := paidSeats
+	if pendingPaidSeats != nil && *pendingPaidSeats < effectiveCapacity {
+		effectiveCapacity = *pendingPaidSeats
+	}
+	if attached >= effectiveCapacity {
+		return ErrSeatCapacityReached
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO seats (mxid, team_id) VALUES ($1, $2)`, mxid, teamID); err != nil {
+		return fmt.Errorf("insert seat %s: %w", mxid, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit seat attach: %w", err)
+	}
+	return nil
+}
+
+// ReserveSeatCountChange atomically validates and records the target capacity before the
+// provider call. AttachSeat applies the lower of paid_seats and this pending value, so a
+// concurrent attachment cannot race a downgrade that Dodo has not acknowledged yet.
+type SeatCountReservation struct {
+	AttemptID uuid.UUID
+	Attached  int
+	Reused    bool
+}
+
+func (s *Store) ReserveSeatCountChange(ctx context.Context, teamID uuid.UUID, quantity int, now time.Time) (SeatCountReservation, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return SeatCountReservation{}, fmt.Errorf("begin seat count reservation: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var status string
+	var subscriptionID *string
+	var pending *int
+	var pendingAttempt *uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT subscription_status, dodo_subscription_id, pending_paid_seats, seat_count_change_attempt_id
+		FROM teams WHERE id = $1 FOR UPDATE
+	`, teamID).Scan(&status, &subscriptionID, &pending, &pendingAttempt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return SeatCountReservation{}, fmt.Errorf("team not found: %w", err)
+		}
+		return SeatCountReservation{}, fmt.Errorf("lock team for seat count change: %w", err)
+	}
+	if (status != "active" && status != "on_hold") || subscriptionID == nil || *subscriptionID == "" {
+		return SeatCountReservation{}, ErrLiveSubscription
+	}
+	if pending != nil {
+		if *pending == quantity && pendingAttempt != nil {
+			var attached int
+			if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM seats WHERE team_id = $1`, teamID).Scan(&attached); err != nil {
+				return SeatCountReservation{}, fmt.Errorf("count seats for repeated seat count change: %w", err)
+			}
+			return SeatCountReservation{AttemptID: *pendingAttempt, Attached: attached, Reused: true}, nil
+		}
+		return SeatCountReservation{}, ErrSeatCountChangeInProgress
+	}
+
+	var attached int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM seats WHERE team_id = $1`, teamID).Scan(&attached); err != nil {
+		return SeatCountReservation{}, fmt.Errorf("count seats for seat count change: %w", err)
+	}
+	if attached > quantity {
+		return SeatCountReservation{Attached: attached}, ErrSeatCapacityReached
+	}
+	attemptID := uuid.New()
+	if _, err := tx.Exec(ctx, `
+		UPDATE teams SET pending_paid_seats = $2, seat_count_change_started_at = $3,
+			seat_count_change_attempt_id = $4
+		WHERE id = $1
+	`, teamID, quantity, now, attemptID); err != nil {
+		return SeatCountReservation{}, fmt.Errorf("reserve seat count change: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return SeatCountReservation{}, fmt.Errorf("commit seat count reservation: %w", err)
+	}
+	return SeatCountReservation{AttemptID: attemptID, Attached: attached}, nil
+}
+
+// ReleaseSeatCountChange removes only the reservation for the provider request that failed.
+// The quantity predicate prevents an older worker from releasing a newer operation.
+func (s *Store) ReleaseSeatCountChange(ctx context.Context, teamID uuid.UUID, attemptID uuid.UUID) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO seats (mxid, team_id) VALUES ($1, $2)
-	`, mxid, teamID)
+		UPDATE teams SET pending_paid_seats = NULL, seat_count_change_started_at = NULL,
+			seat_count_change_attempt_id = NULL
+		WHERE id = $1 AND seat_count_change_attempt_id = $2
+	`, teamID, attemptID)
+	if err != nil {
+		return fmt.Errorf("release seat count reservation: %w", err)
+	}
+	return nil
+}
+
+// InsertSeat is retained for migration/invariant tests and legacy callers. New cashier request
+// paths must use AttachSeat, which is the capacity-safe operation.
+// Deprecated: use AttachSeat.
+func (s *Store) InsertSeat(ctx context.Context, teamID uuid.UUID, mxid string) error {
+	_, err := s.pool.Exec(ctx, `INSERT INTO seats (mxid, team_id) VALUES ($1, $2)`, mxid, teamID)
 	if err != nil {
 		return fmt.Errorf("insert seat %s: %w", mxid, err)
 	}
@@ -328,29 +496,215 @@ func (s *Store) UpdateTeamSubscription(ctx context.Context, teamID uuid.UUID, st
 			dodo_customer_id = COALESCE($4, dodo_customer_id),
 			dodo_subscription_id = COALESCE($5, dodo_subscription_id),
 			checkout_session_id = CASE WHEN $5::text IS NOT NULL THEN NULL ELSE checkout_session_id END,
-			checkout_started_at = CASE WHEN $5::text IS NOT NULL THEN NULL ELSE checkout_started_at END
+			checkout_started_at = CASE WHEN $5::text IS NOT NULL THEN NULL ELSE checkout_started_at END,
+			pending_paid_seats = NULL,
+			seat_count_change_started_at = NULL,
+			seat_count_change_attempt_id = NULL
 		WHERE id = $1
 	`, teamID, status, paidSeats, dodoCustomerID, dodoSubscriptionID)
 	if err != nil {
 		return fmt.Errorf("update team subscription: %w", err)
 	}
+	_, err = s.pool.Exec(ctx, `
+		UPDATE dodo_subscription_bindings
+		SET status = $2, updated_at = now()
+		WHERE team_id = $1 AND is_current
+	`, teamID, status)
+	if err != nil {
+		return fmt.Errorf("update current subscription binding: %w", err)
+	}
 	return nil
 }
 
-// RecordHostedCheckout reserves one in-flight hosted checkout for a team.
-func (s *Store) RecordHostedCheckout(ctx context.Context, teamID uuid.UUID, sessionID string, quantity int, startedAt time.Time) error {
-	_, err := s.pool.Exec(ctx, `
+// CheckoutReservation is the durable idempotency value for one hosted checkout attempt.
+type CheckoutReservation struct{ AttemptID uuid.UUID }
+
+// BeginCheckout reserves a checkout before the provider call. It supersedes a terminal
+// subscription immediately, so delayed events for it cannot damage the replacement flow.
+func (s *Store) BeginCheckout(ctx context.Context, teamID uuid.UUID, quantity int, now time.Time) (CheckoutReservation, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return CheckoutReservation{}, fmt.Errorf("begin checkout reservation: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var status string
+	var paidSeats int
+	var startedAt *time.Time
+	var existingAttemptID *uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT subscription_status, paid_seats, checkout_started_at, checkout_attempt_id
+		FROM teams WHERE id = $1 FOR UPDATE
+	`, teamID).Scan(&status, &paidSeats, &startedAt, &existingAttemptID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return CheckoutReservation{}, fmt.Errorf("team not found: %w", err)
+		}
+		return CheckoutReservation{}, fmt.Errorf("lock team for checkout: %w", err)
+	}
+	if status == "active" || status == "on_hold" {
+		return CheckoutReservation{}, ErrLiveSubscription
+	}
+	if status == "pending" && startedAt != nil && now.Sub(*startedAt) < 24*time.Hour {
+		if existingAttemptID != nil && paidSeats == quantity {
+			return CheckoutReservation{AttemptID: *existingAttemptID}, nil
+		}
+		return CheckoutReservation{}, ErrCheckoutInProgress
+	}
+
+	attemptID := uuid.New()
+	if _, err := tx.Exec(ctx, `
+		UPDATE dodo_subscription_bindings SET is_current = FALSE, updated_at = now()
+		WHERE team_id = $1 AND is_current
+	`, teamID); err != nil {
+		return CheckoutReservation{}, fmt.Errorf("supersede terminal subscription: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
 		UPDATE teams SET
-			subscription_status = 'pending',
-			paid_seats = $3,
-			checkout_session_id = $2,
-			checkout_started_at = $4
+			subscription_status = 'pending', paid_seats = $2,
+			dodo_subscription_id = NULL,
+			checkout_session_id = NULL, checkout_started_at = $3,
+			checkout_attempt_id = $4,
+			checkout_previous_status = $5, checkout_previous_paid_seats = $6
 		WHERE id = $1
-	`, teamID, sessionID, quantity, startedAt)
+	`, teamID, quantity, now, attemptID, status, paidSeats); err != nil {
+		return CheckoutReservation{}, fmt.Errorf("reserve checkout: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return CheckoutReservation{}, fmt.Errorf("commit checkout reservation: %w", err)
+	}
+	return CheckoutReservation{AttemptID: attemptID}, nil
+}
+
+// CompleteCheckoutReservation records the provider session only if it belongs to the current
+// attempt. A stale worker can therefore never overwrite a newer checkout.
+func (s *Store) CompleteCheckoutReservation(ctx context.Context, teamID uuid.UUID, attemptID uuid.UUID, sessionID string) error {
+	command, err := s.pool.Exec(ctx, `
+		UPDATE teams SET checkout_session_id = $3
+		WHERE id = $1 AND checkout_attempt_id = $2
+	`, teamID, attemptID, sessionID)
 	if err != nil {
 		return fmt.Errorf("record hosted checkout: %w", err)
 	}
+	if command.RowsAffected() != 1 {
+		return errors.New("checkout reservation no longer current")
+	}
 	return nil
+}
+
+// ReleaseCheckoutReservation restores the terminal/no-subscription state after a provider
+// failure. It is conditional on the attempt id, so it cannot release a newer checkout.
+func (s *Store) ReleaseCheckoutReservation(ctx context.Context, teamID uuid.UUID, attemptID uuid.UUID) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE teams SET
+			subscription_status = COALESCE(checkout_previous_status, 'none'),
+			paid_seats = COALESCE(checkout_previous_paid_seats, 0),
+			checkout_session_id = NULL, checkout_started_at = NULL,
+			checkout_attempt_id = NULL,
+			checkout_previous_status = NULL, checkout_previous_paid_seats = NULL
+		WHERE id = $1 AND checkout_attempt_id = $2
+	`, teamID, attemptID)
+	if err != nil {
+		return fmt.Errorf("release checkout reservation: %w", err)
+	}
+	return nil
+}
+
+// SubscriptionBinding records whether a provider subscription may still mutate its team.
+type SubscriptionBinding struct {
+	TeamID    uuid.UUID
+	IsCurrent bool
+}
+
+func (s *Store) GetSubscriptionBinding(ctx context.Context, subscriptionID string) (SubscriptionBinding, bool, error) {
+	var b SubscriptionBinding
+	err := s.pool.QueryRow(ctx, `
+		SELECT team_id, is_current FROM dodo_subscription_bindings WHERE subscription_id = $1
+	`, subscriptionID).Scan(&b.TeamID, &b.IsCurrent)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return SubscriptionBinding{}, false, nil
+	}
+	if err != nil {
+		return SubscriptionBinding{}, false, fmt.Errorf("get subscription binding: %w", err)
+	}
+	return b, true, nil
+}
+
+// BindCurrentSubscription atomically accepts the first event for a pending checkout, or updates
+// an already-current provider subscription. Superseded ids are permanently rejected.
+func (s *Store) BindCurrentSubscription(ctx context.Context, teamID uuid.UUID, subscriptionID, customerID, status string, paidSeats int) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin subscription bind: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Always lock the team before its binding. BeginCheckout uses the same order; keeping a
+	// single lock order prevents a checkout/webhook deadlock under concurrent delivery.
+	var teamStatus string
+	var attemptID *uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT subscription_status, checkout_attempt_id
+		FROM teams WHERE id = $1 FOR UPDATE
+	`, teamID).Scan(&teamStatus, &attemptID); err != nil {
+		return fmt.Errorf("lock team for subscription bind: %w", err)
+	}
+
+	var boundTeamID uuid.UUID
+	var current bool
+	var previousStatus string
+	err = tx.QueryRow(ctx, `SELECT team_id, is_current, status FROM dodo_subscription_bindings WHERE subscription_id = $1 FOR UPDATE`, subscriptionID).Scan(&boundTeamID, &current, &previousStatus)
+	if err == nil {
+		if boundTeamID != teamID || !current {
+			return ErrStaleSubscription
+		}
+		if isTerminalSubscriptionStatus(previousStatus) && !isTerminalSubscriptionStatus(status) {
+			return ErrStaleSubscription
+		}
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("lock subscription binding: %w", err)
+	} else {
+		if teamStatus != "pending" || attemptID == nil {
+			return ErrStaleSubscription
+		}
+		if _, err := tx.Exec(ctx, `UPDATE dodo_subscription_bindings SET is_current = FALSE, updated_at = now() WHERE team_id = $1 AND is_current`, teamID); err != nil {
+			return fmt.Errorf("supersede subscription binding: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO dodo_subscription_bindings (subscription_id, team_id, is_current, status) VALUES ($1, $2, TRUE, $3)`, subscriptionID, teamID, status); err != nil {
+			return fmt.Errorf("insert subscription binding: %w", err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE dodo_subscription_bindings SET status = $2, updated_at = now() WHERE subscription_id = $1
+	`, subscriptionID, status); err != nil {
+		return fmt.Errorf("update subscription binding: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE teams SET
+			subscription_status = $2, paid_seats = $3,
+			dodo_customer_id = CASE WHEN $4 <> '' THEN $4 ELSE dodo_customer_id END,
+			dodo_subscription_id = $5,
+			checkout_session_id = NULL, checkout_started_at = NULL,
+			checkout_attempt_id = NULL,
+			checkout_previous_status = NULL, checkout_previous_paid_seats = NULL,
+			pending_paid_seats = NULL, seat_count_change_started_at = NULL,
+			seat_count_change_attempt_id = NULL
+		WHERE id = $1
+	`, teamID, status, paidSeats, customerID, subscriptionID); err != nil {
+		return fmt.Errorf("update team subscription binding: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit subscription bind: %w", err)
+	}
+	return nil
+}
+
+func isTerminalSubscriptionStatus(status string) bool {
+	switch status {
+	case "failed", "cancelled", "expired":
+		return true
+	default:
+		return false
+	}
 }
 
 // IsSeatMXID reports whether mxid appears in the seats table (any team).

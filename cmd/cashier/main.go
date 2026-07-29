@@ -43,6 +43,10 @@ func main() {
 	}
 
 	store := db.NewStore(pool)
+	if err := store.BindBillingEnvironment(ctx, cfg.BillingEnv, cfg.MatrixDeployment); err != nil {
+		slog.Error("billing environment guard", "error", err)
+		os.Exit(1)
+	}
 	// Keep the privileged Synapse admin API on the Docker network. HOMESERVER remains
 	// public because it is used for the browser-facing OIDC authorization redirect.
 	synapse := synapseadmin.NewClient(cfg.SynapseAdminURL, cfg.SynapseAdminToken)

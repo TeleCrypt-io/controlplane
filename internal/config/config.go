@@ -94,6 +94,9 @@ func getenvList(key string) []string {
 type LockerConfig struct {
 	LogLevel string // "debug", "info" (default), "warn", or "error"
 
+	BillingEnv       string // explicit Dodo/data environment: test or production
+	MatrixDeployment string // explicit Matrix/MAS/Synapse deployment identity
+
 	RunOnce          bool // RUN_ONCE=1: run a single sweep and exit (cron/ops/testing)
 	DryRun           bool // DRY_RUN=1: log every action that would be taken, take none
 	SweepIntervalSec int  // ticker period when not RUN_ONCE; default 3600
@@ -127,6 +130,9 @@ func LoadLocker() (*LockerConfig, error) {
 	c := &LockerConfig{
 		LogLevel: getenvDefault("LOG_LEVEL", "info"),
 
+		BillingEnv:       os.Getenv("BILLING_ENV"),
+		MatrixDeployment: os.Getenv("MATRIX_DEPLOYMENT_ID"),
+
 		RunOnce:          getenvBool("RUN_ONCE"),
 		DryRun:           getenvBool("DRY_RUN"),
 		SweepIntervalSec: getenvIntDefault("SWEEP_INTERVAL_SEC", 3600),
@@ -151,6 +157,8 @@ func LoadLocker() (*LockerConfig, error) {
 
 	var missing []string
 	for _, req := range []struct{ name, val string }{
+		{"BILLING_ENV", c.BillingEnv},
+		{"MATRIX_DEPLOYMENT_ID", c.MatrixDeployment},
 		{"MAS_BASE_URL", c.MASBaseURL},
 		{"MAS_ADMIN_CLIENT_ID", c.MASAdminClientID},
 		{"MAS_ADMIN_CLIENT_SECRET", c.MASAdminClientSecret},
@@ -169,6 +177,9 @@ func LoadLocker() (*LockerConfig, error) {
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
 	}
+	if c.BillingEnv != "test" && c.BillingEnv != "production" {
+		return nil, fmt.Errorf("BILLING_ENV must be exactly test or production")
+	}
 
 	return c, nil
 }
@@ -177,9 +188,12 @@ func LoadLocker() (*LockerConfig, error) {
 type CashierConfig struct {
 	LogLevel   string
 	ListenAddr string
-	// TelecryptEnv is an explicit deployment boundary, never inferred from a Dodo URL or key.
-	// Valid values are "test" and "production".
-	TelecryptEnv string
+	// BillingEnv is the explicit billing-provider/data environment, never inferred from a
+	// Dodo URL or key. Valid values are "test" and "production". MatrixDeployment separately
+	// identifies the Matrix stack, so a production Matrix deployment may deliberately use Dodo's
+	// test environment until live billing is enabled.
+	BillingEnv       string
+	MatrixDeployment string // explicit Matrix/MAS/Synapse + billing dataset identity
 
 	ServerName      string // e.g. telecrypt.io — MXID server name
 	Homeserver      string // public base URL for browser-facing MAS OIDC authorization, e.g. https://backend.telecrypt.io
@@ -203,7 +217,8 @@ func LoadCashier() (*CashierConfig, error) {
 	c := &CashierConfig{
 		LogLevel:          getenvDefault("LOG_LEVEL", "info"),
 		ListenAddr:        getenvDefault("LISTEN_ADDR", ":9011"),
-		TelecryptEnv:      os.Getenv("TELECRYPT_ENV"),
+		BillingEnv:        os.Getenv("BILLING_ENV"),
+		MatrixDeployment:  os.Getenv("MATRIX_DEPLOYMENT_ID"),
 		ServerName:        os.Getenv("SERVER_NAME"),
 		Homeserver:        getenvDefault("HOMESERVER", "https://backend.telecrypt.io"),
 		SynapseAdminURL:   getenvDefault("SYNAPSE_ADMIN_URL", "http://synapse:8008"),
@@ -232,7 +247,8 @@ func LoadCashier() (*CashierConfig, error) {
 		{"DODO_API_KEY", c.DodoAPIKey},
 		{"DODO_WEBHOOK_SECRET", c.DodoWebhookSecret},
 		{"DODO_PRODUCT_ID", c.DodoProductID},
-		{"TELECRYPT_ENV", c.TelecryptEnv},
+		{"BILLING_ENV", c.BillingEnv},
+		{"MATRIX_DEPLOYMENT_ID", c.MatrixDeployment},
 		{"DODO_API_BASE", c.DodoAPIBase},
 	} {
 		if req.val == "" {
@@ -255,19 +271,78 @@ func LoadCashier() (*CashierConfig, error) {
 // Do not infer it from an API key: a mixed key/base URL can otherwise charge real customers
 // while the service believes it is safely testing (or vice versa).
 func validateCashierEnvironment(c *CashierConfig) error {
-	if c.TelecryptEnv != "test" && c.TelecryptEnv != "production" {
-		return fmt.Errorf("TELECRYPT_ENV must be exactly test or production")
+	if c.BillingEnv != "test" && c.BillingEnv != "production" {
+		return fmt.Errorf("BILLING_ENV must be exactly test or production")
 	}
 	base, err := url.Parse(c.DodoAPIBase)
 	if err != nil || base.Scheme != "https" || base.Path != "" || base.RawQuery != "" || base.Fragment != "" || base.User != nil {
 		return fmt.Errorf("DODO_API_BASE must be an HTTPS Dodo API origin")
 	}
 	expectedHost := "test.dodopayments.com"
-	if c.TelecryptEnv == "production" {
+	if c.BillingEnv == "production" {
 		expectedHost = "live.dodopayments.com"
 	}
 	if !strings.EqualFold(base.Host, expectedHost) {
-		return fmt.Errorf("DODO_API_BASE %q is incompatible with TELECRYPT_ENV=%s (expected https://%s)", c.DodoAPIBase, c.TelecryptEnv, expectedHost)
+		return fmt.Errorf("DODO_API_BASE %q is incompatible with BILLING_ENV=%s (expected https://%s)", c.DodoAPIBase, c.BillingEnv, expectedHost)
+	}
+	homeserver, err := url.Parse(c.Homeserver)
+	if err != nil || homeserver.Scheme != "https" || homeserver.Host == "" || homeserver.User != nil || homeserver.RawQuery != "" || homeserver.Fragment != "" {
+		return fmt.Errorf("HOMESERVER must be a public HTTPS URL")
+	}
+	plan, err := url.Parse(c.PlanPublicURL)
+	if err != nil || plan.Scheme != "https" || plan.Host == "" || plan.User != nil || plan.RawQuery != "" || plan.Fragment != "" {
+		return fmt.Errorf("PLAN_PUBLIC_URL must be a public HTTPS URL")
+	}
+	dbURL, err := url.Parse(c.ControlplaneDBURL)
+	if err != nil || (dbURL.Scheme != "postgres" && dbURL.Scheme != "postgresql") || dbURL.Host == "" {
+		return fmt.Errorf("CONTROLPLANE_DB_URL must be an explicit Postgres URL")
+	}
+	planMarkedTest := hasTestEnvironmentMarker(plan.Hostname())
+	homeserverMarkedTest := hasTestEnvironmentMarker(homeserver.Hostname())
+	serverNameMarkedTest := hasTestEnvironmentMarker(c.ServerName)
+	dbMarkedTest := hasTestEnvironmentMarker(dbURL.Hostname()) || hasTestEnvironmentMarker(strings.TrimPrefix(dbURL.Path, "/"))
+	if c.MatrixDeployment == "production" {
+		if c.ServerName != "telecrypt.io" ||
+			!samePublicURL(homeserver, "https://backend.telecrypt.io", "") ||
+			!samePublicURL(plan, "https://backend.telecrypt.io", "/plan") {
+			return fmt.Errorf("MATRIX_DEPLOYMENT_ID=production requires the exact TeleCrypt production server, Homeserver, and Plan origins")
+		}
+	} else if !hasTestEnvironmentMarker(c.MatrixDeployment) ||
+		!serverNameMarkedTest || !homeserverMarkedTest || !planMarkedTest {
+		return fmt.Errorf("non-production MATRIX_DEPLOYMENT_ID, SERVER_NAME, HOMESERVER, and PLAN_PUBLIC_URL must carry a test/sandbox/staging marker")
+	}
+	if c.BillingEnv == "production" && (c.MatrixDeployment != "production" || planMarkedTest || homeserverMarkedTest || serverNameMarkedTest || dbMarkedTest) {
+		return fmt.Errorf("BILLING_ENV=production is incompatible with test/sandbox/staging deployment, server, Homeserver, Plan, or database identifiers")
+	}
+	if err := validateComposeInternalOrigin(c.SynapseAdminURL, "synapse", "8008", "SYNAPSE_ADMIN_URL"); err != nil {
+		return err
+	}
+	if err := validateComposeInternalOrigin(c.MASBaseURL, "mas", "8080", "MAS_BASE_URL"); err != nil {
+		return err
 	}
 	return nil
+}
+
+func samePublicURL(u *url.URL, expectedOrigin, expectedPath string) bool {
+	return strings.EqualFold(u.Scheme+"://"+u.Host, expectedOrigin) &&
+		strings.TrimSuffix(u.Path, "/") == expectedPath
+}
+
+func validateComposeInternalOrigin(raw, host, port, name string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" || u.Hostname() != host || u.Port() != port ||
+		(u.Path != "" && u.Path != "/") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("%s must be the Compose-local origin http://%s:%s", name, host, port)
+	}
+	return nil
+}
+
+func hasTestEnvironmentMarker(value string) bool {
+	value = strings.ToLower(value)
+	for _, marker := range []string{"test", "sandbox", "staging"} {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
 }
