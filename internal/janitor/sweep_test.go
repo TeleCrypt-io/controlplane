@@ -703,7 +703,7 @@ func TestSweep_PostLockVerificationErrorCompensates(t *testing.T) {
 	}
 }
 
-func TestSweep_ConfirmationFailureRetainsIntentAndConverges(t *testing.T) {
+func TestSweep_ConfirmationFailureCompensatesImmediately(t *testing.T) {
 	mas := newFakeMAS("locker-client", "s3cr3t")
 	user := mas.addUser("u-confirmation-failure", "confirmationfailure", time.Now().Add(-72*time.Hour))
 
@@ -719,23 +719,14 @@ func TestSweep_ConfirmationFailureRetainsIntentAndConverges(t *testing.T) {
 	if got, want := mas.lockCalls, []string{"u-confirmation-failure"}; !equalStrSlices(got, want) {
 		t.Errorf("lockCalls = %v, want %v", got, want)
 	}
-	if user.lockedAt == nil {
-		t.Fatal("confirmation failure did not leave the successfully locked account locked")
-	}
-	if _, found := store.pendingLocks["u-confirmation-failure"]; !found {
-		t.Fatal("pre-lock intent was lost after confirmation failure")
-	}
-
-	store.confirmErr = nil
-	store.setVerified("@confirmationfailure:"+serverName, true)
-	if err := sweeper.Sweep(context.Background()); err != nil {
-		t.Fatalf("second Sweep: %v", err)
+	if got, want := mas.unlockCalls, []string{"u-confirmation-failure"}; !equalStrSlices(got, want) {
+		t.Errorf("unlockCalls = %v, want immediate compensation %v", got, want)
 	}
 	if user.lockedAt != nil {
-		t.Error("pending lock did not converge after confirmation recovered")
+		t.Fatal("confirmation failure left an unprovenanced lock in MAS")
 	}
 	if _, found := store.pendingLocks["u-confirmation-failure"]; found {
-		t.Error("pending intent remained after convergence")
+		t.Error("pending intent remained after confirmation compensation")
 	}
 }
 
@@ -769,7 +760,7 @@ func TestSweep_FailedCompensationConvergesOnNextSweep(t *testing.T) {
 	}
 }
 
-func TestSweep_AmbiguousLockResponseConvergesFromIntent(t *testing.T) {
+func TestSweep_AmbiguousLockResponseNeverAuthorizesUnlock(t *testing.T) {
 	mas := newFakeMAS("locker-client", "s3cr3t")
 	user := mas.addUser("u-ambiguous-lock", "ambiguouslock", time.Now().Add(-72*time.Hour))
 	mas.lockResponseFailures = 1
@@ -794,11 +785,14 @@ func TestSweep_AmbiguousLockResponseConvergesFromIntent(t *testing.T) {
 	if err := sweeper.Sweep(context.Background()); err != nil {
 		t.Fatalf("second Sweep: %v", err)
 	}
-	if user.lockedAt != nil {
-		t.Error("ambiguous committed lock did not converge on the next sweep")
+	if user.lockedAt == nil {
+		t.Error("ambiguous lock was automatically reversed without proven ownership")
 	}
-	if got, want := mas.unlockCalls, []string{"u-ambiguous-lock"}; !equalStrSlices(got, want) {
-		t.Errorf("unlockCalls = %v, want %v", got, want)
+	if len(mas.unlockCalls) != 0 {
+		t.Errorf("unlockCalls = %v, want none for ambiguous ownership", mas.unlockCalls)
+	}
+	if _, found := store.pendingLocks["u-ambiguous-lock"]; found {
+		t.Error("ambiguous pending intent was not relinquished")
 	}
 }
 

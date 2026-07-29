@@ -130,8 +130,8 @@ const (
 
 // JanitorLockState returns exact confirmed MAS locked_at timestamps plus pre-call intents. MAS
 // exposes no actor/reason for a lock, so timestamp identity prevents janitor from reversing an
-// operator unlock/relock cycle. A durable intent closes the crash/ambiguous-response gap between
-// deciding to lock and persisting MAS's successful response.
+// operator unlock/relock cycle. A durable intent marks a crash/ambiguous-response gap so janitor
+// can relinquish it rather than later misclassifying an unknown lock as its own.
 func (s *Store) JanitorLockState(ctx context.Context) (
 	confirmed, pending map[string]time.Time,
 	err error,
@@ -170,8 +170,8 @@ func (s *Store) JanitorLockState(ctx context.Context) (
 	return confirmed, pending, nil
 }
 
-// BeginJanitorLock durably records intent before calling MAS. A later sweep can distinguish a
-// committed-but-response-lost lock from a call that never changed MAS.
+// BeginJanitorLock durably records intent before calling MAS. Intent alone never authorizes an
+// unlock; only a successful response can be confirmed with an exact locked_at timestamp.
 func (s *Store) BeginJanitorLock(ctx context.Context, userID string) (time.Time, error) {
 	beganAt := time.Now().UTC()
 	if err := s.SetLockerHighWaterMark(ctx, janitorLockIntentKeyPrefix+userID, beganAt); err != nil {
