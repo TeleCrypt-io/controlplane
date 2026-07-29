@@ -66,19 +66,23 @@ same browser action safely recovers the same request. If a seat-count webhook is
 page exposes an authenticated reconciliation action that reads the current Dodo subscription and
 applies only the exact reserved product and quantity.
 
-`TELECRYPT_ENV=test|production` is mandatory and must agree with the configured Dodo API origin,
-Matrix server name, Homeserver, public Plan hostname, and database identifier. A test deployment
-must use identifiers containing `test`, `sandbox`, or `staging`; production rejects those markers.
-This is deliberately fail-closed so test Dodo state cannot share production Matrix accounts,
-billing storage, or a production-looking browser origin. The test Plan page displays an unmistakable
-sandbox banner and Dodo's published test-card instructions; production never renders them. Card
-details are entered only on Dodo-hosted checkout or customer-portal pages and never pass through
-TeleCrypt.
+`BILLING_ENV=test|production` explicitly selects the billing-provider/data environment and must
+agree with the exact Dodo API origin. It is deliberately independent of the browser hostname: the
+production Matrix deployment may use Dodo's test environment while live billing is unavailable.
+The test Plan page displays an unmistakable sandbox banner and Dodo's published test-card
+instructions; live billing never renders them. Card details are entered only on Dodo-hosted
+checkout or customer-portal pages and never pass through TeleCrypt.
 
-`MATRIX_DEPLOYMENT_ID` is also required (`billing-test` in the isolated sandbox, `production` in the
-production-shaped stack). Cashier accepts only the Compose-local `http://synapse:8008` and
-`http://mas:8080` enforcement targets; Compose project/network isolation binds those names to the
-declared Matrix deployment.
+`MATRIX_DEPLOYMENT_ID` is independently required. The exact value `production` requires
+`telecrypt.io` and `https://backend.telecrypt.io`; any other deployment identity and its public
+origins must carry a `test`, `sandbox`, or `staging` marker. On startup both cashier and janitor
+permanently bind their shared Postgres database to the exact billing environment and Matrix
+deployment identity. A later configuration cannot point live billing or a different Matrix
+deployment at that database, even if an operator changes environment variables. Live billing
+additionally rejects test markers in the Matrix, Plan, or database identifiers. Cashier accepts
+only the Compose-local
+`http://synapse:8008` and `http://mas:8080` enforcement targets; Compose network isolation binds
+those names to the declared Matrix deployment.
 
 ## Development notes
 

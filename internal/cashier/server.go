@@ -171,7 +171,7 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 		CanChangeSeats bool
 	}{
 		LoggedIn:    loggedIn,
-		TestMode:    s.cfg.TelecryptEnv == "test",
+		TestMode:    s.cfg.BillingEnv == "test",
 		MXID:        mxid,
 		RegisterURL: strings.TrimRight(s.cfg.Homeserver, "/") + "/auth/register",
 		Team:        team,
@@ -625,7 +625,7 @@ func (s *Server) webhookDedupKey(webhookID string) string {
 	if s.cfg == nil {
 		return "unconfigured:" + webhookID
 	}
-	return s.cfg.TelecryptEnv + ":" + webhookID
+	return s.cfg.BillingEnv + ":" + webhookID
 }
 
 var (
@@ -816,7 +816,7 @@ func NewDodoClient(cfg *config.CashierConfig) *dodo.Client {
 		option.WithBearerToken(cfg.DodoAPIKey),
 		option.WithWebhookKey(cfg.DodoWebhookSecret),
 	}
-	if cfg.TelecryptEnv == "test" {
+	if cfg.BillingEnv == "test" {
 		opts = append(opts, option.WithEnvironmentTestMode())
 	} else {
 		opts = append(opts, option.WithEnvironmentLiveMode())

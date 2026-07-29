@@ -20,7 +20,7 @@ func setRequiredCashierEnv(t *testing.T) {
 		"DODO_API_KEY":           "test-key",
 		"DODO_WEBHOOK_SECRET":    "test-webhook",
 		"DODO_PRODUCT_ID":        "prod_test",
-		"TELECRYPT_ENV":          "test",
+		"BILLING_ENV":            "test",
 		"MATRIX_DEPLOYMENT_ID":   "billing-test",
 		"DODO_API_BASE":          "https://test.dodopayments.com",
 	} {
@@ -58,8 +58,8 @@ func TestLoadCashier_RequiresExplicitCompatibleBillingEnvironment(t *testing.T) 
 	tests := []struct {
 		name, env, base, want string
 	}{
-		{"missing environment", "", "https://test.dodopayments.com", "TELECRYPT_ENV"},
-		{"unknown environment", "staging", "https://test.dodopayments.com", "TELECRYPT_ENV"},
+		{"missing environment", "", "https://test.dodopayments.com", "BILLING_ENV"},
+		{"unknown environment", "staging", "https://test.dodopayments.com", "BILLING_ENV"},
 		{"test uses live API", "test", "https://live.dodopayments.com", "incompatible"},
 		{"production uses test API", "production", "https://test.dodopayments.com", "incompatible"},
 		{"non HTTPS API", "test", "http://test.dodopayments.com", "HTTPS"},
@@ -67,7 +67,7 @@ func TestLoadCashier_RequiresExplicitCompatibleBillingEnvironment(t *testing.T) 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			setRequiredCashierEnv(t)
-			t.Setenv("TELECRYPT_ENV", tt.env)
+			t.Setenv("BILLING_ENV", tt.env)
 			t.Setenv("DODO_API_BASE", tt.base)
 			_, err := LoadCashier()
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
@@ -79,40 +79,59 @@ func TestLoadCashier_RequiresExplicitCompatibleBillingEnvironment(t *testing.T) 
 
 func TestLoadCashier_ProductionUsesLiveDodoAPI(t *testing.T) {
 	setRequiredCashierEnv(t)
-	t.Setenv("TELECRYPT_ENV", "production")
+	t.Setenv("BILLING_ENV", "production")
 	t.Setenv("MATRIX_DEPLOYMENT_ID", "production")
 	t.Setenv("DODO_API_BASE", "https://live.dodopayments.com")
 	t.Setenv("SERVER_NAME", "telecrypt.io")
 	t.Setenv("HOMESERVER", "https://backend.telecrypt.io")
-	t.Setenv("PLAN_PUBLIC_URL", "https://billing.telecrypt.io/plan")
+	t.Setenv("PLAN_PUBLIC_URL", "https://backend.telecrypt.io/plan")
 	t.Setenv("CONTROLPLANE_DB_URL", "postgres://cashier@db/telecrypt")
 	if _, err := LoadCashier(); err != nil {
 		t.Fatalf("LoadCashier production: %v", err)
 	}
 }
 
-func TestLoadCashier_RejectsCrossEnvironmentPlanAndDatabase(t *testing.T) {
+func TestLoadCashier_TestBillingCanUseProductionMatrixWithExplicitIdentities(t *testing.T) {
+	setRequiredCashierEnv(t)
+	t.Setenv("MATRIX_DEPLOYMENT_ID", "production")
+	t.Setenv("SERVER_NAME", "telecrypt.io")
+	t.Setenv("HOMESERVER", "https://backend.telecrypt.io")
+	t.Setenv("PLAN_PUBLIC_URL", "https://backend.telecrypt.io/plan")
+	t.Setenv("CONTROLPLANE_DB_URL", "postgres://cashier@db/telecrypt")
+	if _, err := LoadCashier(); err != nil {
+		t.Fatalf("LoadCashier production Matrix with test billing: %v", err)
+	}
+}
+
+func TestLoadCashier_ProductionMatrixRequiresExactPublicOrigins(t *testing.T) {
+	setRequiredCashierEnv(t)
+	t.Setenv("MATRIX_DEPLOYMENT_ID", "production")
+	t.Setenv("SERVER_NAME", "telecrypt.io")
+	t.Setenv("HOMESERVER", "https://wrong.telecrypt.io")
+	t.Setenv("PLAN_PUBLIC_URL", "https://backend.telecrypt.io/plan")
+	if _, err := LoadCashier(); err == nil || !strings.Contains(err.Error(), "MATRIX_DEPLOYMENT_ID") {
+		t.Fatalf("LoadCashier error = %v, want exact production origin error", err)
+	}
+}
+
+func TestLoadCashier_ProductionRejectsTestIdentifiers(t *testing.T) {
 	tests := []struct {
-		name, environment, planURL, databaseURL string
+		name, planURL, databaseURL string
 	}{
-		{"test Plan on production host", "test", "https://backend.telecrypt.io/plan", "postgres://cashier@db.test/telecrypt_test"},
-		{"test service on production database", "test", "https://billing-test.telecrypt.io/plan", "postgres://cashier@db/telecrypt"},
-		{"production Plan on test host", "production", "https://billing-test.telecrypt.io/plan", "postgres://cashier@db/telecrypt"},
-		{"production service on test database", "production", "https://billing.telecrypt.io/plan", "postgres://cashier@db.test/telecrypt_test"},
+		{"production Plan on test host", "https://billing-test.telecrypt.io/plan", "postgres://cashier@db/telecrypt"},
+		{"production service on test database", "https://billing.telecrypt.io/plan", "postgres://cashier@db.test/telecrypt_test"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			setRequiredCashierEnv(t)
-			t.Setenv("TELECRYPT_ENV", tt.environment)
+			t.Setenv("BILLING_ENV", "production")
 			t.Setenv("PLAN_PUBLIC_URL", tt.planURL)
 			t.Setenv("CONTROLPLANE_DB_URL", tt.databaseURL)
-			if tt.environment == "production" {
-				t.Setenv("DODO_API_BASE", "https://live.dodopayments.com")
-				t.Setenv("MATRIX_DEPLOYMENT_ID", "production")
-				t.Setenv("SERVER_NAME", "telecrypt.io")
-				t.Setenv("HOMESERVER", "https://backend.telecrypt.io")
-			}
-			if _, err := LoadCashier(); err == nil || !strings.Contains(err.Error(), "incompatible") && !strings.Contains(err.Error(), "requires") {
+			t.Setenv("DODO_API_BASE", "https://live.dodopayments.com")
+			t.Setenv("MATRIX_DEPLOYMENT_ID", "production")
+			t.Setenv("SERVER_NAME", "telecrypt.io")
+			t.Setenv("HOMESERVER", "https://backend.telecrypt.io")
+			if _, err := LoadCashier(); err == nil {
 				t.Fatalf("LoadCashier error = %v, want environment boundary error", err)
 			}
 		})
@@ -136,13 +155,5 @@ func TestLoadCashier_RejectsNonLocalEnforcementTargets(t *testing.T) {
 				t.Fatalf("LoadCashier error = %v, want %s boundary error", err, tt.key)
 			}
 		})
-	}
-}
-
-func TestLoadCashier_RejectsCrossEnvironmentHomeserver(t *testing.T) {
-	setRequiredCashierEnv(t)
-	t.Setenv("HOMESERVER", "https://backend.telecrypt.io")
-	if _, err := LoadCashier(); err == nil || !strings.Contains(err.Error(), "HOMESERVER") {
-		t.Fatalf("LoadCashier error = %v, want test Homeserver boundary error", err)
 	}
 }

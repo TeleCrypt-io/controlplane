@@ -33,6 +33,35 @@ func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
+// BindBillingEnvironment permanently assigns this database to one explicit billing-provider
+// environment and Matrix deployment. The singleton row prevents Dodo test and live state—or two
+// Matrix deployments—from ever sharing a database merely because an operator changed env vars.
+func (s *Store) BindBillingEnvironment(ctx context.Context, billingEnv, matrixDeployment string) error {
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO billing_environment_guard (singleton, billing_env, matrix_deployment_id)
+		VALUES (TRUE, $1, $2)
+		ON CONFLICT (singleton) DO NOTHING
+	`, billingEnv, matrixDeployment); err != nil {
+		return fmt.Errorf("bind billing environment: %w", err)
+	}
+
+	var boundEnv, boundDeployment string
+	if err := s.pool.QueryRow(ctx, `
+		SELECT billing_env, matrix_deployment_id
+		FROM billing_environment_guard
+		WHERE singleton = TRUE
+	`).Scan(&boundEnv, &boundDeployment); err != nil {
+		return fmt.Errorf("read billing environment binding: %w", err)
+	}
+	if boundEnv != billingEnv || boundDeployment != matrixDeployment {
+		return fmt.Errorf(
+			"billing database is bound to environment %q and deployment %q, not %q and %q",
+			boundEnv, boundDeployment, billingEnv, matrixDeployment,
+		)
+	}
+	return nil
+}
+
 // VerifiedMXIDs returns the full effective verification set. The legacy verified table is the
 // owner-controlled/manual source of truth; billing_verification_grants contains the separate,
 // cashier-controlled source. Keeping those sources distinct means a billing revocation can never

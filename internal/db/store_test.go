@@ -28,7 +28,7 @@ func newTestStore(t *testing.T) (*Store, *pgxpool.Pool) {
 	t.Cleanup(pool.Close)
 
 	if _, err := pool.Exec(ctx, `
-		DROP TABLE IF EXISTS dodo_subscription_bindings, billing_verification_grants, seats, teams, ownership, verified, pending_claims, locker_state, schema_migrations`,
+		DROP TABLE IF EXISTS billing_environment_guard, dodo_subscription_bindings, billing_verification_grants, seats, teams, ownership, verified, pending_claims, locker_state, schema_migrations`,
 	); err != nil {
 		t.Fatalf("drop existing tables: %v", err)
 	}
@@ -66,6 +66,24 @@ func TestVerifiedMXIDs(t *testing.T) {
 	}
 	if len(set) != 2 {
 		t.Fatalf("expected exactly 2 entries, got %d", len(set))
+	}
+}
+
+func TestBindBillingEnvironment(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+
+	if err := store.BindBillingEnvironment(ctx, "test", "production"); err != nil {
+		t.Fatalf("first BindBillingEnvironment: %v", err)
+	}
+	if err := store.BindBillingEnvironment(ctx, "test", "production"); err != nil {
+		t.Fatalf("idempotent BindBillingEnvironment: %v", err)
+	}
+	if err := store.BindBillingEnvironment(ctx, "production", "production"); err == nil {
+		t.Fatal("environment mismatch unexpectedly accepted")
+	}
+	if err := store.BindBillingEnvironment(ctx, "test", "another-test"); err == nil {
+		t.Fatal("deployment mismatch unexpectedly accepted")
 	}
 }
 

@@ -31,7 +31,7 @@ func TestMigrate(t *testing.T) {
 
 	// Start from a clean slate so this test is repeatable against a long-lived test DB.
 	if _, err := pool.Exec(ctx, `
-		DROP TABLE IF EXISTS dodo_subscription_bindings, billing_verification_grants, seats, teams, ownership, verified, pending_claims, locker_state, schema_migrations`,
+		DROP TABLE IF EXISTS billing_environment_guard, dodo_subscription_bindings, billing_verification_grants, seats, teams, ownership, verified, pending_claims, locker_state, schema_migrations`,
 	); err != nil {
 		t.Fatalf("drop existing tables: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestMigrate(t *testing.T) {
 		}
 	}
 
-	for _, table := range []string{"verified", "billing_verification_grants", "locker_state", "teams", "seats", "dodo_subscription_bindings"} {
+	for _, table := range []string{"verified", "billing_verification_grants", "locker_state", "teams", "seats", "dodo_subscription_bindings", "billing_environment_guard"} {
 		var exists bool
 		err := pool.QueryRow(ctx,
 			`SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = $1)`, table,
@@ -90,7 +90,7 @@ func TestMigrateUpgradeFromTeamsSeats(t *testing.T) {
 	defer pool.Close()
 
 	if _, err := pool.Exec(ctx, `
-		DROP TABLE IF EXISTS dodo_subscription_bindings, billing_verification_grants, seats, teams, ownership, verified, pending_claims, locker_state, schema_migrations`,
+		DROP TABLE IF EXISTS billing_environment_guard, dodo_subscription_bindings, billing_verification_grants, seats, teams, ownership, verified, pending_claims, locker_state, schema_migrations`,
 	); err != nil {
 		t.Fatalf("drop existing tables: %v", err)
 	}
@@ -131,6 +131,12 @@ func TestMigrateUpgradeFromTeamsSeats(t *testing.T) {
 	}
 	if !applied {
 		t.Fatal("0007 migration was not recorded")
+	}
+	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = '0008_billing_environment_guard.sql')`).Scan(&applied); err != nil {
+		t.Fatalf("check 0008 applied: %v", err)
+	}
+	if !applied {
+		t.Fatal("0008 migration was not recorded")
 	}
 
 	var cascade bool

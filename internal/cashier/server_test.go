@@ -47,7 +47,7 @@ func TestHandlePlan_Unauthenticated(t *testing.T) {
 
 func TestHandlePlan_TestModeBannerAndCard(t *testing.T) {
 	cfg := &config.CashierConfig{
-		TelecryptEnv:  "test",
+		BillingEnv:     "test",
 		PlanPublicURL: "https://plan.test.telecrypt.io/plan",
 		Homeserver:    "https://plan.test.telecrypt.io",
 		ServerName:    "telecrypt.io",
@@ -83,7 +83,7 @@ func TestHandlePlan_AuthenticatedTeamHasCompleteSeatControls(t *testing.T) {
 	store.seats[teamID] = []db.Seat{{MXID: "@bot:telecrypt.io", TeamID: teamID}}
 	session := NewSession("test-key")
 	cfg := &config.CashierConfig{
-		TelecryptEnv:  "test",
+		BillingEnv:     "test",
 		PlanPublicURL: "https://plan.test.telecrypt.io/plan",
 		Homeserver:    "https://plan.test.telecrypt.io",
 		ServerName:    "telecrypt.io",
@@ -855,7 +855,7 @@ func TestHandleChangeSeatCount_KnownRejectionReleasesCapacityReservation(t *test
 }
 
 func TestWebhookDedupKeyIncludesExplicitEnvironment(t *testing.T) {
-	srv := &Server{cfg: &config.CashierConfig{TelecryptEnv: "test"}}
+	srv := &Server{cfg: &config.CashierConfig{BillingEnv: "test"}}
 	if got, want := srv.webhookDedupKey("msg_123"), "test:msg_123"; got != want {
 		t.Fatalf("webhookDedupKey = %q, want %q", got, want)
 	}
