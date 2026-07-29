@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -41,6 +42,7 @@ type LoginResult struct {
 // made the new user visible to Synapse.
 type CompatLoginError struct {
 	StatusCode int
+	RetryAfter time.Duration
 	Err        error
 }
 
@@ -58,7 +60,7 @@ func (e *CompatLoginError) Unwrap() error {
 // IsRetryableCompatLogin reports whether retrying the same compatibility login is safe and
 // useful. Client and authentication errors deliberately fail closed without retrying.
 func IsRetryableCompatLogin(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) {
 		return false
 	}
 
@@ -66,7 +68,36 @@ func IsRetryableCompatLogin(err error) bool {
 	if !errors.As(err, &loginErr) {
 		return false
 	}
-	return loginErr.Err != nil || loginErr.StatusCode >= http.StatusInternalServerError
+	return loginErr.Err != nil ||
+		loginErr.StatusCode == http.StatusRequestTimeout ||
+		loginErr.StatusCode == http.StatusTooManyRequests ||
+		loginErr.StatusCode >= http.StatusInternalServerError
+}
+
+// CompatLoginRetryAfter returns MAS's requested retry delay when one was supplied.
+func CompatLoginRetryAfter(err error) time.Duration {
+	var loginErr *CompatLoginError
+	if !errors.As(err, &loginErr) {
+		return 0
+	}
+	return loginErr.RetryAfter
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if retryAt, err := http.ParseTime(value); err == nil && retryAt.After(now) {
+		return retryAt.Sub(now)
+	}
+	return 0
 }
 
 // CompatLogin logs in with m.login.password, deliberately omitting refresh_token — the
@@ -101,7 +132,10 @@ func (c *Client) CompatLogin(ctx context.Context, username, password, deviceID s
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, &CompatLoginError{StatusCode: resp.StatusCode}
+		return nil, &CompatLoginError{
+			StatusCode: resp.StatusCode,
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+		}
 	}
 
 	var out struct {
@@ -109,7 +143,7 @@ func (c *Client) CompatLogin(ctx context.Context, username, password, deviceID s
 		AccessToken string `json:"access_token"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("compat login response: %w", err)
+		return nil, &CompatLoginError{Err: fmt.Errorf("decode response: %w", err)}
 	}
 	return &LoginResult{UserID: out.UserID, AccessToken: out.AccessToken}, nil
 }

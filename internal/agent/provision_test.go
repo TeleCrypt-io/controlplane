@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/TeleCrypt-io/controlplane/internal/masreg"
 	"github.com/TeleCrypt-io/controlplane/internal/synapse"
@@ -118,7 +119,7 @@ func TestProvisionAgent_RetriesTransientCompatLoginFailure(t *testing.T) {
 	m := newFakeMASReg()
 	sy := &fakeSynapse{loginErrs: []error{
 		&synapse.CompatLoginError{StatusCode: http.StatusInternalServerError},
-		&synapse.CompatLoginError{StatusCode: http.StatusBadGateway},
+		&synapse.CompatLoginError{StatusCode: http.StatusTooManyRequests},
 	}}
 
 	p, err := NewProvisioner(m, sy, "https://telecrypt.io", "")
@@ -131,6 +132,28 @@ func TestProvisionAgent_RetriesTransientCompatLoginFailure(t *testing.T) {
 	}
 	if sy.loginCalls != 3 {
 		t.Fatalf("login calls = %d, want 3", sy.loginCalls)
+	}
+}
+
+func TestProvisionAgent_BoundsCompatLoginRetries(t *testing.T) {
+	m := newFakeMASReg()
+	sy := &fakeSynapse{}
+	for range compatLoginMaxAttempts {
+		sy.loginErrs = append(sy.loginErrs, &synapse.CompatLoginError{
+			StatusCode: http.StatusTooManyRequests,
+		})
+	}
+
+	p, err := NewProvisioner(m, sy, "https://telecrypt.io", "")
+	if err != nil {
+		t.Fatalf("NewProvisioner: %v", err)
+	}
+
+	if _, err := p.ProvisionAgent(context.Background()); err == nil {
+		t.Fatal("expected an error when all compatibility-login attempts are throttled")
+	}
+	if sy.loginCalls != compatLoginMaxAttempts {
+		t.Fatalf("login calls = %d, want %d", sy.loginCalls, compatLoginMaxAttempts)
 	}
 }
 
@@ -169,6 +192,28 @@ func TestProvisionAgent_CompatLoginRetryHonorsContext(t *testing.T) {
 	cancel()
 	if _, err := p.ProvisionAgent(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("ProvisionAgent error = %v, want context canceled", err)
+	}
+	if sy.loginCalls != 1 {
+		t.Fatalf("login calls = %d, want 1", sy.loginCalls)
+	}
+}
+
+func TestProvisionAgent_CompatLoginRetryHonorsDeadline(t *testing.T) {
+	m := newFakeMASReg()
+	sy := &fakeSynapse{loginErrs: []error{
+		&synapse.CompatLoginError{Err: context.DeadlineExceeded},
+		&synapse.CompatLoginError{Err: context.DeadlineExceeded},
+	}}
+
+	p, err := NewProvisioner(m, sy, "https://telecrypt.io", "")
+	if err != nil {
+		t.Fatalf("NewProvisioner: %v", err)
+	}
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if _, err := p.ProvisionAgent(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ProvisionAgent error = %v, want context deadline exceeded", err)
 	}
 	if sy.loginCalls != 1 {
 		t.Fatalf("login calls = %d, want 1", sy.loginCalls)

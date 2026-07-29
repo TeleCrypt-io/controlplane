@@ -17,6 +17,7 @@ import (
 const (
 	compatLoginMaxAttempts  = 6
 	compatLoginInitialDelay = 100 * time.Millisecond
+	compatLoginMaxDelay     = 2 * time.Second
 )
 
 type Provisioned struct {
@@ -114,7 +115,15 @@ func (p *Provisioner) compatLoginAfterRegistration(
 			return nil, err
 		}
 
-		timer := time.NewTimer(delay)
+		retryDelay := delay
+		if requested := synapse.CompatLoginRetryAfter(err); requested > retryDelay {
+			retryDelay = requested
+		}
+		if retryDelay > compatLoginMaxDelay {
+			retryDelay = compatLoginMaxDelay
+		}
+
+		timer := time.NewTimer(retryDelay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
