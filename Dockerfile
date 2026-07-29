@@ -31,7 +31,7 @@ USER 991:991
 # This must remain the final/default target. The Synapse module image is built explicitly with
 # `--target synapse-tier-controller` and is published as a separate package.
 # ENTRYPOINT defaults to redpill — deploying janitor or cashier means overriding the command on this
-# same image, e.g. `docker run ... ghcr.io/telecrypt-io/telecrypt-controlplane:0.3.0 /janitor`.
+# same image, e.g. `docker run ... ghcr.io/telecrypt-io/telecrypt-controlplane:<release> /janitor`.
 FROM scratch AS controlplane
 COPY --from=controlplane-build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=controlplane-build /out/redpill /redpill

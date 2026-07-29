@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -32,6 +33,40 @@ func NewClient(compatBaseURL string) *Client {
 type LoginResult struct {
 	UserID      string
 	AccessToken string
+}
+
+// CompatLoginError preserves enough information for the provisioning layer to distinguish a
+// transient MAS/Synapse readiness failure from a permanent authentication or request failure.
+// MAS returns a 5xx briefly when its asynchronous post-registration provisioning job has not yet
+// made the new user visible to Synapse.
+type CompatLoginError struct {
+	StatusCode int
+	Err        error
+}
+
+func (e *CompatLoginError) Error() string {
+	if e.StatusCode != 0 {
+		return fmt.Sprintf("compat login: unexpected status %d", e.StatusCode)
+	}
+	return fmt.Sprintf("compat login: %v", e.Err)
+}
+
+func (e *CompatLoginError) Unwrap() error {
+	return e.Err
+}
+
+// IsRetryableCompatLogin reports whether retrying the same compatibility login is safe and
+// useful. Client and authentication errors deliberately fail closed without retrying.
+func IsRetryableCompatLogin(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	var loginErr *CompatLoginError
+	if !errors.As(err, &loginErr) {
+		return false
+	}
+	return loginErr.Err != nil || loginErr.StatusCode >= http.StatusInternalServerError
 }
 
 // CompatLogin logs in with m.login.password, deliberately omitting refresh_token — the
@@ -61,12 +96,12 @@ func (c *Client) CompatLogin(ctx context.Context, username, password, deviceID s
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("compat login: %w", err)
+		return nil, &CompatLoginError{Err: err}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("compat login: unexpected status %d", resp.StatusCode)
+		return nil, &CompatLoginError{StatusCode: resp.StatusCode}
 	}
 
 	var out struct {

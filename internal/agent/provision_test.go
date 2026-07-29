@@ -34,13 +34,17 @@ func (f *fakeMASReg) Register(ctx context.Context, username, password string) er
 
 // fakeSynapse is a fake Synapse client.
 type fakeSynapse struct {
-	loginErr    error
+	loginErrs   []error
 	loginUserID string // if empty, echoes back whatever was requested correctly
+	loginCalls  int
 }
 
 func (f *fakeSynapse) CompatLogin(ctx context.Context, username, password, deviceID string) (*synapse.LoginResult, error) {
-	if f.loginErr != nil {
-		return nil, f.loginErr
+	f.loginCalls++
+	if len(f.loginErrs) != 0 {
+		err := f.loginErrs[0]
+		f.loginErrs = f.loginErrs[1:]
+		return nil, err
 	}
 	userID := f.loginUserID
 	if userID == "" {
@@ -95,7 +99,7 @@ func TestProvisionAgent_RegisterFails(t *testing.T) {
 
 func TestProvisionAgent_CompatLoginFails(t *testing.T) {
 	m := newFakeMASReg()
-	sy := &fakeSynapse{loginErr: errors.New("synapse unreachable")}
+	sy := &fakeSynapse{loginErrs: []error{errors.New("synapse unreachable")}}
 
 	p, err := NewProvisioner(m, sy, "https://telecrypt.io", "")
 	if err != nil {
@@ -104,6 +108,70 @@ func TestProvisionAgent_CompatLoginFails(t *testing.T) {
 
 	if _, err := p.ProvisionAgent(context.Background()); err == nil {
 		t.Fatal("expected an error when compat login fails")
+	}
+	if sy.loginCalls != 1 {
+		t.Fatalf("non-retryable login calls = %d, want 1", sy.loginCalls)
+	}
+}
+
+func TestProvisionAgent_RetriesTransientCompatLoginFailure(t *testing.T) {
+	m := newFakeMASReg()
+	sy := &fakeSynapse{loginErrs: []error{
+		&synapse.CompatLoginError{StatusCode: http.StatusInternalServerError},
+		&synapse.CompatLoginError{StatusCode: http.StatusBadGateway},
+	}}
+
+	p, err := NewProvisioner(m, sy, "https://telecrypt.io", "")
+	if err != nil {
+		t.Fatalf("NewProvisioner: %v", err)
+	}
+
+	if _, err := p.ProvisionAgent(context.Background()); err != nil {
+		t.Fatalf("ProvisionAgent: %v", err)
+	}
+	if sy.loginCalls != 3 {
+		t.Fatalf("login calls = %d, want 3", sy.loginCalls)
+	}
+}
+
+func TestProvisionAgent_DoesNotRetryAuthenticationFailure(t *testing.T) {
+	m := newFakeMASReg()
+	sy := &fakeSynapse{loginErrs: []error{
+		&synapse.CompatLoginError{StatusCode: http.StatusForbidden},
+	}}
+
+	p, err := NewProvisioner(m, sy, "https://telecrypt.io", "")
+	if err != nil {
+		t.Fatalf("NewProvisioner: %v", err)
+	}
+
+	if _, err := p.ProvisionAgent(context.Background()); err == nil {
+		t.Fatal("expected an error when compat login is forbidden")
+	}
+	if sy.loginCalls != 1 {
+		t.Fatalf("login calls = %d, want 1", sy.loginCalls)
+	}
+}
+
+func TestProvisionAgent_CompatLoginRetryHonorsContext(t *testing.T) {
+	m := newFakeMASReg()
+	sy := &fakeSynapse{loginErrs: []error{
+		&synapse.CompatLoginError{StatusCode: http.StatusInternalServerError},
+		&synapse.CompatLoginError{StatusCode: http.StatusInternalServerError},
+	}}
+
+	p, err := NewProvisioner(m, sy, "https://telecrypt.io", "")
+	if err != nil {
+		t.Fatalf("NewProvisioner: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := p.ProvisionAgent(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ProvisionAgent error = %v, want context canceled", err)
+	}
+	if sy.loginCalls != 1 {
+		t.Fatalf("login calls = %d, want 1", sy.loginCalls)
 	}
 }
 
