@@ -57,4 +57,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/telecrypt-io/controlplane:${{ github.ref_name }}
+          tags: ghcr.io/telecrypt-io/telecrypt-controlplane:${{ github.ref_name }}
