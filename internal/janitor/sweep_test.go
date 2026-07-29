@@ -654,6 +654,26 @@ func TestSweep_DryRunLocksNothing(t *testing.T) {
 	}
 }
 
+func TestSweep_DryRunDoesNotDeleteStaleProvenance(t *testing.T) {
+	mas := newFakeMAS("locker-client", "s3cr3t")
+	mas.addUser("u-dry-run-stale-record", "dryrunstalerecord", time.Now().Add(-72*time.Hour))
+
+	store := newFakeStore()
+	store.setJanitorLocked("u-dry-run-stale-record", true)
+	cfg := Config{LockAfterHours: 48, DryRun: true}
+	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
+
+	if err := sweeper.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !store.janitorLocks["u-dry-run-stale-record"] {
+		t.Error("dry run deleted persisted janitor lock provenance")
+	}
+	if len(mas.lockCalls) != 0 || len(mas.unlockCalls) != 0 {
+		t.Errorf("dry run mutated MAS: lockCalls=%v unlockCalls=%v", mas.lockCalls, mas.unlockCalls)
+	}
+}
+
 // TestSweep_Digest_SendsOnlyAccountsAfterHighWaterMarkAndAdvancesIt covers the digest half:
 // existing (already-reported) email accounts are excluded, new ones are included, and the
 // high-water mark advances to the newest reported account's created_at only after a successful

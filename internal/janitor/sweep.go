@@ -183,13 +183,19 @@ func (s *Sweeper) sweepLocks(
 		}
 
 		if janitorLocked[u.ID] {
-			if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
-				log.Error("failed to clear stale lock provenance; refusing further action", "error", err)
-				skipped++
-				continue
+			if s.cfg.DryRun {
+				log.Info("would clear stale janitor lock provenance (dry run)")
+			} else {
+				if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
+					log.Error("failed to clear stale lock provenance; refusing further action", "error", err)
+					skipped++
+					continue
+				}
+				log.Info("cleared stale janitor lock provenance from unlocked account")
 			}
+			// Update only the in-memory sweep snapshot in dry-run so later classification
+			// accurately models the action without mutating persisted state.
 			delete(janitorLocked, u.ID)
-			log.Info("cleared stale janitor lock provenance from unlocked account")
 		}
 
 		reason := skipReason(u, cutoff, mxid, hasEmail, verified, s.cfg.ExcludeMXIDs)
