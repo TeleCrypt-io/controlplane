@@ -13,6 +13,7 @@ import (
 type synapseAdmin interface {
 	SetUserTypeVerified(ctx context.Context, mxid string) error
 	ClearUserType(ctx context.Context, mxid string) error
+	UserExists(ctx context.Context, mxid string) (bool, error)
 }
 
 type entitlementStore interface {
@@ -43,9 +44,6 @@ func NewReconciler(store entitlementStore, synapse synapseAdmin) *Reconciler {
 }
 
 // ReconcileTeamEntitlement is the one place seat verification happens for team billing.
-// Known follow-up (out of scope for initial build): periodic reconciliation against Dodo's live
-// subscription state in case a webhook is ever missed.
-//
 // TODO: Dodo's customer portal allows seat-count changes outside our UI (no SDK knob to disable).
 // When that happens, reconcile will auto-drop newest seats to enforce attached <= paid.
 // Detect over-subscription here and emit a structured log alert so ops can notify the team admin.

@@ -4,10 +4,12 @@ package db
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -26,7 +28,7 @@ func newTestStore(t *testing.T) (*Store, *pgxpool.Pool) {
 	t.Cleanup(pool.Close)
 
 	if _, err := pool.Exec(ctx, `
-		DROP TABLE IF EXISTS billing_verification_grants, seats, teams, ownership, verified, pending_claims, locker_state, schema_migrations`,
+		DROP TABLE IF EXISTS dodo_subscription_bindings, billing_verification_grants, seats, teams, ownership, verified, pending_claims, locker_state, schema_migrations`,
 	); err != nil {
 		t.Fatalf("drop existing tables: %v", err)
 	}
@@ -247,5 +249,166 @@ func TestTeamAndSeatInvariants(t *testing.T) {
 	}
 	if err := store.UpdateTeamSubscription(ctx, first.ID, "active", -1, nil, nil); err == nil {
 		t.Fatal("negative paid seats unexpectedly succeeded")
+	}
+}
+
+func TestAttachSeatEnforcesCapacity(t *testing.T) {
+	store, pool := newTestStore(t)
+	ctx := context.Background()
+	team, err := store.CreateTeam(ctx, "@capacity-admin:telecrypt.io")
+	if err != nil {
+		t.Fatalf("CreateTeam: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE teams SET paid_seats = 1 WHERE id = $1`, team.ID); err != nil {
+		t.Fatalf("set paid seats: %v", err)
+	}
+	if err := store.AttachSeat(ctx, team.ID, "@first:telecrypt.io"); err != nil {
+		t.Fatalf("first AttachSeat: %v", err)
+	}
+	if err := store.AttachSeat(ctx, team.ID, "@second:telecrypt.io"); !errors.Is(err, ErrSeatCapacityReached) {
+		t.Fatalf("second AttachSeat error = %v, want ErrSeatCapacityReached", err)
+	}
+}
+
+func TestAttachSeatSerializesConcurrentCapacityChecks(t *testing.T) {
+	store, pool := newTestStore(t)
+	ctx := context.Background()
+	team, err := store.CreateTeam(ctx, "@concurrent-seat-admin:telecrypt.io")
+	if err != nil {
+		t.Fatalf("CreateTeam: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE teams SET paid_seats = 1 WHERE id = $1`, team.ID); err != nil {
+		t.Fatalf("set paid seats: %v", err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, mxid := range []string{"@first-racer:telecrypt.io", "@second-racer:telecrypt.io"} {
+		go func(mxid string) {
+			<-start
+			results <- store.AttachSeat(ctx, team.ID, mxid)
+		}(mxid)
+	}
+	close(start)
+
+	var attached, rejected int
+	for range 2 {
+		switch err := <-results; {
+		case err == nil:
+			attached++
+		case errors.Is(err, ErrSeatCapacityReached):
+			rejected++
+		default:
+			t.Fatalf("unexpected concurrent AttachSeat error: %v", err)
+		}
+	}
+	if attached != 1 || rejected != 1 {
+		t.Fatalf("concurrent results: attached=%d rejected=%d, want 1/1", attached, rejected)
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM seats WHERE team_id = $1`, team.ID).Scan(&count); err != nil {
+		t.Fatalf("count seats: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("stored seats = %d, want 1", count)
+	}
+}
+
+func TestBeginCheckoutSerializesConcurrentAttempts(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+	team, err := store.CreateTeam(ctx, "@concurrent-checkout-admin:telecrypt.io")
+	if err != nil {
+		t.Fatalf("CreateTeam: %v", err)
+	}
+
+	start := make(chan struct{})
+	type checkoutResult struct {
+		reservation CheckoutReservation
+		err         error
+	}
+	results := make(chan checkoutResult, 2)
+	for range 2 {
+		go func() {
+			<-start
+			reservation, err := store.BeginCheckout(ctx, team.ID, 2, time.Now().UTC())
+			results <- checkoutResult{reservation: reservation, err: err}
+		}()
+	}
+	close(start)
+
+	var attempts []uuid.UUID
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("unexpected concurrent BeginCheckout error: %v", result.err)
+		}
+		attempts = append(attempts, result.reservation.AttemptID)
+	}
+	if attempts[0] == uuid.Nil || attempts[0] != attempts[1] {
+		t.Fatalf("concurrent attempts = %v, want one shared durable id", attempts)
+	}
+}
+
+func TestPendingDowngradeCapacityBlocksConcurrentAttachment(t *testing.T) {
+	store, pool := newTestStore(t)
+	ctx := context.Background()
+	team, err := store.CreateTeam(ctx, "@downgrade-admin:telecrypt.io")
+	if err != nil {
+		t.Fatalf("CreateTeam: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE teams SET subscription_status = 'active', paid_seats = 3, dodo_subscription_id = 'sub_downgrade'
+		WHERE id = $1
+	`, team.ID); err != nil {
+		t.Fatalf("activate team: %v", err)
+	}
+	if err := store.AttachSeat(ctx, team.ID, "@first:telecrypt.io"); err != nil {
+		t.Fatalf("AttachSeat first: %v", err)
+	}
+	reservation, err := store.ReserveSeatCountChange(ctx, team.ID, 1, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("ReserveSeatCountChange: %v", err)
+	}
+	if reservation.Attached != 1 || reservation.AttemptID == uuid.Nil {
+		t.Fatalf("reservation = %+v, want one attached and durable attempt id", reservation)
+	}
+	retry, err := store.ReserveSeatCountChange(ctx, team.ID, 1, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("repeat ReserveSeatCountChange: %v", err)
+	}
+	if !retry.Reused || retry.AttemptID != reservation.AttemptID {
+		t.Fatalf("repeated reservation = %+v, want reused attempt %s", retry, reservation.AttemptID)
+	}
+	if err := store.AttachSeat(ctx, team.ID, "@racer:telecrypt.io"); !errors.Is(err, ErrSeatCapacityReached) {
+		t.Fatalf("AttachSeat during downgrade = %v, want ErrSeatCapacityReached", err)
+	}
+}
+
+func TestTerminalSubscriptionCannotBeRevivedByDelayedEvent(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+	team, err := store.CreateTeam(ctx, "@terminal-admin:telecrypt.io")
+	if err != nil {
+		t.Fatalf("CreateTeam: %v", err)
+	}
+	if _, err := store.BeginCheckout(ctx, team.ID, 2, time.Now().UTC()); err != nil {
+		t.Fatalf("BeginCheckout: %v", err)
+	}
+	if err := store.BindCurrentSubscription(ctx, team.ID, "sub_terminal", "cus_terminal", "active", 2); err != nil {
+		t.Fatalf("bind active: %v", err)
+	}
+	if err := store.BindCurrentSubscription(ctx, team.ID, "sub_terminal", "cus_terminal", "cancelled", 2); err != nil {
+		t.Fatalf("bind cancelled: %v", err)
+	}
+	if err := store.BindCurrentSubscription(ctx, team.ID, "sub_terminal", "cus_terminal", "active", 2); !errors.Is(err, ErrStaleSubscription) {
+		t.Fatalf("delayed active event = %v, want ErrStaleSubscription", err)
+	}
+	got, err := store.GetTeamByID(ctx, team.ID)
+	if err != nil {
+		t.Fatalf("GetTeamByID: %v", err)
+	}
+	if got.SubscriptionStatus != "cancelled" {
+		t.Fatalf("subscription status = %q, want cancelled", got.SubscriptionStatus)
 	}
 }
