@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any
 
 from synapse.api.errors import Codes
@@ -33,8 +32,6 @@ _DENIAL_MESSAGE = (
     "See https://telecrypt.io/llms.txt"
 )
 
-_CACHE_TTL_SECONDS = 30.0
-
 
 class TierControllerConfig:
     def __init__(self, restricted_room_cap: int) -> None:
@@ -45,7 +42,6 @@ class TierController:
     def __init__(self, config: TierControllerConfig, api: ModuleApi) -> None:
         self.config = config
         self.api = api
-        self._user_type_cache: dict[str, tuple[str | None, float]] = {}
 
         api.register_media_repository_callbacks(
             is_user_allowed_to_upload_media_of_size=self.is_user_allowed_to_upload_media_of_size,
@@ -64,11 +60,6 @@ class TierController:
         return TierControllerConfig(restricted_room_cap)
 
     async def _get_user_type(self, user_id: str) -> str | None:
-        cached = self._user_type_cache.get(user_id)
-        now = time.monotonic()
-        if cached is not None and cached[1] > now:
-            return cached[0]
-
         def txn(cursor: Any) -> str | None:
             cursor.execute("SELECT user_type FROM users WHERE name = %s", (user_id,))
             row = cursor.fetchone()
@@ -84,7 +75,6 @@ class TierController:
             )
             return None
 
-        self._user_type_cache[user_id] = (user_type, now + _CACHE_TTL_SECONDS)
         return user_type
 
     async def _is_restricted(self, user_id: str) -> bool:

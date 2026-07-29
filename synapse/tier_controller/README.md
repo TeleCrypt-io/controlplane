@@ -14,9 +14,10 @@ A user is **RESTRICTED** unless Synapse `users.user_type` is exactly `verified`.
 and lookup-failure values are restricted. Verified users are uncapped; restricted users may not
 upload media or enable room encryption and may create only `restricted_room_cap` rooms.
 
-The module uses `module_api` callbacks only and has no credentials or outbound HTTP. User-type and
-room-count lookups are cached for 30 seconds; an entitlement change can therefore take up to that
-long to apply.
+The module uses `module_api` callbacks only and has no credentials or outbound HTTP. User type is
+read from Synapse's local database for every restricted capability decision so billing grants and
+revocations take effect immediately. Room counts are queried only when a restricted user creates a
+room.
 
 ## Denial behavior
 
