@@ -23,7 +23,9 @@ long to apply.
 Restricted uploads are rejected through Synapse's boolean media callback. Synapse 1.155.0 supplies
 the client-facing upload error itself, so that path cannot include the verification guidance.
 Restricted room creation and encryption-event callbacks return `Codes.FORBIDDEN` with the guidance
-from the module; Synapse exposes it to clients as the error message.
+from the module; Synapse exposes it to clients as the error message. Encrypted `initial_state` in a
+`/createRoom` request is rejected directly by the room-creation callback because Synapse does not
+pass those initial state events through the event spam-checker callback.
 
 ## Server configuration
 

@@ -127,6 +127,42 @@ async def test_restricted_room_cap_allowed_under_cap():
 
 
 @pytest.mark.asyncio
+async def test_unverified_encrypted_initial_state_denied_before_room_creation():
+    module, _ = make_module(
+        user_types={"@a:x": "unverified"}, room_counts={"@a:x": 0}, restricted_room_cap=3
+    )
+    room_config = {
+        "preset": "private_chat",
+        "initial_state": [
+            {
+                "type": "m.room.encryption",
+                "state_key": "",
+                "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+            }
+        ],
+    }
+    assert await module.user_may_create_room("@a:x", room_config) == (
+        Codes.FORBIDDEN,
+        {"error": _DENIAL_MESSAGE},
+    )
+
+
+@pytest.mark.asyncio
+async def test_verified_encrypted_initial_state_allowed():
+    module, _ = make_module(user_types={"@a:x": "verified"})
+    room_config = {
+        "initial_state": [
+            {
+                "type": "m.room.encryption",
+                "state_key": "",
+                "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+            }
+        ],
+    }
+    assert await module.user_may_create_room("@a:x", room_config) is NOT_SPAM
+
+
+@pytest.mark.asyncio
 async def test_verified_bypasses_room_cap():
     module, _ = make_module(user_types={"@a:x": "verified"}, room_counts={"@a:x": 999999})
     assert await module.user_may_create_room("@a:x", {}) is NOT_SPAM

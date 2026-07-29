@@ -112,6 +112,15 @@ class TierController:
     async def user_may_create_room(self, user_id: str, room_config: dict) -> Any:
         if not await self._is_restricted(user_id):
             return NOT_SPAM
+        # Synapse does not run createRoom's initial_state events through check_event_for_spam.
+        # The user_may_create_room callback receives the complete request body, so reject an
+        # encryption state event here before the room is created.
+        initial_state = room_config.get("initial_state", [])
+        if isinstance(initial_state, list) and any(
+            isinstance(event, dict) and event.get("type") == "m.room.encryption"
+            for event in initial_state
+        ):
+            return Codes.FORBIDDEN, {"error": _DENIAL_MESSAGE}
         count = await self._count_created_rooms(user_id)
         if count >= self.config.restricted_room_cap:
             return Codes.FORBIDDEN, {"error": _DENIAL_MESSAGE}
