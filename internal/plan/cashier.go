@@ -19,24 +19,24 @@ type Principal struct {
 // Team is the billing-safe subset of a team shown to its administrator. Provider identifiers
 // and billing credentials are intentionally never returned to the browser-facing Plan service.
 type Team struct {
-	ID                 string
-	SubscriptionStatus string
-	PaidSeats          int
-	PendingPaidSeats   *int
-	CheckoutActive     bool
-	HasBillingAccount  bool
+	ID                 string `json:"id"`
+	SubscriptionStatus string `json:"subscription_status"`
+	PaidSeats          int    `json:"paid_seats"`
+	PendingPaidSeats   *int   `json:"pending_paid_seats"`
+	CheckoutActive     bool   `json:"checkout_active"`
+	HasBillingAccount  bool   `json:"has_billing_account"`
 }
 
 // Seat is a Matrix account attached to a team.
 type Seat struct {
-	MXID      string
-	CreatedAt time.Time
+	MXID      string    `json:"mxid"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // State is all information the Plan renderer needs for one authenticated principal.
 type State struct {
-	Team  *Team
-	Seats []Seat
+	Team  *Team  `json:"team"`
+	Seats []Seat `json:"seats"`
 }
 
 // CashierClient is the complete public-Plan-to-private-Cashier contract. It intentionally

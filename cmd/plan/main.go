@@ -24,9 +24,23 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLogLevel(cfg.LogLevel)})))
 
+	cashierClient, err := plan.NewHTTPCashierClient(cfg.CashierInternalURL, cfg.PlanAssertionPrivateKey, nil)
+	if err != nil {
+		slog.Error("cashier client", "error", err)
+		os.Exit(1)
+	}
+
 	srv := &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           plan.NewServer(),
+		Addr: cfg.ListenAddr,
+		Handler: plan.NewServer(plan.Config{
+			ServerName:      cfg.ServerName,
+			Homeserver:      cfg.Homeserver,
+			MASBaseURL:      cfg.MASBaseURL,
+			PlanPublicURL:   cfg.PlanPublicURL,
+			MASClientID:     cfg.MASClientID,
+			MASClientSecret: cfg.MASClientSecret,
+			SessionKey:      cfg.SessionKey,
+		}, cashierClient),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {

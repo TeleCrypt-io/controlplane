@@ -29,8 +29,15 @@ func setRequiredCashierEnv(t *testing.T) {
 }
 
 func TestLoadPlan_UsesIsolatedPlanAndCashierTopology(t *testing.T) {
+	t.Setenv("SERVER_NAME", "telecrypt.test")
+	t.Setenv("HOMESERVER", "https://backend.test.telecrypt.io")
+	t.Setenv("MAS_BASE_URL", "http://mas:8080")
 	t.Setenv("PLAN_PUBLIC_URL", "https://backend.test.telecrypt.io/plan")
 	t.Setenv("CASHIER_INTERNAL_URL", "http://cashier:9011")
+	t.Setenv("MAS_OIDC_CLIENT_ID", "plan")
+	t.Setenv("MAS_OIDC_CLIENT_SECRET", "test-secret")
+	t.Setenv("SESSION_KEY", "test-session-key")
+	t.Setenv("PLAN_ASSERTION_PRIVATE_KEY", strings.Repeat("A", 86))
 
 	cfg, err := LoadPlan()
 	if err != nil {
@@ -42,8 +49,15 @@ func TestLoadPlan_UsesIsolatedPlanAndCashierTopology(t *testing.T) {
 }
 
 func TestLoadPlan_RejectsPublicCashierOrigin(t *testing.T) {
+	t.Setenv("SERVER_NAME", "telecrypt.test")
+	t.Setenv("HOMESERVER", "https://backend.test.telecrypt.io")
+	t.Setenv("MAS_BASE_URL", "http://mas:8080")
 	t.Setenv("PLAN_PUBLIC_URL", "https://backend.test.telecrypt.io/plan")
 	t.Setenv("CASHIER_INTERNAL_URL", "https://billing.test.telecrypt.io")
+	t.Setenv("MAS_OIDC_CLIENT_ID", "plan")
+	t.Setenv("MAS_OIDC_CLIENT_SECRET", "test-secret")
+	t.Setenv("SESSION_KEY", "test-session-key")
+	t.Setenv("PLAN_ASSERTION_PRIVATE_KEY", strings.Repeat("A", 86))
 
 	if _, err := LoadPlan(); err == nil {
 		t.Fatal("LoadPlan accepted a public Cashier origin")
