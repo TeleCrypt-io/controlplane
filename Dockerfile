@@ -27,6 +27,8 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/steward ./cmd/stew
 # CMD defaults to the Redpill component. It is a default, rather than an ENTRYPOINT, because this
 # one image contains three separately deployed components; Janitor and Steward replace CMD.
 FROM scratch AS controlplane
+LABEL org.opencontainers.image.source="https://github.com/TeleCrypt-io/controlplane"
+LABEL org.opencontainers.image.licenses="BUSL-1.1"
 COPY --from=controlplane-build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=controlplane-build /out/redpill /redpill
 COPY --from=controlplane-build /out/janitor /janitor
