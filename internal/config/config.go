@@ -273,24 +273,54 @@ func LoadCashier() (*CashierConfig, error) {
 type PlanConfig struct {
 	LogLevel           string
 	ListenAddr         string
+	ServerName         string
+	Homeserver         string
+	MASBaseURL         string
 	PlanPublicURL      string
 	CashierInternalURL string
+	MASClientID        string
+	MASClientSecret    string
+	SessionKey         string
 }
 
-// LoadPlan validates the two fixed topology boundaries needed when Plan is activated by a later
-// coordinated release. The current Plan command is a fail-closed scaffold and is not deployed.
+// LoadPlan validates the public Plan and private MAS/Cashier topology. Plan is not deployed until
+// a later coordinated release supplies the signed Cashier transport and routes traffic to it.
 func LoadPlan() (*PlanConfig, error) {
 	c := &PlanConfig{
 		LogLevel:           getenvDefault("LOG_LEVEL", "info"),
 		ListenAddr:         getenvDefault("LISTEN_ADDR", ":9012"),
+		ServerName:         os.Getenv("SERVER_NAME"),
+		Homeserver:         getenvDefault("HOMESERVER", "https://backend.telecrypt.io"),
+		MASBaseURL:         os.Getenv("MAS_BASE_URL"),
 		PlanPublicURL:      getenvDefault("PLAN_PUBLIC_URL", "https://backend.telecrypt.io/plan"),
 		CashierInternalURL: getenvDefault("CASHIER_INTERNAL_URL", "http://cashier:9011"),
+		MASClientID:        os.Getenv("MAS_OIDC_CLIENT_ID"),
+		MASClientSecret:    os.Getenv("MAS_OIDC_CLIENT_SECRET"),
+		SessionKey:         os.Getenv("SESSION_KEY"),
+	}
+	for _, req := range []struct{ name, val string }{
+		{"SERVER_NAME", c.ServerName},
+		{"MAS_BASE_URL", c.MASBaseURL},
+		{"MAS_OIDC_CLIENT_ID", c.MASClientID},
+		{"MAS_OIDC_CLIENT_SECRET", c.MASClientSecret},
+		{"SESSION_KEY", c.SessionKey},
+	} {
+		if req.val == "" {
+			return nil, fmt.Errorf("missing required env var: %s", req.name)
+		}
+	}
+	homeserver, err := url.Parse(c.Homeserver)
+	if err != nil || homeserver.Scheme != "https" || homeserver.Host == "" || homeserver.User != nil || homeserver.RawQuery != "" || homeserver.Fragment != "" {
+		return nil, fmt.Errorf("HOMESERVER must be a public HTTPS URL")
 	}
 	plan, err := url.Parse(c.PlanPublicURL)
 	if err != nil || plan.Scheme != "https" || plan.Host == "" || plan.User != nil || plan.RawQuery != "" || plan.Fragment != "" {
 		return nil, fmt.Errorf("PLAN_PUBLIC_URL must be a public HTTPS URL")
 	}
 	if err := validateComposeInternalOrigin(c.CashierInternalURL, "cashier", "9011", "CASHIER_INTERNAL_URL"); err != nil {
+		return nil, err
+	}
+	if err := validateComposeInternalOrigin(c.MASBaseURL, "mas", "8080", "MAS_BASE_URL"); err != nil {
 		return nil, err
 	}
 	return c, nil
