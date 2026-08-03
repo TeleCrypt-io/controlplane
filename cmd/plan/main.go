@@ -25,8 +25,16 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLogLevel(cfg.LogLevel)})))
 
 	srv := &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           plan.NewServer(),
+		Addr: cfg.ListenAddr,
+		Handler: plan.NewServer(plan.Config{
+			ServerName:      cfg.ServerName,
+			Homeserver:      cfg.Homeserver,
+			MASBaseURL:      cfg.MASBaseURL,
+			PlanPublicURL:   cfg.PlanPublicURL,
+			MASClientID:     cfg.MASClientID,
+			MASClientSecret: cfg.MASClientSecret,
+			SessionKey:      cfg.SessionKey,
+		}, nil),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
