@@ -30,11 +30,11 @@ GitHub Release assets:
 - `telecrypt_tier_controller-<release>-py3-none-any.whl.sha256`
 
 The standalone `telecrypt-synapse` repository consumes that wheel to build a Synapse image. The
-Dockerfile's `synapse-tier-controller` target is retained only temporarily for the deployed legacy
-path. Both existing images are published under the same exact release tag:
+Dockerfile's `synapse-tier-controller` target is retained only as source history for the deployed
+legacy `0.3.4` image; new Controlplane releases never build or publish that target. The only
+container image published for new releases is:
 
 - `ghcr.io/telecrypt-io/telecrypt-controlplane:<release>`
-- `ghcr.io/telecrypt-io/telecrypt-synapse-tier-controller:<release>`
 
 The temporary legacy module image is based on `ghcr.io/dotwee/matrix-synapse-s3:v1.155.0`; a
 Synapse upgrade belongs in the standalone image-builder repository. Deployments must use exact
