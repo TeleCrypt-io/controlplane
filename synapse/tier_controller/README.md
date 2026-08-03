@@ -1,9 +1,15 @@
 # tier_controller
 
-`tier_controller` is a pure-Python Synapse module owned and released by the control plane. It is
-baked read-only into `ghcr.io/telecrypt-io/telecrypt-synapse-tier-controller:<release>` at
-`/modules/tier_controller`; server deployment configuration only selects that exact release and
-loads `tier_controller.TierController`.
+`tier_controller` is a pure-Python Synapse module owned and released by the control plane. Each
+Controlplane release publishes the matching, versioned
+`telecrypt_tier_controller-<release>-py3-none-any.whl` and its `.sha256` file as GitHub Release
+assets. The standalone `telecrypt-synapse` image builder installs that exact wheel; server
+deployment configuration only selects the resulting exact image release and loads
+`tier_controller.TierController`.
+
+`ghcr.io/telecrypt-io/telecrypt-synapse-tier-controller:<release>` remains a temporary legacy
+compatibility image while the deployed server is migrated. It is not the source of the module for
+new Synapse images.
 
 The image is built against `ghcr.io/dotwee/matrix-synapse-s3:v1.155.0`. Upgrade that base only as
 part of a new controlplane release after the module tests and a deployment canary pass.
@@ -41,5 +47,7 @@ modules:
 
 ## Tests
 
-The GitHub workflow builds the module image and runs the fake-`module_api` unit suite from the
-baked image. This ensures the exact file layout and `PYTHONPATH` used at runtime are tested.
+The GitHub workflow builds the wheel, installs it with Synapse `1.155.0` into a clean virtual
+environment, and runs the fake-`module_api` unit suite. A tag build fails unless the wheel version
+exactly equals the Controlplane release tag, then publishes the wheel and checksum together on that
+GitHub Release.
