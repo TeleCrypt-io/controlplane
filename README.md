@@ -26,10 +26,6 @@ coordinate, not a claim that the GitHub Release distributes the Go services. Dep
 configuration, credentials, operating procedures, and production acceptance material remain
 private in Harness.
 
-The publisher uses a repository secret with package-publishing access because this organisation
-does not permit the ephemeral GitHub Actions token to create a new GHCR package. The credential is
-used only on immutable tag workflows and is not stored in source or exposed to pull requests.
-
 ## Repository layout
 
 - `cmd/` contains the minimal `main` packages for the three independently deployed processes:

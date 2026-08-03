@@ -84,10 +84,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          # The organisation's ephemeral Actions token cannot create a new GHCR package.
-          # This dedicated repository secret has only the package scope required to publish
-          # immutable release images; it is never available to pull-request workflows.
-          password: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
         if: startsWith(github.ref, 'refs/tags/')
