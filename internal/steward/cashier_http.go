@@ -1,4 +1,4 @@
-package plan
+package steward
 
 import (
 	"bytes"
@@ -38,7 +38,7 @@ func NewHTTPCashierClient(baseURL, encodedPrivateKey string, httpClient *http.Cl
 	}
 	key, err := base64.RawURLEncoding.DecodeString(encodedPrivateKey)
 	if err != nil || len(key) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("PLAN_ASSERTION_PRIVATE_KEY must be a raw URL-safe base64 Ed25519 private key")
+		return nil, fmt.Errorf("STEWARD_ASSERTION_PRIVATE_KEY must be a raw URL-safe base64 Ed25519 private key")
 	}
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 15 * time.Second}

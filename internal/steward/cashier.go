@@ -1,7 +1,7 @@
-// Package plan owns TeleCrypt's public Plan surface. It deliberately has no
+// Package steward owns TeleCrypt's public Plan surface. It deliberately has no
 // Dodo, Synapse-admin, or billing-database dependency: it authenticates a browser with MAS and
 // invokes the private Cashier service through this narrow interface.
-package plan
+package steward
 
 import (
 	"context"

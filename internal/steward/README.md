@@ -1,6 +1,6 @@
 # Plan service boundary
 
-`internal/plan` is the public, browser-facing owner of `/plan`.  It will own MAS OIDC,
+`internal/steward` is the public, browser-facing owner of `/plan`. It owns MAS OIDC,
 browser sessions, origin/CSRF protection, rendering, and the user-facing team/seat actions.
 
 It must not receive Dodo credentials, Dodo webhook secrets, Synapse-admin credentials, or a

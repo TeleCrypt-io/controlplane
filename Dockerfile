@@ -13,7 +13,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/redpill ./cmd/redpill
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/janitor ./cmd/janitor
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/cashier ./cmd/cashier
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/plan ./cmd/plan
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/steward ./cmd/steward
 
 # The tier controller belongs to the control plane but runs in-process in Synapse. Keep the
 # Synapse version exact: the controller uses callbacks and database tables validated against this
@@ -40,6 +40,6 @@ COPY --from=controlplane-build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs
 COPY --from=controlplane-build /out/redpill /redpill
 COPY --from=controlplane-build /out/janitor /janitor
 COPY --from=controlplane-build /out/cashier /cashier
-COPY --from=controlplane-build /out/plan /plan
+COPY --from=controlplane-build /out/steward /steward
 USER 991:991
 ENTRYPOINT ["/redpill"]

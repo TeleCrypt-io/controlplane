@@ -28,8 +28,9 @@ func setRequiredCashierEnv(t *testing.T) {
 	}
 }
 
-func TestLoadPlan_UsesIsolatedPlanAndCashierTopology(t *testing.T) {
+func TestLoadSteward_UsesIsolatedPlanAndCashierTopology(t *testing.T) {
 	t.Setenv("SERVER_NAME", "telecrypt.test")
+	t.Setenv("BILLING_ENV", "test")
 	t.Setenv("HOMESERVER", "https://backend.test.telecrypt.io")
 	t.Setenv("MAS_BASE_URL", "http://mas:8080")
 	t.Setenv("PLAN_PUBLIC_URL", "https://backend.test.telecrypt.io/plan")
@@ -37,19 +38,20 @@ func TestLoadPlan_UsesIsolatedPlanAndCashierTopology(t *testing.T) {
 	t.Setenv("MAS_OIDC_CLIENT_ID", "plan")
 	t.Setenv("MAS_OIDC_CLIENT_SECRET", "test-secret")
 	t.Setenv("SESSION_KEY", "test-session-key")
-	t.Setenv("PLAN_ASSERTION_PRIVATE_KEY", strings.Repeat("A", 86))
+	t.Setenv("STEWARD_ASSERTION_PRIVATE_KEY", strings.Repeat("A", 86))
 
-	cfg, err := LoadPlan()
+	cfg, err := LoadSteward()
 	if err != nil {
-		t.Fatalf("LoadPlan: %v", err)
+		t.Fatalf("LoadSteward: %v", err)
 	}
 	if got, want := cfg.ListenAddr, ":9012"; got != want {
 		t.Fatalf("ListenAddr = %q, want %q", got, want)
 	}
 }
 
-func TestLoadPlan_RejectsPublicCashierOrigin(t *testing.T) {
+func TestLoadSteward_RejectsPublicCashierOrigin(t *testing.T) {
 	t.Setenv("SERVER_NAME", "telecrypt.test")
+	t.Setenv("BILLING_ENV", "test")
 	t.Setenv("HOMESERVER", "https://backend.test.telecrypt.io")
 	t.Setenv("MAS_BASE_URL", "http://mas:8080")
 	t.Setenv("PLAN_PUBLIC_URL", "https://backend.test.telecrypt.io/plan")
@@ -57,10 +59,10 @@ func TestLoadPlan_RejectsPublicCashierOrigin(t *testing.T) {
 	t.Setenv("MAS_OIDC_CLIENT_ID", "plan")
 	t.Setenv("MAS_OIDC_CLIENT_SECRET", "test-secret")
 	t.Setenv("SESSION_KEY", "test-session-key")
-	t.Setenv("PLAN_ASSERTION_PRIVATE_KEY", strings.Repeat("A", 86))
+	t.Setenv("STEWARD_ASSERTION_PRIVATE_KEY", strings.Repeat("A", 86))
 
-	if _, err := LoadPlan(); err == nil {
-		t.Fatal("LoadPlan accepted a public Cashier origin")
+	if _, err := LoadSteward(); err == nil {
+		t.Fatal("LoadSteward accepted a public Cashier origin")
 	}
 }
 

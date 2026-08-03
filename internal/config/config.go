@@ -267,12 +267,13 @@ func LoadCashier() (*CashierConfig, error) {
 	return c, nil
 }
 
-// PlanConfig contains only the future public Plan service's own configuration. In particular it
-// excludes Dodo, Synapse-admin, and database credentials: Plan will use MAS OIDC and the narrow
+// StewardConfig contains only the public Steward service's own configuration. In particular it
+// excludes Dodo, Synapse-admin, and database credentials: Steward uses MAS OIDC and the narrow
 // private Cashier API instead.
-type PlanConfig struct {
+type StewardConfig struct {
 	LogLevel           string
 	ListenAddr         string
+	BillingEnv         string
 	ServerName         string
 	Homeserver         string
 	MASBaseURL         string
@@ -281,15 +282,15 @@ type PlanConfig struct {
 	MASClientID        string
 	MASClientSecret    string
 	SessionKey         string
-	PlanAssertionPrivateKey string
+	StewardAssertionPrivateKey string
 }
 
-// LoadPlan validates the public Plan and private MAS/Cashier topology. Plan is not deployed until
-// a later coordinated release supplies the signed Cashier transport and routes traffic to it.
-func LoadPlan() (*PlanConfig, error) {
-	c := &PlanConfig{
+// LoadSteward validates the public Steward and private MAS/Cashier topology.
+func LoadSteward() (*StewardConfig, error) {
+	c := &StewardConfig{
 		LogLevel:           getenvDefault("LOG_LEVEL", "info"),
 		ListenAddr:         getenvDefault("LISTEN_ADDR", ":9012"),
+		BillingEnv:         os.Getenv("BILLING_ENV"),
 		ServerName:         os.Getenv("SERVER_NAME"),
 		Homeserver:         getenvDefault("HOMESERVER", "https://backend.telecrypt.io"),
 		MASBaseURL:         os.Getenv("MAS_BASE_URL"),
@@ -298,15 +299,16 @@ func LoadPlan() (*PlanConfig, error) {
 		MASClientID:        os.Getenv("MAS_OIDC_CLIENT_ID"),
 		MASClientSecret:    os.Getenv("MAS_OIDC_CLIENT_SECRET"),
 		SessionKey:         os.Getenv("SESSION_KEY"),
-		PlanAssertionPrivateKey: os.Getenv("PLAN_ASSERTION_PRIVATE_KEY"),
+		StewardAssertionPrivateKey: os.Getenv("STEWARD_ASSERTION_PRIVATE_KEY"),
 	}
 	for _, req := range []struct{ name, val string }{
 		{"SERVER_NAME", c.ServerName},
+		{"BILLING_ENV", c.BillingEnv},
 		{"MAS_BASE_URL", c.MASBaseURL},
 		{"MAS_OIDC_CLIENT_ID", c.MASClientID},
 		{"MAS_OIDC_CLIENT_SECRET", c.MASClientSecret},
 		{"SESSION_KEY", c.SessionKey},
-		{"PLAN_ASSERTION_PRIVATE_KEY", c.PlanAssertionPrivateKey},
+		{"STEWARD_ASSERTION_PRIVATE_KEY", c.StewardAssertionPrivateKey},
 	} {
 		if req.val == "" {
 			return nil, fmt.Errorf("missing required env var: %s", req.name)
@@ -325,6 +327,9 @@ func LoadPlan() (*PlanConfig, error) {
 	}
 	if err := validateComposeInternalOrigin(c.MASBaseURL, "mas", "8080", "MAS_BASE_URL"); err != nil {
 		return nil, err
+	}
+	if c.BillingEnv != "test" && c.BillingEnv != "production" {
+		return nil, fmt.Errorf("BILLING_ENV must be exactly test or production")
 	}
 	return c, nil
 }
