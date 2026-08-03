@@ -281,6 +281,7 @@ type PlanConfig struct {
 	MASClientID        string
 	MASClientSecret    string
 	SessionKey         string
+	PlanAssertionPrivateKey string
 }
 
 // LoadPlan validates the public Plan and private MAS/Cashier topology. Plan is not deployed until
@@ -297,6 +298,7 @@ func LoadPlan() (*PlanConfig, error) {
 		MASClientID:        os.Getenv("MAS_OIDC_CLIENT_ID"),
 		MASClientSecret:    os.Getenv("MAS_OIDC_CLIENT_SECRET"),
 		SessionKey:         os.Getenv("SESSION_KEY"),
+		PlanAssertionPrivateKey: os.Getenv("PLAN_ASSERTION_PRIVATE_KEY"),
 	}
 	for _, req := range []struct{ name, val string }{
 		{"SERVER_NAME", c.ServerName},
@@ -304,6 +306,7 @@ func LoadPlan() (*PlanConfig, error) {
 		{"MAS_OIDC_CLIENT_ID", c.MASClientID},
 		{"MAS_OIDC_CLIENT_SECRET", c.MASClientSecret},
 		{"SESSION_KEY", c.SessionKey},
+		{"PLAN_ASSERTION_PRIVATE_KEY", c.PlanAssertionPrivateKey},
 	} {
 		if req.val == "" {
 			return nil, fmt.Errorf("missing required env var: %s", req.name)

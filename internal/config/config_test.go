@@ -37,6 +37,7 @@ func TestLoadPlan_UsesIsolatedPlanAndCashierTopology(t *testing.T) {
 	t.Setenv("MAS_OIDC_CLIENT_ID", "plan")
 	t.Setenv("MAS_OIDC_CLIENT_SECRET", "test-secret")
 	t.Setenv("SESSION_KEY", "test-session-key")
+	t.Setenv("PLAN_ASSERTION_PRIVATE_KEY", strings.Repeat("A", 86))
 
 	cfg, err := LoadPlan()
 	if err != nil {
@@ -56,6 +57,7 @@ func TestLoadPlan_RejectsPublicCashierOrigin(t *testing.T) {
 	t.Setenv("MAS_OIDC_CLIENT_ID", "plan")
 	t.Setenv("MAS_OIDC_CLIENT_SECRET", "test-secret")
 	t.Setenv("SESSION_KEY", "test-session-key")
+	t.Setenv("PLAN_ASSERTION_PRIVATE_KEY", strings.Repeat("A", 86))
 
 	if _, err := LoadPlan(); err == nil {
 		t.Fatal("LoadPlan accepted a public Cashier origin")
