@@ -1,6 +1,4 @@
-// Command plan is the future public Plan service. It is intentionally not deployed until a
-// coordinated release moves the browser flow from legacy cashier and wires its private Cashier
-// transport. See internal/plan/README.md.
+// Command steward is TeleCrypt's public account, team, and subscription-management service.
 package main
 
 import (
@@ -13,18 +11,18 @@ import (
 	"time"
 
 	"github.com/TeleCrypt-io/controlplane/internal/config"
-	"github.com/TeleCrypt-io/controlplane/internal/plan"
+	"github.com/TeleCrypt-io/controlplane/internal/steward"
 )
 
 func main() {
-	cfg, err := config.LoadPlan()
+	cfg, err := config.LoadSteward()
 	if err != nil {
 		slog.Error("config", "error", err)
 		os.Exit(1)
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLogLevel(cfg.LogLevel)})))
 
-	cashierClient, err := plan.NewHTTPCashierClient(cfg.CashierInternalURL, cfg.PlanAssertionPrivateKey, nil)
+	cashierClient, err := steward.NewHTTPCashierClient(cfg.CashierInternalURL, cfg.StewardAssertionPrivateKey, nil)
 	if err != nil {
 		slog.Error("cashier client", "error", err)
 		os.Exit(1)
@@ -32,7 +30,8 @@ func main() {
 
 	srv := &http.Server{
 		Addr: cfg.ListenAddr,
-		Handler: plan.NewServer(plan.Config{
+		Handler: steward.NewServer(steward.Config{
+			BillingEnv:      cfg.BillingEnv,
 			ServerName:      cfg.ServerName,
 			Homeserver:      cfg.Homeserver,
 			MASBaseURL:      cfg.MASBaseURL,
@@ -44,7 +43,7 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
-		slog.Info("plan scaffold listening", "addr", cfg.ListenAddr)
+		slog.Info("steward listening", "addr", cfg.ListenAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("server", "error", err)
 			os.Exit(1)

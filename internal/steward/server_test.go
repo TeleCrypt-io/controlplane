@@ -1,4 +1,4 @@
-package plan
+package steward
 
 import (
 	"context"
@@ -65,6 +65,16 @@ func TestServerRendersPublicPlanLoginSurface(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "/plan/login") {
 		t.Fatal("GET /plan does not offer the MAS login route")
+	}
+}
+
+func TestServerRendersPersistentSandboxBanner(t *testing.T) {
+	srv := testServer()
+	srv.cfg.BillingEnv = "test"
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/plan", nil))
+	if !strings.Contains(rec.Body.String(), "TEST / SANDBOX") {
+		t.Fatal("GET /plan does not visibly identify the test billing environment")
 	}
 }
 
