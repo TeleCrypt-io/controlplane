@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "telecrypt-tier-controller"
-version = "0.3.8"
+version = "0.3.9"
 description = "TeleCrypt fail-closed Synapse capability-policy module"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,9 +15,8 @@ classifiers = [
   "Programming Language :: Python :: 3 :: Only",
 ]
 
-# The project root is the package directory itself.  Keeping this explicit lets the
-# legacy image continue to copy this directory unchanged while the wheel installs
-# the importable package as ``tier_controller``.
+# The project root is the package directory itself so the released wheel installs the importable
+# package as ``tier_controller``.
 [tool.setuptools]
 packages = ["tier_controller"]
 package-dir = { tier_controller = "." }

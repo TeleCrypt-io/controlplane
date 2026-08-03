@@ -7,12 +7,9 @@ assets. The standalone `telecrypt-synapse` image builder installs that exact whe
 deployment configuration only selects the resulting exact image release and loads
 `tier_controller.TierController`.
 
-`ghcr.io/telecrypt-io/telecrypt-synapse-tier-controller:<release>` remains a temporary legacy
-compatibility image while the deployed server is migrated. It is not the source of the module for
-new Synapse images.
-
-The image is built against `ghcr.io/dotwee/matrix-synapse-s3:v1.155.0`. Upgrade that base only as
-part of a new controlplane release after the module tests and a deployment canary pass.
+Controlplane does not build or publish a Synapse-module container image. Compatibility is verified
+in GitHub Actions against the exact Synapse version, while `telecrypt-synapse` installs the released
+wheel into its own exact derived Synapse image.
 
 ## Model
 

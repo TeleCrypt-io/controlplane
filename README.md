@@ -18,6 +18,15 @@ Every release is an immutable exact tag. GitHub Actions tests the source and, on
 
 The tier-controller wheel version must equal the Controlplane release tag. The standalone `telecrypt-synapse` repository consumes that exact wheel to build its own exact Synapse image. Deployment configuration, credentials, operating procedures, and production acceptance material remain private in Harness.
 
+## Repository layout
+
+- `cmd/` contains the minimal `main` packages for the three independently deployed processes:
+  Redpill, Janitor, and Steward.
+- `internal/` contains their shared Go implementation. Go deliberately prevents packages below
+  `internal/` from being imported by unrelated repositories.
+- `synapse/tier_controller/` contains the public Python package released as the exact wheel for
+  `telecrypt-synapse`; it is not copied into the Controlplane container image.
+
 ## Browser service boundary
 
 Steward keeps the historic public URL `/plan` for compatibility. It owns MAS PKCE/OIDC, browser cookies, Origin protection, local MXID validation, and the team UI. It has no Dodo, Synapse-admin, or Postgres credentials. Commands are signed to the private Cashier service, which alone handles checkout, payment webhooks, entitlement mutation, and Dodo customer portal links.
