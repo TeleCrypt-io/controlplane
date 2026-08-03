@@ -11,12 +11,20 @@ Cashier, Dodo integration, subscription records, payment-provider credentials, a
 
 ## Release contract
 
-Every release is an immutable exact tag. GitHub Actions tests the source and, only for a new tag, builds and publishes:
+Every source version is an immutable exact tag. GitHub Actions tests the source and, only for a new
+tag, publishes two distinct artifact types:
 
-- `ghcr.io/telecrypt-io/telecrypt-controlplane:<release>`
-- `telecrypt_tier_controller-<release>-py3-none-any.whl` and its checksum as GitHub Release assets.
+- The Go services are released only as `ghcr.io/telecrypt-io/controlplane:<release>`. The image
+  contains Redpill, Janitor, and Steward; no executable archives are attached to GitHub Releases.
+- The GitHub Release, titled `tier-controller <release>`, contains only
+  `telecrypt_tier_controller-<release>-py3-none-any.whl` and its checksum. This is the public
+  distribution channel for the Synapse module.
 
-The tier-controller wheel version must equal the Controlplane release tag. The standalone `telecrypt-synapse` repository consumes that exact wheel to build its own exact Synapse image. Deployment configuration, credentials, operating procedures, and production acceptance material remain private in Harness.
+The wheel version must equal the source/image tag. The standalone `telecrypt-synapse` repository
+consumes that exact wheel to build its own exact Synapse image. The shared tag is a compatibility
+coordinate, not a claim that the GitHub Release distributes the Go services. Deployment
+configuration, credentials, operating procedures, and production acceptance material remain
+private in Harness.
 
 ## Repository layout
 

@@ -93,9 +93,9 @@ jobs:
           context: .
           push: true
           target: controlplane
-          tags: ghcr.io/telecrypt-io/telecrypt-controlplane:${{ github.ref_name }}
+          tags: ghcr.io/telecrypt-io/controlplane:${{ github.ref_name }}
 
-      - name: Create immutable release with tier-controller wheel
+      - name: Create immutable tier-controller wheel release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
@@ -105,4 +105,4 @@ jobs:
             echo "GitHub Release $RELEASE already exists; refusing to replace release assets" >&2
             exit 1
           fi
-          gh release create "$RELEASE" --verify-tag --title "$RELEASE" --generate-notes dist/tier-controller/*.whl dist/tier-controller/*.whl.sha256
+          gh release create "$RELEASE" --verify-tag --title "tier-controller $RELEASE" --generate-notes dist/tier-controller/*.whl dist/tier-controller/*.whl.sha256
