@@ -13,6 +13,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/redpill ./cmd/redpill
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/janitor ./cmd/janitor
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/cashier ./cmd/cashier
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/plan ./cmd/plan
 
 # The tier controller belongs to the control plane but runs in-process in Synapse. Keep the
 # Synapse version exact: the controller uses callbacks and database tables validated against this
@@ -23,7 +24,9 @@ COPY --chown=991:991 synapse/tier_controller /modules/tier_controller
 ENV PYTHONPATH=/modules
 USER 991:991
 
-# Runtime: scratch — no shell, no package manager. All three binaries ship in this one image;
+# Runtime: scratch — no shell, no package manager. The public control-plane image ships redpill,
+# janitor, the transitional legacy cashier binary, and Plan. Production will invoke `/plan`; the
+# private Cashier image owns the billing service.
 # redpill needs no CA trust store (MAS is reached over plain HTTP on the internal telecrypt_net
 # network) but janitor's SMTP digest does, so the bundle is copied in even though redpill itself
 # never touches it.
@@ -37,5 +40,6 @@ COPY --from=controlplane-build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs
 COPY --from=controlplane-build /out/redpill /redpill
 COPY --from=controlplane-build /out/janitor /janitor
 COPY --from=controlplane-build /out/cashier /cashier
+COPY --from=controlplane-build /out/plan /plan
 USER 991:991
 ENTRYPOINT ["/redpill"]
