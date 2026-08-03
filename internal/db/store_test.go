@@ -24,7 +24,7 @@ func testStore(t *testing.T) (*Store, context.Context) {
 
 func TestStoreReadsButDoesNotCreatePrivateCashierState(t *testing.T) {
     store, ctx := testStore(t)
-    if _, err := store.BindBillingEnvironment(ctx, "test", "production"); err == nil { t.Fatal("accepted missing private Cashier billing guard") }
+    if err := store.BindBillingEnvironment(ctx, "test", "production"); err == nil { t.Fatal("accepted missing private Cashier billing guard") }
     pool := store.pool
     if _, err := pool.Exec(ctx, `INSERT INTO cashier.billing_environment_guard (singleton, billing_env, matrix_deployment_id) VALUES (TRUE, 'test', 'production')`); err != nil { t.Fatalf("insert guard: %v", err) }
     if err := store.BindBillingEnvironment(ctx, "test", "production"); err != nil { t.Fatalf("verify guard: %v", err) }
