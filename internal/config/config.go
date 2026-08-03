@@ -267,6 +267,35 @@ func LoadCashier() (*CashierConfig, error) {
 	return c, nil
 }
 
+// PlanConfig contains only the future public Plan service's own configuration. In particular it
+// excludes Dodo, Synapse-admin, and database credentials: Plan will use MAS OIDC and the narrow
+// private Cashier API instead.
+type PlanConfig struct {
+	LogLevel           string
+	ListenAddr         string
+	PlanPublicURL      string
+	CashierInternalURL string
+}
+
+// LoadPlan validates the two fixed topology boundaries needed when Plan is activated by a later
+// coordinated release. The current Plan command is a fail-closed scaffold and is not deployed.
+func LoadPlan() (*PlanConfig, error) {
+	c := &PlanConfig{
+		LogLevel:           getenvDefault("LOG_LEVEL", "info"),
+		ListenAddr:         getenvDefault("LISTEN_ADDR", ":9012"),
+		PlanPublicURL:      getenvDefault("PLAN_PUBLIC_URL", "https://backend.telecrypt.io/plan"),
+		CashierInternalURL: getenvDefault("CASHIER_INTERNAL_URL", "http://cashier:9011"),
+	}
+	plan, err := url.Parse(c.PlanPublicURL)
+	if err != nil || plan.Scheme != "https" || plan.Host == "" || plan.User != nil || plan.RawQuery != "" || plan.Fragment != "" {
+		return nil, fmt.Errorf("PLAN_PUBLIC_URL must be a public HTTPS URL")
+	}
+	if err := validateComposeInternalOrigin(c.CashierInternalURL, "cashier", "9011", "CASHIER_INTERNAL_URL"); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
 // validateCashierEnvironment makes the billing environment an explicit, fail-closed choice.
 // Do not infer it from an API key: a mixed key/base URL can otherwise charge real customers
 // while the service believes it is safely testing (or vice versa).

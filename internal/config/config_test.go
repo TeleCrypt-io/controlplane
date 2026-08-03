@@ -28,6 +28,28 @@ func setRequiredCashierEnv(t *testing.T) {
 	}
 }
 
+func TestLoadPlan_UsesIsolatedPlanAndCashierTopology(t *testing.T) {
+	t.Setenv("PLAN_PUBLIC_URL", "https://backend.test.telecrypt.io/plan")
+	t.Setenv("CASHIER_INTERNAL_URL", "http://cashier:9011")
+
+	cfg, err := LoadPlan()
+	if err != nil {
+		t.Fatalf("LoadPlan: %v", err)
+	}
+	if got, want := cfg.ListenAddr, ":9012"; got != want {
+		t.Fatalf("ListenAddr = %q, want %q", got, want)
+	}
+}
+
+func TestLoadPlan_RejectsPublicCashierOrigin(t *testing.T) {
+	t.Setenv("PLAN_PUBLIC_URL", "https://backend.test.telecrypt.io/plan")
+	t.Setenv("CASHIER_INTERNAL_URL", "https://billing.test.telecrypt.io")
+
+	if _, err := LoadPlan(); err == nil {
+		t.Fatal("LoadPlan accepted a public Cashier origin")
+	}
+}
+
 func TestLoadCashier_UsesInternalSynapseAdminURLByDefault(t *testing.T) {
 	setRequiredCashierEnv(t)
 	t.Setenv("SYNAPSE_ADMIN_URL", "")
