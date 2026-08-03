@@ -22,18 +22,24 @@ go vet ./...
 go test ./...
 ```
 
-The Dockerfile's default `controlplane` target builds the three binaries into one image. Its
-`synapse-tier-controller` target builds a separate Synapse image that contains the policy module.
-Both are published under the same exact release tag:
+The Dockerfile's default `controlplane` target builds the three binaries into one image. A
+Controlplane release also publishes the exact versioned policy-module wheel and checksum as
+GitHub Release assets:
+
+- `telecrypt_tier_controller-<release>-py3-none-any.whl`
+- `telecrypt_tier_controller-<release>-py3-none-any.whl.sha256`
+
+The standalone `telecrypt-synapse` repository consumes that wheel to build a Synapse image. The
+Dockerfile's `synapse-tier-controller` target is retained only temporarily for the deployed legacy
+path. Both existing images are published under the same exact release tag:
 
 - `ghcr.io/telecrypt-io/telecrypt-controlplane:<release>`
 - `ghcr.io/telecrypt-io/telecrypt-synapse-tier-controller:<release>`
 
-The module image is based on `ghcr.io/dotwee/matrix-synapse-s3:v1.155.0`; a Synapse upgrade must
-be made here, tested, and released before a server configuration may reference it. Deployments
-must use exact tags and must not install the module at runtime. Pass configuration through the
-environment; do not commit credentials, database URLs, signing keys, payment-provider keys, or
-live account data.
+The temporary legacy module image is based on `ghcr.io/dotwee/matrix-synapse-s3:v1.155.0`; a
+Synapse upgrade belongs in the standalone image-builder repository. Deployments must use exact
+tags and must not install the module at runtime. Pass configuration through the environment; do
+not commit credentials, database URLs, signing keys, payment-provider keys, or live account data.
 
 ## Public endpoint
 
