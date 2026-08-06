@@ -49,7 +49,7 @@ Steward keeps the historic public URL `/plan` for compatibility. It owns MAS PKC
 
 Redpill never collects or generates a password and never calls Matrix compatibility login. Its
 only authority is an Ed25519 key that signs the fixed private `POST /internal/v1/agents` command.
-Agent Issuer verifies the request-bound signature, obtains a short-lived `urn:mas:admin` token via
+Agent Issuer verifies the request-bound signature and rejects reused request IDs, then obtains a short-lived `urn:mas:admin` token via
 OAuth client credentials, creates a passwordless MAS account, and issues a personal access token
 with only Matrix client and generated-device scopes. If token issuance fails after account
 creation, it deactivates the incomplete account.

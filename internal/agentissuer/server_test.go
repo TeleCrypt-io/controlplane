@@ -4,9 +4,13 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/TeleCrypt-io/controlplane/internal/agent"
 	"github.com/TeleCrypt-io/controlplane/internal/masadmin"
@@ -16,6 +20,34 @@ type fakeMAS struct {
 	created     string
 	deactivated string
 	issueErr    error
+}
+
+func TestAssertionRequestIDIsAcceptedOnce(t *testing.T) {
+	public, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuer, err := New(&fakeMAS{}, base64.RawURLEncoding.EncodeToString(public), "https://backend.telecrypt.io", "telecrypt.io")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{}`)
+	sum := sha256.Sum256(body)
+	requestID := uuid.NewString()
+	claims := assertion{
+		Audience:   audience,
+		Expires:    time.Now().Add(time.Minute).Unix(),
+		Method:     "POST",
+		Path:       "/internal/v1/agents",
+		RequestID:  requestID,
+		BodySHA256: base64.RawURLEncoding.EncodeToString(sum[:]),
+	}
+	if !issuer.acceptAssertion(claims, claims.Method, claims.Path, requestID, body) {
+		t.Fatal("first assertion was rejected")
+	}
+	if issuer.acceptAssertion(claims, claims.Method, claims.Path, requestID, body) {
+		t.Fatal("replayed assertion was accepted")
+	}
 }
 
 func (f *fakeMAS) CreateUser(_ context.Context, username string) (masadmin.CreatedUser, error) {

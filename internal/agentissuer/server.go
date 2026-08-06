@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -42,6 +43,8 @@ type Server struct {
 	homeserver string
 	serverName string
 	mux        *http.ServeMux
+	seenMu     sync.Mutex
+	seen       map[string]time.Time
 }
 
 func New(mas masProvisioner, encodedPublicKey, homeserver, serverName string) (*Server, error) {
@@ -52,7 +55,7 @@ func New(mas masProvisioner, encodedPublicKey, homeserver, serverName string) (*
 	if homeserver == "" || serverName == "" {
 		return nil, fmt.Errorf("homeserver and server name are required")
 	}
-	s := &Server{mas: mas, publicKey: ed25519.PublicKey(key), homeserver: strings.TrimRight(homeserver, "/"), serverName: serverName, mux: http.NewServeMux()}
+	s := &Server{mas: mas, publicKey: ed25519.PublicKey(key), homeserver: strings.TrimRight(homeserver, "/"), serverName: serverName, mux: http.NewServeMux(), seen: make(map[string]time.Time)}
 	s.mux.Handle("POST /internal/v1/agents", s.requireAssertion(http.HandlerFunc(s.handleCreateAgent)))
 	s.mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	return s, nil
@@ -120,12 +123,35 @@ func (s *Server) requireAssertion(next http.Handler) http.Handler {
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		claims, err := verifyAssertion(r.Header.Get("Authorization"), s.publicKey)
-		if err != nil || !validAssertion(claims, r.Method, r.URL.Path, r.Header.Get(requestIDHeader), body) {
+		if err != nil || !s.acceptAssertion(claims, r.Method, r.URL.Path, r.Header.Get(requestIDHeader), body) {
 			http.Error(w, "invalid issuer assertion", http.StatusUnauthorized)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// acceptAssertion consumes a valid request ID exactly once. Signatures are
+// short-lived, but without this cache a captured private request could still
+// be replayed during its validity window to mint additional agents.
+func (s *Server) acceptAssertion(claims assertion, method, path, requestID string, body []byte) bool {
+	if !validAssertion(claims, method, path, requestID, body) {
+		return false
+	}
+
+	now := time.Now()
+	s.seenMu.Lock()
+	defer s.seenMu.Unlock()
+	for id, expires := range s.seen {
+		if !expires.After(now) {
+			delete(s.seen, id)
+		}
+	}
+	if _, exists := s.seen[requestID]; exists {
+		return false
+	}
+	s.seen[requestID] = time.Unix(claims.Expires, 0)
+	return true
 }
 
 func verifyAssertion(authorization string, key ed25519.PublicKey) (assertion, error) {
