@@ -1,7 +1,7 @@
-// Package redpillhttp is redpill's public HTTP API: a stateless registration shim exposing only
-// POST /redpill and GET /health. It holds no database connection, no admin credentials, no OIDC,
-// no sessions, and no edge token — it drives MAS's public registration form directly
-// (internal/agent + internal/masreg) and applies an in-memory rate limit.
+// Package redpillhttp is Redpill's public HTTP API: a stateless registration shim exposing only
+// POST /redpill and GET /health. It holds no database connection, no admin credentials, no
+// stored sessions, and no edge token; it drives MAS's public registration/device-OAuth flow and
+// applies an in-memory rate limit.
 package redpillhttp
 
 import (
@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/TeleCrypt-io/controlplane/internal/agent"
 )
@@ -62,35 +63,53 @@ func clientIP(r *http.Request, ignoredProxyIP string) string {
 }
 
 type redpillResponse struct {
-	MXID        string `json:"mxid"`
-	AccessToken string `json:"access_token"`
-	DeviceID    string `json:"device_id"`
-	Homeserver  string `json:"homeserver"`
-	PlanURL     string `json:"plan_url"`
+	MXID               string `json:"mxid"`
+	Password           string `json:"password"`
+	AccessToken        string `json:"access_token"`
+	RefreshToken       string `json:"refresh_token"`
+	ExpiresIn          int    `json:"expires_in"`
+	DeviceID           string `json:"device_id"`
+	Homeserver         string `json:"homeserver"`
+	OAuthIssuer        string `json:"issuer"`
+	OAuthClientID      string `json:"client_id"`
+	OAuthTokenEndpoint string `json:"token_endpoint"`
+	PlanURL            string `json:"plan_url"`
 }
 
-// handleRedpill provisions a fresh agent account directly against MAS/Synapse — no morpheus, no
-// edge token, no DB. Rate-limited in-memory per source IP and globally.
+// handleRedpill provisions a fresh agent account through MAS's public registration and OAuth
+// flow — no admin credential, compatibility login, edge token, or database. Rate-limited
+// in-memory per source IP and globally.
 func (s *Server) handleRedpill(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	allowed := s.rateLimiter.Allow(clientIP(r, s.ignoredProxyIP))
 	if !allowed {
 		http.Error(w, "rate limit exceeded, try again later", http.StatusTooManyRequests)
 		return
 	}
 
-	result, err := s.provisioner.ProvisionAgent(r.Context())
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	result, err := s.provisioner.ProvisionAgent(ctx)
 	if err != nil {
-		slog.Error("redpill: provisioning failed", "error", err)
+		// Provisioning errors may contain third-party form text or generated identifiers. Do not
+		// risk logging any part of the one-time credential exchange.
+		slog.Error("redpill: provisioning failed")
 		http.Error(w, "provisioning failed", http.StatusInternalServerError)
 		return
 	}
 
 	resp := redpillResponse{
-		MXID:        result.MXID,
-		AccessToken: result.AccessToken,
-		DeviceID:    result.DeviceID,
-		Homeserver:  result.Homeserver,
-		PlanURL:     s.planURL,
+		MXID:               result.MXID,
+		Password:           result.Password,
+		AccessToken:        result.AccessToken,
+		RefreshToken:       result.RefreshToken,
+		ExpiresIn:          result.ExpiresIn,
+		DeviceID:           result.DeviceID,
+		Homeserver:         result.Homeserver,
+		OAuthIssuer:        result.OAuthIssuer,
+		OAuthClientID:      result.OAuthClientID,
+		OAuthTokenEndpoint: result.OAuthTokenEndpoint,
+		PlanURL:            s.planURL,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

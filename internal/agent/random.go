@@ -16,9 +16,8 @@ func randomLocalpart() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// randomPassword returns a high-entropy password. It's used once to drive MAS's public
-// registration form and the compat login that follows, then discarded — never stored or handed
-// to the agent; only the minted access_token/device_id are.
+// randomPassword returns a high-entropy password. It is used for MAS's public registration form
+// and returned only once to the immediate Redpill caller; it is never stored or logged.
 func randomPassword() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
