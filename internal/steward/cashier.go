@@ -29,8 +29,9 @@ type Team struct {
 
 // Seat is a Matrix account attached to a team.
 type Seat struct {
-	MXID      string    `json:"mxid"`
-	CreatedAt time.Time `json:"created_at"`
+	MXID              string    `json:"mxid"`
+	CreatedAt         time.Time `json:"created_at"`
+	EntitlementStatus string    `json:"entitlement_status"`
 }
 
 // State is all information the Plan renderer needs for one authenticated principal.

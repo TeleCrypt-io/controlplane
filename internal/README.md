@@ -4,7 +4,8 @@
 unrelated repository from importing these packages. The public entry points are deliberately
 small `main` packages in `cmd/`:
 
-- `cmd/redpill` serves `POST /redpill` and provisions a newly registered user's Matrix agent.
+- `cmd/redpill` serves `POST /redpill` and signs a narrow request to the private agent issuer.
+- `cmd/agentissuer` creates passwordless MAS users and scoped bot personal sessions.
 - `cmd/janitor` is a scheduled, non-listening maintenance process.
 - `cmd/steward` serves the authenticated account, team, and subscription UI at `/plan`.
 
@@ -17,7 +18,8 @@ small `main` packages in `cmd/`:
 | `db` | Janitor's small maintenance-state schema and read-side billing-grant access. | Does not create payments, subscriptions, or provider records. |
 | `janitor` | Finds stale unclaimed accounts, locks them through MAS, and sends the owner digest. | No HTTP listener. |
 | `masadmin` | MAS admin OAuth client used only by Janitor. | Never used by Redpill or Steward. |
-| `masreg` | MAS public registration and compatibility-login client used by Redpill. | Does not use MAS-admin authority. |
+| `agent` | Credential-free signed client from public Redpill to the private agent issuer. | Holds no MAS credential. |
+| `agentissuer` | Private passwordless MAS user and bot-PAT provisioning boundary. | Holds a dedicated MAS OAuth admin client credential. |
 | `redpillhttp` | Redpill request parsing, client-IP handling, response shaping, and rate limiting. | Public surface is limited to the registration endpoint. |
 | `steward` | MAS OIDC, browser sessions, CSRF/origin checks, rendering, and signed Cashier commands. | Has no Dodo, Synapse-admin, or Postgres credential. |
 | `synapse` | Narrow Synapse compatibility client required by Redpill provisioning. | Not a Synapse-admin client. |

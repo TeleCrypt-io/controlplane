@@ -3,7 +3,7 @@
 // (github.com/element-hq/matrix-authentication-service, tag v1.16.0), not guessed:
 //
 //   - crates/router/src/endpoints.rs — OAuth2TokenEndpoint's path is "/oauth2/token" (same
-//     no-/auth-prefix convention internal/masreg already uses against MASBaseURL).
+//     no-/auth-prefix convention used against the private MAS origin).
 //   - crates/handlers/src/oauth2/token.rs (client_credentials_grant) and
 //     crates/axum-utils/src/client_authorization.rs (Credentials::verify) — client_credentials
 //     authentication is checked against the client's *registered* token_endpoint_auth_method:
@@ -55,6 +55,18 @@ import (
 // (404).
 var ErrUserNotFound = errors.New("masadmin: user not found")
 
+// CreatedUser and PersonalSession are the minimum MAS Admin API fields needed by the private
+// agent issuer. Personal access tokens are returned only once, at session creation.
+type CreatedUser struct {
+	ID       string
+	Username string
+}
+
+type PersonalSession struct {
+	ID          string
+	AccessToken string
+}
+
 // listPageSize is the page[first] value used for both ListUsers and ListUserEmails. MAS's own
 // default (10, per admin/params.rs) is fine correctness-wise but wasteful for a sweep that always
 // wants the full list — a larger page keeps the round-trip count low without guessing at prod
@@ -78,8 +90,7 @@ type Client struct {
 	tokenExpiry time.Time
 }
 
-// NewClient targets the given MAS base URL (e.g. http://mas:8080, no /auth prefix — same
-// convention as internal/masreg.NewClient and internal/synapse.NewClient) with the given admin
+// NewClient targets the given MAS base URL (e.g. http://mas:8080, no /auth prefix) with the given admin
 // client_credentials client_id/client_secret.
 func NewClient(baseURL, clientID, clientSecret string) *Client {
 	return &Client{
@@ -185,6 +196,62 @@ type emailAttrs struct {
 	CreatedAt time.Time `json:"created_at"`
 	UserID    string    `json:"user_id"`
 	Email     string    `json:"email"`
+}
+
+// CreateUser creates a passwordless MAS user. Authentication is supplied by the client's
+// short-lived OAuth client-credentials token; no compatibility login or user password exists.
+func (c *Client) CreateUser(ctx context.Context, username string) (CreatedUser, error) {
+	body, err := json.Marshal(struct {
+		Username string `json:"username"`
+	}{Username: username})
+	if err != nil {
+		return CreatedUser{}, err
+	}
+	var out struct {
+		Data resource[userAttrs] `json:"data"`
+	}
+	if err := c.postJSON(ctx, "/api/admin/v1/users", body, http.StatusCreated, &out); err != nil {
+		return CreatedUser{}, fmt.Errorf("masadmin: create user: %w", err)
+	}
+	if out.Data.ID == "" || out.Data.Attributes.Username != username {
+		return CreatedUser{}, fmt.Errorf("masadmin: create user returned unexpected identity")
+	}
+	return CreatedUser{ID: out.Data.ID, Username: out.Data.Attributes.Username}, nil
+}
+
+// CreatePersonalSession issues a revocable bot credential acting only as actorUserID with the
+// supplied Matrix client/device scopes. A nil expiresIn deliberately creates a non-expiring PAT;
+// callers must document and provide an administrative revocation path.
+func (c *Client) CreatePersonalSession(ctx context.Context, actorUserID, humanName, scope string, expiresIn *uint32) (PersonalSession, error) {
+	body, err := json.Marshal(struct {
+		ActorUserID string  `json:"actor_user_id"`
+		HumanName   string  `json:"human_name"`
+		Scope       string  `json:"scope"`
+		ExpiresIn   *uint32 `json:"expires_in"`
+	}{actorUserID, humanName, scope, expiresIn})
+	if err != nil {
+		return PersonalSession{}, err
+	}
+	var out struct {
+		Data resource[struct {
+			AccessToken *string `json:"access_token"`
+		}] `json:"data"`
+	}
+	if err := c.postJSON(ctx, "/api/admin/v1/personal-sessions", body, http.StatusCreated, &out); err != nil {
+		return PersonalSession{}, fmt.Errorf("masadmin: create personal session: %w", err)
+	}
+	if out.Data.ID == "" || out.Data.Attributes.AccessToken == nil || *out.Data.Attributes.AccessToken == "" {
+		return PersonalSession{}, fmt.Errorf("masadmin: personal session response had no access token")
+	}
+	return PersonalSession{ID: out.Data.ID, AccessToken: *out.Data.Attributes.AccessToken}, nil
+}
+
+// DeactivateUser is compensating cleanup when account creation succeeds but PAT issuance fails.
+func (c *Client) DeactivateUser(ctx context.Context, userID string) error {
+	if err := c.postJSON(ctx, "/api/admin/v1/users/"+url.PathEscape(userID)+"/deactivate", []byte(`{}`), http.StatusOK, nil); err != nil {
+		return fmt.Errorf("masadmin: deactivate user %s: %w", userID, err)
+	}
+	return nil
 }
 
 // ListUsers returns every MAS user account, paging through the full result set via page[after]
@@ -338,6 +405,31 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 		return fmt.Errorf("%s", describeError(resp))
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func (c *Client) postJSON(ctx context.Context, path string, body []byte, wantStatus int, out any) error {
+	token, err := c.token(ctx)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != wantStatus {
+		return fmt.Errorf("%s", describeError(resp))
+	}
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out)
 }
 
 // describeError makes a best-effort attempt to surface MAS's {"errors":[{"title":...}]} error

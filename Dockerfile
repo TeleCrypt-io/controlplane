@@ -11,26 +11,28 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/redpill ./cmd/redpill
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/agentissuer ./cmd/agentissuer
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/janitor ./cmd/janitor
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/steward ./cmd/steward
 
-# Runtime: scratch — no shell, no package manager. The public control-plane image ships redpill,
-# janitor, and Steward. The private Cashier image owns all billing service code and Dodo access.
-# redpill needs no CA trust store (MAS is reached over plain HTTP on the internal telecrypt_net
-# network) but janitor's SMTP digest does, so the bundle is copied in even though redpill itself
-# never touches it.
+# Runtime: scratch — no shell, no package manager. The public control-plane image ships Redpill,
+# Agent Issuer, Janitor, and Steward. The private Cashier image owns billing and Dodo access.
+# Agent Issuer and Janitor reach MAS/SMTP respectively; the CA bundle is available to every binary
+# even though internal MAS traffic currently uses private-network HTTP.
 #
 # The tier controller is intentionally absent from this image. GitHub Actions releases it only as a
 # wheel; the standalone telecrypt-synapse builder downloads that exact release asset and verifies
 # its checksum.
 #
 # CMD defaults to the Redpill component. It is a default, rather than an ENTRYPOINT, because this
-# one image contains three separately deployed components; Janitor and Steward replace CMD.
+# one image contains four separately deployed components; Agent Issuer, Janitor, and Steward
+# replace CMD.
 FROM scratch AS controlplane
 LABEL org.opencontainers.image.source="https://github.com/TeleCrypt-io/controlplane"
 LABEL org.opencontainers.image.licenses="BUSL-1.1"
 COPY --from=controlplane-build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=controlplane-build /out/redpill /redpill
+COPY --from=controlplane-build /out/agentissuer /agentissuer
 COPY --from=controlplane-build /out/janitor /janitor
 COPY --from=controlplane-build /out/steward /steward
 USER 991:991

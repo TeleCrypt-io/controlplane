@@ -1,14 +1,11 @@
-// Command redpill runs TeleCrypt.io's stateless agent-registration shim: POST /redpill drives
-// MAS's public registration form directly (no admin credentials, no database, no morpheus — see
-// internal/agent, internal/masreg, internal/synapse) and GET /health is a liveness probe.
+// Command redpill runs TeleCrypt.io's credential-free public agent-registration shim. POST
+// /redpill calls the signed private agent issuer; GET /health is a liveness probe.
 package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,9 +13,7 @@ import (
 
 	"github.com/TeleCrypt-io/controlplane/internal/agent"
 	"github.com/TeleCrypt-io/controlplane/internal/config"
-	"github.com/TeleCrypt-io/controlplane/internal/masreg"
 	"github.com/TeleCrypt-io/controlplane/internal/redpillhttp"
-	"github.com/TeleCrypt-io/controlplane/internal/synapse"
 )
 
 func main() {
@@ -61,16 +56,7 @@ func main() {
 }
 
 func build(cfg *config.Config) (http.Handler, error) {
-	if _, err := url.Parse(cfg.Homeserver); err != nil {
-		return nil, fmt.Errorf("parse homeserver URL: %w", err)
-	}
-
-	// MAS registration and compat login both need browser-visible public URLs because MAS builds
-	// redirects from its configured public base URL.
-	masRegClient := masreg.NewClient(cfg.MASBaseURL)
-	synapseClient := synapse.NewClient(cfg.Homeserver)
-
-	provisioner, err := agent.NewProvisioner(masRegClient, synapseClient, cfg.Homeserver, cfg.ServerName)
+	provisioner, err := agent.NewProvisioner(cfg.AgentIssuerInternalURL, cfg.RedpillAssertionPrivateKey, nil)
 	if err != nil {
 		return nil, err
 	}

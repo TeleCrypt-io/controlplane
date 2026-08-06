@@ -74,7 +74,54 @@ func (f *fakeMASAdmin) server() *httptest.Server {
 	mux.HandleFunc("GET /api/admin/v1/user-emails", f.handleListEmails)
 	mux.HandleFunc("POST /api/admin/v1/users/{id}/lock", f.handleLock)
 	mux.HandleFunc("POST /api/admin/v1/users/{id}/unlock", f.handleUnlock)
+	mux.HandleFunc("POST /api/admin/v1/users", f.handleCreateUser)
+	mux.HandleFunc("POST /api/admin/v1/users/{id}/deactivate", f.handleDeactivate)
+	mux.HandleFunc("POST /api/admin/v1/personal-sessions", f.handleCreatePersonalSession)
 	return httptest.NewServer(mux)
+}
+
+func (f *fakeMASAdmin) handleCreateUser(w http.ResponseWriter, r *http.Request) {
+	if !f.requireBearer(w, r) {
+		return
+	}
+	var input struct {
+		Username string `json:"username"`
+	}
+	if json.NewDecoder(r.Body).Decode(&input) != nil || input.Username == "" {
+		http.Error(w, "bad user", http.StatusBadRequest)
+		return
+	}
+	created := f.addUser("01CREATEDUSER0000000000000", input.Username, time.Now().UTC(), false)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"type": "user", "id": created.id, "attributes": fakeUserAttrs{Username: created.username, CreatedAt: created.createdAt}}}) //nolint:errcheck
+}
+
+func (f *fakeMASAdmin) handleCreatePersonalSession(w http.ResponseWriter, r *http.Request) {
+	if !f.requireBearer(w, r) {
+		return
+	}
+	var input struct {
+		ActorUserID string  `json:"actor_user_id"`
+		HumanName   string  `json:"human_name"`
+		Scope       string  `json:"scope"`
+		ExpiresIn   *uint32 `json:"expires_in"`
+	}
+	if json.NewDecoder(r.Body).Decode(&input) != nil || input.ActorUserID == "" || input.HumanName == "" || input.Scope == "" || input.ExpiresIn != nil {
+		http.Error(w, "bad session", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"type": "personal-session", "id": "01PERSONALSESSION000000000", "attributes": map[string]any{"access_token": "mas_pat_test"}}}) //nolint:errcheck
+}
+
+func (f *fakeMASAdmin) handleDeactivate(w http.ResponseWriter, r *http.Request) {
+	if !f.requireBearer(w, r) {
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"type": "user", "id": r.PathValue("id"), "attributes": map[string]any{}}}) //nolint:errcheck
 }
 
 func (f *fakeMASAdmin) handleToken(w http.ResponseWriter, r *http.Request) {
@@ -338,6 +385,30 @@ func TestToken_BasicAuthCachedAcrossCalls(t *testing.T) {
 
 	if fake.tokenFetches != 1 {
 		t.Errorf("tokenFetches = %d, want 1 (token should be cached across calls)", fake.tokenFetches)
+	}
+}
+
+func TestPasswordlessUserAndPersonalSession(t *testing.T) {
+	fake := newFakeMASAdmin("issuer-client", "secret")
+	srv := fake.server()
+	defer srv.Close()
+	c := NewClient(srv.URL, "issuer-client", "secret")
+	user, err := c.CreateUser(context.Background(), "agent123")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if user.Username != "agent123" || user.ID == "" {
+		t.Fatalf("user = %#v", user)
+	}
+	session, err := c.CreatePersonalSession(context.Background(), user.ID, "TeleCrypt agent", "urn:matrix:test", nil)
+	if err != nil {
+		t.Fatalf("CreatePersonalSession: %v", err)
+	}
+	if session.AccessToken != "mas_pat_test" {
+		t.Fatalf("session = %#v", session)
+	}
+	if err := c.DeactivateUser(context.Background(), user.ID); err != nil {
+		t.Fatalf("DeactivateUser: %v", err)
 	}
 }
 

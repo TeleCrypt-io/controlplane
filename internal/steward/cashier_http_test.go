@@ -93,17 +93,19 @@ func verifyPlanJWS(t *testing.T, authorization string, public ed25519.PublicKey)
 }
 
 type planAssertion struct {
-	Subject string `json:"sub"`
-	Audience string `json:"aud"`
-	Method string `json:"method"`
-	Path string `json:"path"`
-	RequestID string `json:"request_id"`
+	Subject    string `json:"sub"`
+	Audience   string `json:"aud"`
+	Method     string `json:"method"`
+	Path       string `json:"path"`
+	RequestID  string `json:"request_id"`
 	BodySHA256 string `json:"body_sha256"`
 }
 
 func mustDecode(t *testing.T, value string) []byte {
 	t.Helper()
 	decoded, err := base64.RawURLEncoding.DecodeString(value)
-	if err != nil { t.Fatalf("base64 decode: %v", err) }
+	if err != nil {
+		t.Fatalf("base64 decode: %v", err)
+	}
 	return decoded
 }

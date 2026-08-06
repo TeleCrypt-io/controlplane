@@ -1,7 +1,7 @@
 // Package redpillhttp is redpill's public HTTP API: a stateless registration shim exposing only
 // POST /redpill and GET /health. It holds no database connection, no admin credentials, no OIDC,
-// no sessions, and no edge token — it drives MAS's public registration form directly
-// (internal/agent + internal/masreg) and applies an in-memory rate limit.
+// no sessions and no MAS credential. It calls the signed private agent issuer through
+// internal/agent and applies an in-memory rate limit.
 package redpillhttp
 
 import (
@@ -69,8 +69,8 @@ type redpillResponse struct {
 	PlanURL     string `json:"plan_url"`
 }
 
-// handleRedpill provisions a fresh agent account directly against MAS/Synapse — no morpheus, no
-// edge token, no DB. Rate-limited in-memory per source IP and globally.
+// handleRedpill asks the private issuer for a fresh passwordless agent account. The public process
+// holds only a narrow signing key and is rate-limited in-memory per source IP and globally.
 func (s *Server) handleRedpill(w http.ResponseWriter, r *http.Request) {
 	allowed := s.rateLimiter.Allow(clientIP(r, s.ignoredProxyIP))
 	if !allowed {
