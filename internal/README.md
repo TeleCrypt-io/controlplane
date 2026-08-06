@@ -17,10 +17,9 @@ small `main` packages in `cmd/`:
 | `db` | Janitor's small maintenance-state schema and read-side billing-grant access. | Does not create payments, subscriptions, or provider records. |
 | `janitor` | Finds stale unclaimed accounts, locks them through MAS, and sends the owner digest. | No HTTP listener. |
 | `masadmin` | MAS admin OAuth client used only by Janitor. | Never used by Redpill or Steward. |
-| `masreg` | MAS public registration and compatibility-login client used by Redpill. | Does not use MAS-admin authority. |
+| `masreg` | MAS public registration, dynamic-client, and device-OAuth client used by Redpill. | Does not use MAS-admin authority or a client secret. |
 | `redpillhttp` | Redpill request parsing, client-IP handling, response shaping, and rate limiting. | Public surface is limited to the registration endpoint. |
 | `steward` | MAS OIDC, browser sessions, CSRF/origin checks, rendering, and signed Cashier commands. | Has no Dodo, Synapse-admin, or Postgres credential. |
-| `synapse` | Narrow Synapse compatibility client required by Redpill provisioning. | Not a Synapse-admin client. |
 
 ## Billing and team-management flow
 

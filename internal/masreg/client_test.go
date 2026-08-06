@@ -2,7 +2,9 @@ package masreg
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -217,5 +219,100 @@ func TestRegister_NoPasswordRedirectErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "/register/password") {
 		t.Errorf("error = %v, want a message about /register/password", err)
+	}
+}
+
+func TestRegister_RejectsOffOriginRedirect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/register" {
+			http.Redirect(w, r, "https://attacker.invalid/register/password", http.StatusSeeOther)
+			return
+		}
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	err := NewClient(srv.URL).Register(context.Background(), "alice", "generated-password")
+	if err == nil || !strings.Contains(err.Error(), "redirected outside") {
+		t.Fatalf("Register error = %v, want off-origin redirect rejection", err)
+	}
+}
+
+func TestRegister_RejectsIncompleteCompletionBelowBasePath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/auth/register":
+			http.Redirect(w, r, "/auth/register/password", http.StatusSeeOther)
+		case "/auth/register/password":
+			if r.Method == http.MethodGet {
+				fmt.Fprint(w, `<input name="csrf" value="csrf">`)
+				return
+			}
+			http.Redirect(w, r, "/auth/register/steps/one/display-name", http.StatusSeeOther)
+		case "/auth/register/steps/one/display-name":
+			if r.Method == http.MethodGet {
+				fmt.Fprint(w, `<input name="csrf" value="csrf">`)
+				return
+			}
+			// MAS still reports a registration path. The old root-only check accepted this when
+			// MAS was mounted at /auth.
+			http.Redirect(w, r, "/auth/register/steps/one/finish", http.StatusSeeOther)
+		case "/auth/register/steps/one/finish":
+			fmt.Fprint(w, "still incomplete")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	err := NewClient(srv.URL+"/auth").Register(context.Background(), "alice", "generated-password")
+	if err == nil || !strings.Contains(err.Error(), "did not complete") {
+		t.Fatalf("Register error = %v, want incomplete registration rejection", err)
+	}
+}
+
+func TestOAuthRetriesHonorCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s := &session{baseURL: "http://127.0.0.1:1"}
+	device := &deviceAuthorization{DeviceCode: "code", ExpiresIn: 60, Interval: 1}
+	if _, err := s.pollDeviceToken(ctx, "client", device); !errors.Is(err, context.Canceled) {
+		t.Fatalf("poll error = %v, want context canceled", err)
+	}
+	if _, _, err := s.whoAmI(ctx, "http://127.0.0.1:1", "token"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("whoami error = %v, want context canceled", err)
+	}
+}
+
+type flakyTransport struct {
+	calls int
+	body  string
+}
+
+func (t *flakyTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	t.calls++
+	if t.calls == 1 {
+		return nil, errors.New("temporary connection reset")
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(t.body)),
+	}, nil
+}
+
+func TestOAuthRetriesTransientTransportErrors(t *testing.T) {
+	tokenTransport := &flakyTransport{body: `{"access_token":"access","refresh_token":"refresh","expires_in":60}`}
+	s := &session{baseURL: "https://mas.example", publicHTTPClient: &http.Client{Transport: tokenTransport}}
+	got, err := s.pollDeviceToken(context.Background(), "client", &deviceAuthorization{DeviceCode: "code", ExpiresIn: 60})
+	if err != nil || got.AccessToken != "access" || tokenTransport.calls != 2 {
+		t.Fatalf("poll result = %#v, err = %v, calls = %d", got, err, tokenTransport.calls)
+	}
+
+	whoamiTransport := &flakyTransport{body: `{"user_id":"@agent:telecrypt.io","device_id":"DEVICE"}`}
+	s.publicHTTPClient = &http.Client{Transport: whoamiTransport}
+	userID, deviceID, err := s.whoAmI(context.Background(), "https://backend.example", "access")
+	if err != nil || userID != "@agent:telecrypt.io" || deviceID != "DEVICE" || whoamiTransport.calls != 2 {
+		t.Fatalf("whoami result = %q, %q, %v, calls = %d", userID, deviceID, err, whoamiTransport.calls)
 	}
 }

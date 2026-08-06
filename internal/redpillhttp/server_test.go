@@ -1,10 +1,13 @@
 package redpillhttp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +20,37 @@ type fakeProvisioner struct {
 	calls  int
 }
 
+type contextProvisioner struct{ hasDeadline bool }
+
+func (p *contextProvisioner) ProvisionAgent(ctx context.Context) (*agent.Provisioned, error) {
+	_, p.hasDeadline = ctx.Deadline()
+	return &agent.Provisioned{}, nil
+}
+
+func TestHandleRedpill_BoundsProvisioningTime(t *testing.T) {
+	p := &contextProvisioner{}
+	s := New(p, NewRateLimiter(5, 60, time.Minute), "https://telecrypt.io/plan", "")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest("POST", "/redpill", nil))
+	if !p.hasDeadline {
+		t.Fatal("ProvisionAgent did not receive a bounded context")
+	}
+}
+
+func TestHandleRedpill_DoesNotLogProvisioningError(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	secret := "generated-password-must-not-appear"
+	s := New(&fakeProvisioner{err: errors.New(secret)}, NewRateLimiter(5, 60, time.Minute), "https://telecrypt.io/plan", "")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest("POST", "/redpill", nil))
+	if strings.Contains(logs.String(), secret) {
+		t.Fatalf("provisioning log leaked secret: %s", logs.String())
+	}
+}
+
 func (f *fakeProvisioner) ProvisionAgent(ctx context.Context) (*agent.Provisioned, error) {
 	f.calls++
 	if f.err != nil {
@@ -27,10 +61,16 @@ func (f *fakeProvisioner) ProvisionAgent(ctx context.Context) (*agent.Provisione
 
 func TestHandleRedpill_HappyPath(t *testing.T) {
 	p := &fakeProvisioner{result: &agent.Provisioned{
-		MXID:        "@abc123:telecrypt.io",
-		AccessToken: "mct_token",
-		DeviceID:    "AGTDEADBEEF",
-		Homeserver:  "https://telecrypt.io",
+		MXID:               "@abc123:telecrypt.io",
+		Password:           "generated-password",
+		AccessToken:        "oauth-access",
+		RefreshToken:       "oauth-refresh",
+		ExpiresIn:          3600,
+		DeviceID:           "AGTDEADBEEF",
+		Homeserver:         "https://telecrypt.io",
+		OAuthIssuer:        "https://telecrypt.io/auth",
+		OAuthClientID:      "dynamic-client",
+		OAuthTokenEndpoint: "https://telecrypt.io/auth/oauth2/token",
 	}}
 	s := New(p, NewRateLimiter(5, 60, time.Minute), "https://backend.telecrypt.io/plan", "")
 
@@ -49,8 +89,14 @@ func TestHandleRedpill_HappyPath(t *testing.T) {
 	if resp["mxid"] != "@abc123:telecrypt.io" {
 		t.Errorf("mxid = %v, want @abc123:telecrypt.io", resp["mxid"])
 	}
-	if resp["access_token"] != "mct_token" {
-		t.Errorf("access_token = %v, want mct_token", resp["access_token"])
+	if resp["password"] != "generated-password" || resp["access_token"] != "oauth-access" || resp["refresh_token"] != "oauth-refresh" || resp["expires_in"] != float64(3600) {
+		t.Errorf("credential response = %v, want complete refreshable OAuth credentials", resp)
+	}
+	if resp["issuer"] != "https://telecrypt.io/auth" || resp["client_id"] != "dynamic-client" || resp["token_endpoint"] != "https://telecrypt.io/auth/oauth2/token" {
+		t.Errorf("OAuth refresh metadata = %v", resp)
+	}
+	if w.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", w.Header().Get("Cache-Control"))
 	}
 	if _, ok := resp["adopt_url"]; ok {
 		t.Error("response must not contain adopt_url — the nonce-based adopt flow is gone")
@@ -77,6 +123,9 @@ func TestHandleRedpill_ProvisioningFails(t *testing.T) {
 
 	if w.Code != 500 {
 		t.Errorf("status = %d, want 500", w.Code)
+	}
+	if w.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", w.Header().Get("Cache-Control"))
 	}
 }
 

@@ -1,7 +1,6 @@
-// Package masreg drives MAS 1.16.0's public, unauthenticated password-registration form as a
-// plain HTTP client — the same request sequence a browser runs, with no admin credentials
-// involved. This replaces the old admin-API-based provisioning (mas.Client.CreateUser +
-// SetPassword) now that redpill holds no MAS admin credentials at all.
+// Package masreg drives MAS 1.16.0's public password-registration and OAuth device flows as a
+// plain HTTP client — the same request sequence a browser runs, with no admin credentials or
+// pre-registered OAuth client involved.
 //
 // The endpoint sequence and form field names below are derived from the MAS v1.16.0 source
 // (github.com/element-hq/matrix-authentication-service, tag v1.16.0):
@@ -33,7 +32,10 @@
 package masreg
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -53,16 +55,29 @@ type Client struct {
 	baseURL string
 }
 
-// NewClient targets the given MAS base URL (e.g. http://mas:8080, no /auth prefix — same
-// convention as internal/synapse.NewClient).
+// NewClient targets the given MAS base URL (e.g. http://mas:8080, no /auth prefix).
 func NewClient(baseURL string) *Client {
 	return &Client{baseURL: strings.TrimRight(baseURL, "/")}
 }
 
 // session is the HTTP state of one Register call: one cookie jar, one client, discarded after.
 type session struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL          string
+	httpClient       *http.Client
+	publicHTTPClient *http.Client // test seam; production always uses the credential-free default below
+}
+
+// DeviceTokens is the complete, short-lived result of the public OAuth device grant. Its client
+// ID and token endpoint are returned because the caller must retain them to refresh the token;
+// masreg itself keeps no state after RegisterAndAuthorizeDevice returns.
+type DeviceTokens struct {
+	AccessToken   string
+	RefreshToken  string
+	ExpiresIn     int
+	ClientID      string
+	Issuer        string
+	TokenEndpoint string
+	UserID        string
 }
 
 var csrfFieldRe = regexp.MustCompile(`name="csrf"\s+value="([^"]*)"`)
@@ -78,8 +93,7 @@ func extractCSRF(body []byte) string {
 }
 
 // Register drives the full public registration flow for the given username/password and returns
-// once MAS has created the account. It does not itself log the caller in — call
-// synapse.Client.CompatLogin afterwards to mint an access token.
+// once MAS has created the account. It exists for callers that need registration alone.
 //
 // Assumes (unverified outside a live spike): password registration is enabled, no upstream OAuth
 // provider is configured (so GET /register redirects straight to /register/password), email is
@@ -87,15 +101,89 @@ func extractCSRF(body []byte) string {
 // registration token is required. Any of these being true in prod would make Register fail
 // closed with a descriptive error rather than silently mis-register.
 func (c *Client) Register(ctx context.Context, username, password string) error {
+	_, err := c.registerSession(ctx, username, password)
+	return err
+}
+
+// RegisterAndAuthorizeDevice creates an account through MAS's public forms, dynamically
+// registers a public native OAuth client, grants a Matrix device through the authenticated MAS
+// session, and polls the public token endpoint. The cookie jar is local to this call and is
+// discarded before return.
+func (c *Client) RegisterAndAuthorizeDevice(
+	ctx context.Context, username, password, deviceID, clientURI string,
+) (*DeviceTokens, error) {
+	s, err := c.registerSession(ctx, username, password)
+	if err != nil {
+		return nil, err
+	}
+	clientID, err := s.registerPublicNativeClient(ctx, clientURI)
+	if err != nil {
+		return nil, fmt.Errorf("register public OAuth client: %w", err)
+	}
+	device, err := s.startDeviceAuthorization(ctx, clientID, deviceID)
+	if err != nil {
+		return nil, fmt.Errorf("start device authorization: %w", err)
+	}
+	if err := s.approveDeviceAuthorization(ctx, device.UserCode); err != nil {
+		return nil, fmt.Errorf("approve device authorization: %w", err)
+	}
+	tokens, err := s.pollDeviceToken(ctx, clientID, device)
+	if err != nil {
+		return nil, fmt.Errorf("poll device token: %w", err)
+	}
+	tokens.ClientID = clientID
+	// MAS's issuer is its configured base URI, whose canonical form has a trailing slash.
+	tokens.Issuer = c.baseURL + "/"
+	tokens.TokenEndpoint = c.baseURL + "/oauth2/token"
+	userID, returnedDeviceID, err := s.whoAmI(ctx, clientURI, tokens.AccessToken)
+	if err != nil {
+		return nil, fmt.Errorf("validate OAuth token identity: %w", err)
+	}
+	if returnedDeviceID != deviceID {
+		return nil, fmt.Errorf("OAuth token returned unexpected device_id %q", returnedDeviceID)
+	}
+	tokens.UserID = userID
+	return tokens, nil
+}
+
+func (c *Client) registerSession(ctx context.Context, username, password string) (*session, error) {
 	jar, _ := cookiejar.New(nil) // nil PublicSuffixList: this client only ever talks to one host
+	base, err := url.Parse(c.baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse MAS base URL: %w", err)
+	}
 	s := &session{
 		baseURL: c.baseURL,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 			Jar:     jar,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return errors.New("MAS registration exceeded redirect limit")
+				}
+				if req.URL.Scheme != base.Scheme || req.URL.Host != base.Host {
+					return errors.New("MAS redirected outside its configured origin")
+				}
+				return nil
+			},
 		},
 	}
-	return s.register(ctx, username, password)
+	if err := s.register(ctx, username, password); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *session) publicClient() *http.Client {
+	if s.publicHTTPClient != nil {
+		return s.publicHTTPClient
+	}
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		// Public OAuth endpoints must never redirect: a 307/308 could otherwise replay a device
+		// code or bearer token to an attacker-controlled origin.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 func (c *session) register(ctx context.Context, username, password string) error {
@@ -104,7 +192,7 @@ func (c *session) register(ctx context.Context, username, password string) error
 	if err != nil {
 		return fmt.Errorf("masreg: load register form: %w", err)
 	}
-	if !strings.HasSuffix(formURL.Path, "/register/password") {
+	if !c.isRegistrationPath(formURL.Path) || !strings.HasSuffix(formURL.Path, "/register/password") {
 		return fmt.Errorf("masreg: expected to land on /register/password, got %q — "+
 			"is an upstream OAuth provider configured alongside password registration?", formURL.Path)
 	}
@@ -126,7 +214,7 @@ func (c *session) register(ctx context.Context, username, password string) error
 	if err != nil {
 		return fmt.Errorf("masreg: submit password form: %w", err)
 	}
-	if !strings.Contains(formURL.Path, "/register/steps/") || !strings.HasSuffix(formURL.Path, "/display-name") {
+	if !c.isRegistrationPath(formURL.Path) || !strings.Contains(formURL.Path, "/register/steps/") || !strings.HasSuffix(formURL.Path, "/display-name") {
 		return fmt.Errorf("masreg: expected to land on the display-name step, got %q: %s",
 			formURL.Path, sniffError(body))
 	}
@@ -145,12 +233,335 @@ func (c *session) register(ctx context.Context, username, password string) error
 	if err != nil {
 		return fmt.Errorf("masreg: submit display-name step: %w", err)
 	}
-	if strings.HasPrefix(formURL.Path, "/register") {
+	if c.isRegistrationPath(formURL.Path) {
 		return fmt.Errorf("masreg: registration did not complete, still on %q: %s",
 			formURL.Path, sniffError(body))
 	}
 
 	return nil
+}
+
+// isRegistrationPath accounts for MAS being published below a path prefix (for example
+// https://backend.telecrypt.io/auth/). Redirects that stay inside /auth/register are incomplete
+// registration, even though they do not begin at the origin root.
+func (c *session) isRegistrationPath(path string) bool {
+	base, err := url.Parse(c.baseURL)
+	if err != nil {
+		return false
+	}
+	prefix := strings.TrimRight(base.Path, "/") + "/register"
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
+}
+
+type deviceAuthorization struct {
+	DeviceCode string `json:"device_code"`
+	UserCode   string `json:"user_code"`
+	ExpiresIn  int    `json:"expires_in"`
+	Interval   int    `json:"interval"`
+}
+
+func (s *session) registerPublicNativeClient(ctx context.Context, clientURI string) (string, error) {
+	payload := struct {
+		ClientName              string   `json:"client_name"`
+		ClientURI               string   `json:"client_uri"`
+		RedirectURIs            []string `json:"redirect_uris"`
+		ApplicationType         string   `json:"application_type"`
+		TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
+		GrantTypes              []string `json:"grant_types"`
+		ResponseTypes           []string `json:"response_types"`
+	}{
+		ClientName:              "TeleCrypt Redpill agent",
+		ClientURI:               clientURI,
+		RedirectURIs:            []string{clientURI},
+		ApplicationType:         "native",
+		TokenEndpointAuthMethod: "none",
+		GrantTypes: []string{
+			"urn:ietf:params:oauth:grant-type:device_code",
+			"refresh_token",
+		},
+		ResponseTypes: []string{},
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	// MAS v1.16.0's DynamicClientRegistration route is /oauth2/registration. The grant types
+	// are explicit: MAS otherwise defaults to authorization_code, which cannot issue this device
+	// grant or its refresh token.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/oauth2/registration", bytes.NewReader(b))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.publicClient().Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return "", unexpectedStatus(resp)
+	}
+	var out struct {
+		ClientID string `json:"client_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("decode response: %w", err)
+	}
+	if out.ClientID == "" {
+		return "", fmt.Errorf("response has no client_id")
+	}
+	return out.ClientID, nil
+}
+
+func (s *session) startDeviceAuthorization(ctx context.Context, clientID, deviceID string) (*deviceAuthorization, error) {
+	form := url.Values{
+		"client_id": {clientID},
+		"scope":     {"openid urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:" + deviceID},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/oauth2/device_authorization", strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := s.publicClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, unexpectedStatus(resp)
+	}
+	var out deviceAuthorization
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	if out.DeviceCode == "" || out.UserCode == "" || out.ExpiresIn <= 0 {
+		return nil, fmt.Errorf("response is missing device authorization fields")
+	}
+	if out.Interval <= 0 {
+		out.Interval = 5
+	}
+	return &out, nil
+}
+
+func (s *session) approveDeviceAuthorization(ctx context.Context, userCode string) error {
+	csrf, _, body, err := s.getForm(ctx, s.baseURL+"/link")
+	if err != nil {
+		return fmt.Errorf("load link form: %w", err)
+	}
+	if csrf == "" {
+		return fmt.Errorf("no csrf token found on device link page: %s", sniffError(body))
+	}
+
+	linkForm := url.Values{"csrf": {csrf}, "code": {userCode}}
+	deviceURL, err := s.postFormNoRedirect(ctx, s.baseURL+"/link", linkForm)
+	if err != nil {
+		return fmt.Errorf("submit device link: %w", err)
+	}
+	csrf, _, body, err = s.getForm(ctx, deviceURL)
+	if err != nil {
+		return fmt.Errorf("load device consent: %w", err)
+	}
+	if csrf == "" {
+		return fmt.Errorf("no csrf token found on device consent page: %s", sniffError(body))
+	}
+	_, _, body, err = s.postForm(ctx, deviceURL, url.Values{
+		"csrf":           {csrf},
+		"confirm_device": {"on"},
+		"action":         {"consent"},
+	})
+	if err != nil {
+		return fmt.Errorf("submit device consent: %w", err)
+	}
+	return nil
+}
+
+func (s *session) postFormNoRedirect(ctx context.Context, target string, form url.Values) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	client := *s.httpClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		return "", unexpectedStatus(resp)
+	}
+	location := resp.Header.Get("Location")
+	if location == "" {
+		return "", fmt.Errorf("redirect has no location")
+	}
+	u, err := url.Parse(location)
+	if err != nil {
+		return "", fmt.Errorf("parse redirect location: %w", err)
+	}
+	base, err := url.Parse(s.baseURL)
+	if err != nil {
+		return "", err
+	}
+	resolved := base.ResolveReference(u)
+	if resolved.Scheme != base.Scheme || resolved.Host != base.Host || !strings.HasPrefix(resolved.Path, "/") {
+		return "", fmt.Errorf("device link redirected outside MAS")
+	}
+	return resolved.String(), nil
+}
+
+func (s *session) pollDeviceToken(ctx context.Context, clientID string, device *deviceAuthorization) (*DeviceTokens, error) {
+	deadline := time.Now().Add(time.Duration(device.ExpiresIn) * time.Second)
+	interval := time.Duration(device.Interval) * time.Second
+	for {
+		form := url.Values{
+			"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
+			"device_code": {device.DeviceCode},
+			"client_id":   {clientID},
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/oauth2/token", strings.NewReader(form.Encode()))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp, err := s.publicClient().Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if err := waitForRetry(ctx, interval, deadline); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if err := waitForRetry(ctx, interval, deadline); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		var out struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			ExpiresIn    int    `json:"expires_in"`
+			Error        string `json:"error"`
+		}
+		decodeErr := json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode response: %w", decodeErr)
+		}
+		if resp.StatusCode == http.StatusOK {
+			if out.AccessToken == "" || out.RefreshToken == "" || out.ExpiresIn <= 0 {
+				return nil, fmt.Errorf("token response is missing access_token, refresh_token, or expires_in")
+			}
+			return &DeviceTokens{AccessToken: out.AccessToken, RefreshToken: out.RefreshToken, ExpiresIn: out.ExpiresIn}, nil
+		}
+		if out.Error != "authorization_pending" && out.Error != "slow_down" {
+			return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
+		}
+		if out.Error == "slow_down" {
+			interval += 5 * time.Second
+		}
+		if err := waitForRetry(ctx, interval, deadline); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func waitForRetry(ctx context.Context, interval time.Duration, deadline time.Time) error {
+	if time.Now().Add(interval).After(deadline) {
+		return fmt.Errorf("device authorization expired")
+	}
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (s *session) whoAmI(ctx context.Context, homeserver, accessToken string) (string, string, error) {
+	u, err := url.Parse(homeserver)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", "", fmt.Errorf("invalid homeserver URL")
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/_matrix/client/v3/account/whoami"
+	u.RawQuery = ""
+	u.Fragment = ""
+	for attempt, delay := 0, 100*time.Millisecond; attempt < 6; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			return "", "", err
+		}
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		resp, err := s.publicClient().Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return "", "", ctx.Err()
+			}
+			if attempt == 5 {
+				return "", "", fmt.Errorf("identity transport failure after retries: %w", err)
+			}
+			if err := waitForContext(ctx, delay); err != nil {
+				return "", "", err
+			}
+			delay *= 2
+			continue
+		}
+		if resp.StatusCode == http.StatusOK {
+			var out struct {
+				UserID   string `json:"user_id"`
+				DeviceID string `json:"device_id"`
+			}
+			err := json.NewDecoder(resp.Body).Decode(&out)
+			resp.Body.Close()
+			if err != nil {
+				return "", "", fmt.Errorf("decode response: %w", err)
+			}
+			if out.UserID == "" || out.DeviceID == "" {
+				return "", "", fmt.Errorf("response is missing user_id or device_id")
+			}
+			return out.UserID, out.DeviceID, nil
+		}
+		if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < http.StatusInternalServerError {
+			err := unexpectedStatus(resp)
+			return "", "", err
+		}
+		resp.Body.Close()
+		if attempt == 5 {
+			return "", "", fmt.Errorf("identity was not ready after retries")
+		}
+		if err := waitForContext(ctx, delay); err != nil {
+			return "", "", err
+		}
+		delay *= 2
+	}
+	return "", "", fmt.Errorf("identity was not ready")
+}
+
+func waitForContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func unexpectedStatus(resp *http.Response) error {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read status response: %w", err)
+	}
+	return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, sniffError(body))
 }
 
 func (c *session) getForm(ctx context.Context, target string) (csrf string, finalURL *url.URL, body []byte, err error) {

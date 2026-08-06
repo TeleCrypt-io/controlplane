@@ -79,7 +79,7 @@ type Client struct {
 }
 
 // NewClient targets the given MAS base URL (e.g. http://mas:8080, no /auth prefix — same
-// convention as internal/masreg.NewClient and internal/synapse.NewClient) with the given admin
+// convention as internal/masreg.NewClient) with the given admin
 // client_credentials client_id/client_secret.
 func NewClient(baseURL, clientID, clientSecret string) *Client {
 	return &Client{

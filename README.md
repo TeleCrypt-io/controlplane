@@ -41,6 +41,22 @@ Steward keeps the historic public URL `/plan` for compatibility. It owns MAS PKC
 
 `BILLING_ENV` is explicit. A test configuration visibly renders `TEST / SANDBOX — no real charges` on every Steward page. Payment card data is entered only on the Dodo-hosted checkout or customer-portal page, never at TeleCrypt.
 
+## Redpill credential contract
+
+`POST /redpill` is the existing public, rate-limited component for creating an agent account. It
+uses only MAS's public password-registration forms, dynamic registration of a public native OAuth
+client (`token_endpoint_auth_method: none`), and MAS's device-authorization pages through the
+new account's short-lived cookie session. It never receives a MAS/Synapse admin credential, a
+personal access token, or a static OAuth client secret, and it never uses Matrix
+`m.login.password`.
+
+The one response contains the MXID, generated MAS password, access/refresh tokens, expiry,
+device ID, homeserver, and `issuer`/`client_id`/`token_endpoint` needed to refresh directly with
+MAS. The password is a recovery credential; agents should use the refresh token. Redpill stores
+none of those values, logs no credential-exchange details, and sends `Cache-Control: no-store`.
+Deployment must enforce edge rate limiting; Redpill's in-memory per-source/global limiter is a
+secondary per-process backstop, not a substitute for that edge control.
+
 ## Development
 
 Requires Go `1.26.4`.
