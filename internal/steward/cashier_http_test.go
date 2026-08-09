@@ -14,7 +14,7 @@ import (
 	"testing"
 )
 
-func TestHTTPCashierClientSignsExactCommand(t *testing.T) {
+func TestHTTPCashierClientPreservesPrivatePlanCreationProtocol(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate Ed25519 key: %v", err)
@@ -50,12 +50,50 @@ func TestHTTPCashierClientSignsExactCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new HTTP Cashier client: %v", err)
 	}
-	team, err := client.CreateTeam(t.Context(), Principal{MXID: "@alice:telecrypt.io"}, "b3987ed2-51a4-4b04-b5f5-b915683d0cf5")
+	plan, err := client.CreatePlan(t.Context(), Principal{MXID: "@alice:telecrypt.io"}, "b3987ed2-51a4-4b04-b5f5-b915683d0cf5")
 	if err != nil {
-		t.Fatalf("CreateTeam: %v", err)
+		t.Fatalf("CreatePlan: %v", err)
 	}
-	if team.ID != "team-id" {
-		t.Fatalf("team ID = %q, want team-id", team.ID)
+	if plan.ID != "team-id" {
+		t.Fatalf("plan ID = %q, want team-id", plan.ID)
+	}
+}
+
+func TestHTTPCashierClientMapsPrivateTeamStateToPlanModel(t *testing.T) {
+	_, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate Ed25519 key: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/internal/v1/plan-state" {
+			http.Error(w, "wrong route", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"team":{"id":"legacy-team-id","subscription_status":"active","paid_seats":2},"seats":[{"mxid":"@alice:telecrypt.io"}]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewHTTPCashierClient(server.URL, base64.RawURLEncoding.EncodeToString(private), server.Client())
+	if err != nil {
+		t.Fatalf("new HTTP Cashier client: %v", err)
+	}
+	state, err := client.PlanState(t.Context(), Principal{MXID: "@alice:telecrypt.io"})
+	if err != nil {
+		t.Fatalf("PlanState: %v", err)
+	}
+	if state.Plan == nil || state.Plan.ID != "legacy-team-id" || state.Plan.PaidSeats != 2 {
+		t.Fatalf("PlanState plan = %#v, want mapped private team", state.Plan)
+	}
+	if len(state.Seats) != 1 || state.Seats[0].MXID != "@alice:telecrypt.io" {
+		t.Fatalf("PlanState seats = %#v", state.Seats)
+	}
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal PlanState: %v", err)
+	}
+	if strings.Contains(string(encoded), `"team"`) || !strings.Contains(string(encoded), `"plan"`) {
+		t.Fatalf("owned PlanState JSON = %s, want plan key and no team key", encoded)
 	}
 }
 
@@ -93,17 +131,19 @@ func verifyPlanJWS(t *testing.T, authorization string, public ed25519.PublicKey)
 }
 
 type planAssertion struct {
-	Subject string `json:"sub"`
-	Audience string `json:"aud"`
-	Method string `json:"method"`
-	Path string `json:"path"`
-	RequestID string `json:"request_id"`
+	Subject    string `json:"sub"`
+	Audience   string `json:"aud"`
+	Method     string `json:"method"`
+	Path       string `json:"path"`
+	RequestID  string `json:"request_id"`
 	BodySHA256 string `json:"body_sha256"`
 }
 
 func mustDecode(t *testing.T, value string) []byte {
 	t.Helper()
 	decoded, err := base64.RawURLEncoding.DecodeString(value)
-	if err != nil { t.Fatalf("base64 decode: %v", err) }
+	if err != nil {
+		t.Fatalf("base64 decode: %v", err)
+	}
 	return decoded
 }

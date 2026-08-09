@@ -16,9 +16,10 @@ type Principal struct {
 	MXID string
 }
 
-// Team is the billing-safe subset of a team shown to its administrator. Provider identifiers
-// and billing credentials are intentionally never returned to the browser-facing Plan service.
-type Team struct {
+// Plan is the billing-safe subset of a user's plan shown to its administrator. Provider
+// identifiers and billing credentials are intentionally never returned to the browser-facing
+// Plan service.
+type Plan struct {
 	ID                 string `json:"id"`
 	SubscriptionStatus string `json:"subscription_status"`
 	PaidSeats          int    `json:"paid_seats"`
@@ -27,28 +28,28 @@ type Team struct {
 	HasBillingAccount  bool   `json:"has_billing_account"`
 }
 
-// Seat is a Matrix account attached to a team.
+// Seat is a Matrix account attached to a plan.
 type Seat struct {
 	MXID      string    `json:"mxid"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// State is all information the Plan renderer needs for one authenticated principal.
-type State struct {
-	Team  *Team  `json:"team"`
+// PlanState is all information the Plan renderer needs for one authenticated principal.
+type PlanState struct {
+	Plan  *Plan  `json:"plan"`
 	Seats []Seat `json:"seats"`
 }
 
 // CashierClient is the complete public-Plan-to-private-Cashier contract. It intentionally
 // omits provider webhooks, arbitrary subscription lookup, Synapse administration, and direct
 // database access. Every command is performed for principal; Cashier must derive ownership from
-// that identity rather than accepting an administrator MXID or team ID supplied by a browser.
+// that identity rather than accepting an administrator MXID or plan ID supplied by a browser.
 //
 // Implementations must use short-lived, audience-bound Plan assertions on a private Compose
 // network. Monetary commands must accept and durably honour requestID for safe browser retries.
 type CashierClient interface {
-	PlanState(ctx context.Context, principal Principal) (State, error)
-	CreateTeam(ctx context.Context, principal Principal, requestID string) (Team, error)
+	PlanState(ctx context.Context, principal Principal) (PlanState, error)
+	CreatePlan(ctx context.Context, principal Principal, requestID string) (Plan, error)
 	AttachSeat(ctx context.Context, principal Principal, requestID, mxid string) error
 	RemoveSeat(ctx context.Context, principal Principal, requestID, mxid string) error
 	StartCheckout(ctx context.Context, principal Principal, requestID string, quantity int) (paymentLink string, err error)

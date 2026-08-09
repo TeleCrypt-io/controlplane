@@ -6,7 +6,7 @@ small `main` packages in `cmd/`:
 
 - `cmd/redpill` serves `POST /redpill` and provisions a newly registered user's Matrix agent.
 - `cmd/janitor` is a scheduled, non-listening maintenance process.
-- `cmd/steward` serves the authenticated account, team, and subscription UI at `/plan`.
+- `cmd/steward` serves the authenticated account, plan, and subscription UI at `/plan`.
 
 ## Package responsibilities
 
@@ -21,10 +21,10 @@ small `main` packages in `cmd/`:
 | `redpillhttp` | Redpill request parsing, client-IP handling, response shaping, and rate limiting. | Public surface is limited to the registration endpoint. |
 | `steward` | MAS OIDC, browser sessions, CSRF/origin checks, rendering, and signed Cashier commands. | Has no Dodo, Synapse-admin, or Postgres credential. |
 
-## Billing and team-management flow
+## Billing and plan-management flow
 
-`Steward` is the user-facing team-management component. A user authenticates with MAS, then
-Steward reads team state or requests a change through the private Cashier interface. The request
+`Steward` is the user-facing plan-management component. A user authenticates with MAS, then
+Steward reads plan state or requests a change through the private Cashier interface. The request
 is signed and bound to its method, path, exact body, and a short expiry. Cashier is the sole
 holder of payment-provider credentials and billing-write authority; it performs payment actions
 and applies the resulting entitlement to Synapse.

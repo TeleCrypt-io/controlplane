@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -42,19 +41,30 @@ func NewServer(cfg Config, cashier CashierClient) *Server {
 	s := &Server{cfg: cfg, cashier: cashier, session: NewSession(cfg.SessionKey), mux: http.NewServeMux()}
 	s.oidc = NewOIDCClient(cfg.Homeserver, cfg.MASBaseURL, cfg.MASClientID, cfg.MASClientSecret, strings.TrimRight(cfg.PlanPublicURL, "/")+"/callback")
 	s.mux.HandleFunc("GET /plan", s.handlePlan)
+	s.mux.HandleFunc("GET /plan/assets/logo-mark.png", s.handlePlanLogo)
+	s.mux.HandleFunc("GET /plan/assets/product.css", s.handlePlanProductCSS)
+	s.mux.HandleFunc("GET /plan/assets/plan.css", s.handlePlanCSS)
+	s.mux.HandleFunc("GET /plan/assets/plan.js", s.handlePlanJS)
 	s.mux.HandleFunc("GET /plan/login", s.handleLogin)
 	s.mux.HandleFunc("GET /plan/callback", s.handleCallback)
-	s.mux.Handle("POST /api/team", s.requireBrowserSession(http.HandlerFunc(s.handleCreateTeam)))
-	s.mux.Handle("POST /api/team/seats", s.requireBrowserSession(http.HandlerFunc(s.handleAddSeat)))
-	s.mux.Handle("DELETE /api/team/seats/{mxid}", s.requireBrowserSession(http.HandlerFunc(s.handleDeleteSeat)))
-	s.mux.Handle("POST /api/team/checkout", s.requireBrowserSession(http.HandlerFunc(s.handleCheckout)))
-	s.mux.Handle("POST /api/team/portal", s.requireBrowserSession(http.HandlerFunc(s.handlePortal)))
-	s.mux.Handle("POST /api/team/seat-count", s.requireBrowserSession(http.HandlerFunc(s.handleChangeSeatCount)))
-	s.mux.Handle("POST /api/team/seat-count/reconcile", s.requireBrowserSession(http.HandlerFunc(s.handleReconcileSeatCount)))
-	// Compatibility route for a cached legacy Plan iframe. It has the same authenticated command.
-	s.mux.Handle("POST /api/team/downgrade-request", s.requireBrowserSession(http.HandlerFunc(s.handleChangeSeatCount)))
+	s.registerPlanCommands("/api/plan", s.handleCreatePlan)
+	// Existing Plan pages may have the former browser API cached. Keep those routes and response
+	// shape as compatibility aliases while the current UI and public concept use /api/plan.
+	s.registerPlanCommands("/api/team", s.handleCreateTeamCompatibility)
 	s.mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	return s
+}
+
+func (s *Server) registerPlanCommands(prefix string, create http.HandlerFunc) {
+	s.mux.Handle("POST "+prefix, s.requireBrowserSession(create))
+	s.mux.Handle("POST "+prefix+"/seats", s.requireBrowserSession(http.HandlerFunc(s.handleAddSeat)))
+	s.mux.Handle("DELETE "+prefix+"/seats/{mxid}", s.requireBrowserSession(http.HandlerFunc(s.handleDeleteSeat)))
+	s.mux.Handle("POST "+prefix+"/checkout", s.requireBrowserSession(http.HandlerFunc(s.handleCheckout)))
+	s.mux.Handle("POST "+prefix+"/portal", s.requireBrowserSession(http.HandlerFunc(s.handlePortal)))
+	s.mux.Handle("POST "+prefix+"/seat-count", s.requireBrowserSession(http.HandlerFunc(s.handleChangeSeatCount)))
+	s.mux.Handle("POST "+prefix+"/seat-count/reconcile", s.requireBrowserSession(http.HandlerFunc(s.handleReconcileSeatCount)))
+	// Compatibility route for a cached legacy Plan iframe. It has the same authenticated command.
+	s.mux.Handle("POST "+prefix+"/downgrade-request", s.requireBrowserSession(http.HandlerFunc(s.handleChangeSeatCount)))
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
@@ -118,9 +128,9 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Plan is temporarily unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		data.Team, data.Seats = state.Team, state.Seats
-		if data.Team != nil {
-			switch data.Team.SubscriptionStatus {
+		data.Plan, data.Seats = state.Plan, state.Seats
+		if data.Plan != nil {
+			switch data.Plan.SubscriptionStatus {
 			case "none", "failed", "cancelled", "expired":
 				data.CanCheckout = true
 			case "pending":
@@ -134,6 +144,33 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	if err := planTmpl.Execute(w, data); err != nil {
 		http.Error(w, "Plan is temporarily unavailable", http.StatusInternalServerError)
 	}
+}
+
+// handlePlanLogo serves the product-neutral TeleCrypt mark used by Plan. It is
+// intentionally local to Steward: Plan must not need a third-party asset host
+// to render its authentication or billing controls.
+func (s *Server) handlePlanLogo(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(planLogoPNG)
+}
+
+func (s *Server) handlePlanProductCSS(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(planProductCSS)
+}
+
+func (s *Server) handlePlanCSS(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(planCSS)
+}
+
+func (s *Server) handlePlanJS(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(planJS)
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -197,18 +234,28 @@ func commandUnavailable(w http.ResponseWriter) {
 	http.Error(w, "Plan is temporarily unavailable", http.StatusServiceUnavailable)
 }
 
-func (s *Server) handleCreateTeam(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCreatePlan(w http.ResponseWriter, r *http.Request) {
+	s.createPlan(w, r, "plan_id", "set up plan failed")
+}
+
+// handleCreateTeamCompatibility preserves the old browser API response for already-cached Plan
+// pages. New code must use handleCreatePlan and the /api/plan routes.
+func (s *Server) handleCreateTeamCompatibility(w http.ResponseWriter, r *http.Request) {
+	s.createPlan(w, r, "team_id", "create team failed")
+}
+
+func (s *Server) createPlan(w http.ResponseWriter, r *http.Request, responseKey, failureMessage string) {
 	client, p, id, ok := s.command(r)
 	if !ok {
 		commandUnavailable(w)
 		return
 	}
-	team, err := client.CreateTeam(r.Context(), p, id)
+	plan, err := client.CreatePlan(r.Context(), p, id)
 	if err != nil {
-		http.Error(w, "create team failed", http.StatusBadGateway)
+		http.Error(w, failureMessage, http.StatusBadGateway)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{"team_id": team.ID})
+	writeJSON(w, http.StatusCreated, map[string]string{responseKey: plan.ID})
 }
 
 type seatRequest struct {
@@ -333,9 +380,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 type pageData struct {
 	LoggedIn, TestMode                          bool
 	MXID, RegisterURL                           string
-	Team                                        *Team
+	Plan                                        *Plan
 	Seats                                       []Seat
 	CanCheckout, CheckoutActive, CanChangeSeats bool
 }
-
-var planTmpl = template.Must(template.New("plan").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>TeleCrypt Plan</title></head><body><h1>TeleCrypt Plan</h1>{{if .TestMode}}<p><strong>TEST / SANDBOX — no real charges</strong></p>{{end}}{{if not .LoggedIn}}<p>Registration is free and does not require a card.</p><p><a href="{{.RegisterURL}}">Create a TeleCrypt account</a> or <a href="/plan/login">log in</a>.</p>{{else}}<p>Signed in as <strong>{{.MXID}}</strong></p>{{if .Team}}<p>Subscription: <strong>{{.Team.SubscriptionStatus}}</strong> · Paid seats: <strong>{{.Team.PaidSeats}}</strong></p><h2>Seats</h2><ul>{{range .Seats}}<li>{{.MXID}} <button data-mxid="{{.MXID}}" onclick="removeSeat(this.dataset.mxid)">Remove</button></li>{{else}}<li>No seats attached yet.</li>{{end}}</ul><form id="add-seat" onsubmit="return addSeat(event)"><input name="mxid" required><button>Attach seat</button></form>{{if .CanCheckout}}<form id="checkout" onsubmit="return checkout(event)"><input name="quantity" type="number" min="1" value="1" required><button>Start {{if $.TestMode}}sandbox {{end}}checkout</button></form>{{else if .CanChangeSeats}}<form onsubmit="return changeSeatCount(event)"><input name="quantity" type="number" min="1" value="{{.Team.PaidSeats}}" required><button>Update paid seats</button></form>{{end}}{{if .Team.HasBillingAccount}}<button onclick="openPortal()">Manage subscription, card, invoices, or cancellation</button>{{end}}{{else}}<button onclick="createTeam()">Create team</button>{{end}}{{end}}<script>async function command(url,o={}){o.headers=Object.assign({},o.headers,{"X-TeleCrypt-Request-ID":crypto.randomUUID()});return fetch(url,o)}async function createTeam(){const r=await command('/api/team',{method:'POST'});if(r.ok)location.reload();else alert(await r.text())}async function addSeat(e){e.preventDefault();const r=await command('/api/team/seats',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mxid:e.target.mxid.value.trim()})});if(r.ok)location.reload();else alert(await r.text());return false}async function removeSeat(mxid){const r=await command('/api/team/seats/'+encodeURIComponent(mxid),{method:'DELETE'});if(r.ok)location.reload();else alert(await r.text())}async function checkout(e){e.preventDefault();const r=await command('/api/team/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({quantity:+e.target.quantity.value})});if(!r.ok){alert(await r.text());return false}location=(await r.json()).payment_link;return false}async function openPortal(){const r=await command('/api/team/portal',{method:'POST'});if(r.ok)window.open((await r.json()).link,'_blank');else alert(await r.text())}async function changeSeatCount(e){e.preventDefault();const r=await command('/api/team/seat-count',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({quantity:+e.target.quantity.value})});if(r.ok)location.reload();else alert(await r.text());return false}</script></body></html>`))
