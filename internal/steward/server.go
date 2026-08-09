@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -42,6 +41,10 @@ func NewServer(cfg Config, cashier CashierClient) *Server {
 	s := &Server{cfg: cfg, cashier: cashier, session: NewSession(cfg.SessionKey), mux: http.NewServeMux()}
 	s.oidc = NewOIDCClient(cfg.Homeserver, cfg.MASBaseURL, cfg.MASClientID, cfg.MASClientSecret, strings.TrimRight(cfg.PlanPublicURL, "/")+"/callback")
 	s.mux.HandleFunc("GET /plan", s.handlePlan)
+	s.mux.HandleFunc("GET /plan/assets/logo-mark.png", s.handlePlanLogo)
+	s.mux.HandleFunc("GET /plan/assets/product.css", s.handlePlanProductCSS)
+	s.mux.HandleFunc("GET /plan/assets/plan.css", s.handlePlanCSS)
+	s.mux.HandleFunc("GET /plan/assets/plan.js", s.handlePlanJS)
 	s.mux.HandleFunc("GET /plan/login", s.handleLogin)
 	s.mux.HandleFunc("GET /plan/callback", s.handleCallback)
 	s.mux.Handle("POST /api/team", s.requireBrowserSession(http.HandlerFunc(s.handleCreateTeam)))
@@ -134,6 +137,33 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	if err := planTmpl.Execute(w, data); err != nil {
 		http.Error(w, "Plan is temporarily unavailable", http.StatusInternalServerError)
 	}
+}
+
+// handlePlanLogo serves the product-neutral TeleCrypt mark used by Plan. It is
+// intentionally local to Steward: Plan must not need a third-party asset host
+// to render its authentication or billing controls.
+func (s *Server) handlePlanLogo(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(planLogoPNG)
+}
+
+func (s *Server) handlePlanProductCSS(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(planProductCSS)
+}
+
+func (s *Server) handlePlanCSS(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(planCSS)
+}
+
+func (s *Server) handlePlanJS(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(planJS)
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -337,5 +367,3 @@ type pageData struct {
 	Seats                                       []Seat
 	CanCheckout, CheckoutActive, CanChangeSeats bool
 }
-
-var planTmpl = template.Must(template.New("plan").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>TeleCrypt Plan</title></head><body><h1>TeleCrypt Plan</h1>{{if .TestMode}}<p><strong>TEST / SANDBOX — no real charges</strong></p>{{end}}{{if not .LoggedIn}}<p>Registration is free and does not require a card.</p><p><a href="{{.RegisterURL}}">Create a TeleCrypt account</a> or <a href="/plan/login">log in</a>.</p>{{else}}<p>Signed in as <strong>{{.MXID}}</strong></p>{{if .Team}}<p>Subscription: <strong>{{.Team.SubscriptionStatus}}</strong> · Paid seats: <strong>{{.Team.PaidSeats}}</strong></p><h2>Seats</h2><ul>{{range .Seats}}<li>{{.MXID}} <button data-mxid="{{.MXID}}" onclick="removeSeat(this.dataset.mxid)">Remove</button></li>{{else}}<li>No seats attached yet.</li>{{end}}</ul><form id="add-seat" onsubmit="return addSeat(event)"><input name="mxid" required><button>Attach seat</button></form>{{if .CanCheckout}}<form id="checkout" onsubmit="return checkout(event)"><input name="quantity" type="number" min="1" value="1" required><button>Start {{if $.TestMode}}sandbox {{end}}checkout</button></form>{{else if .CanChangeSeats}}<form onsubmit="return changeSeatCount(event)"><input name="quantity" type="number" min="1" value="{{.Team.PaidSeats}}" required><button>Update paid seats</button></form>{{end}}{{if .Team.HasBillingAccount}}<button onclick="openPortal()">Manage subscription, card, invoices, or cancellation</button>{{end}}{{else}}<button onclick="createTeam()">Create team</button>{{end}}{{end}}<script>async function command(url,o={}){o.headers=Object.assign({},o.headers,{"X-TeleCrypt-Request-ID":crypto.randomUUID()});return fetch(url,o)}async function createTeam(){const r=await command('/api/team',{method:'POST'});if(r.ok)location.reload();else alert(await r.text())}async function addSeat(e){e.preventDefault();const r=await command('/api/team/seats',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mxid:e.target.mxid.value.trim()})});if(r.ok)location.reload();else alert(await r.text());return false}async function removeSeat(mxid){const r=await command('/api/team/seats/'+encodeURIComponent(mxid),{method:'DELETE'});if(r.ok)location.reload();else alert(await r.text())}async function checkout(e){e.preventDefault();const r=await command('/api/team/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({quantity:+e.target.quantity.value})});if(!r.ok){alert(await r.text());return false}location=(await r.json()).payment_link;return false}async function openPortal(){const r=await command('/api/team/portal',{method:'POST'});if(r.ok)window.open((await r.json()).link,'_blank');else alert(await r.text())}async function changeSeatCount(e){e.preventDefault();const r=await command('/api/team/seat-count',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({quantity:+e.target.quantity.value})});if(r.ok)location.reload();else alert(await r.text());return false}</script></body></html>`))

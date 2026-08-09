@@ -33,3 +33,23 @@ signed Dodo webhook endpoint.
 The package owns the public browser flow, MAS OIDC, session cookies, exact-origin protection, and
 rendering. An unavailable Cashier client fails closed for authenticated billing views and commands;
 it never falls back to direct Dodo, Synapse, or database access.
+
+## Plan UI ownership and release integration
+
+`assets/product.css`, `assets/plan.html`, `assets/plan.css`, and `assets/plan.js` are embedded in the
+Steward binary. They need no browser-side package manager, CDN, or runtime dependency.
+`product.css` is a byte-identical vendored copy of the exact framework-neutral shared UI core used
+by Storage; `plan.css` contains only Plan-specific composition and responsive layout. The page thus
+uses the same light canvas, white surfaces, system typography, compact controls, and neutral borders
+without giving this Go service a frontend build pipeline.
+
+The shared library remains the source of those visual tokens and component conventions. Updating
+the vendored file requires an exact shared-library release plus a byte-identity check before the
+Controlplane release. `assets/SHARED_UI_PROVENANCE.json` records the exact shared source commit and
+content hash used by this checkout. Product assets are not inferred from service favicons: Plan embeds
+TeleCrypt's original `logo-mark.png`, while Storage retains its existing end-user appearance.
+
+Before release, integrate these files into a reviewed immutable Controlplane release, run the
+Steward rendering and security tests plus an authenticated visual regression against the exact
+release artifact, and record that exact release for promotion. No deployment should be made from
+this working tree.

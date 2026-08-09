@@ -12,9 +12,10 @@ import (
 type fakeCashier struct {
 	principal Principal
 	requestID string
+	state     State
 }
 
-func (f *fakeCashier) PlanState(context.Context, Principal) (State, error) { return State{}, nil }
+func (f *fakeCashier) PlanState(context.Context, Principal) (State, error) { return f.state, nil }
 func (f *fakeCashier) CreateTeam(_ context.Context, p Principal, requestID string) (Team, error) {
 	f.principal, f.requestID = p, requestID
 	return Team{ID: "team-id"}, nil
@@ -63,8 +64,21 @@ func TestServerRendersPublicPlanLoginSurface(t *testing.T) {
 	if got, want := rec.Header().Get("Cache-Control"), "no-store"; got != want {
 		t.Fatalf("GET /plan Cache-Control = %q, want %q", got, want)
 	}
-	if !strings.Contains(rec.Body.String(), "/plan/login") {
+	body := rec.Body.String()
+	if !strings.Contains(body, "/plan/login") {
 		t.Fatal("GET /plan does not offer the MAS login route")
+	}
+	for _, marker := range []string{
+		"Create a TeleCrypt account",
+		"/plan/assets/logo-mark.png",
+		"/plan/assets/product.css",
+		"/plan/assets/plan.css",
+		"/plan/assets/plan.js",
+		"Sign-in is handled by your TeleCrypt account.",
+	} {
+		if !strings.Contains(body, marker) {
+			t.Errorf("public Plan page is missing %q", marker)
+		}
 	}
 }
 
@@ -76,6 +90,104 @@ func TestServerRendersPersistentSandboxBanner(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "TEST / SANDBOX") {
 		t.Fatal("GET /plan does not visibly identify the test billing environment")
 	}
+}
+
+func TestPlanAssetsAreLocalAndCarryCommandContract(t *testing.T) {
+	srv := testServer()
+
+	for _, asset := range []struct {
+		path        string
+		contentType string
+		marker      string
+	}{
+		{"/plan/assets/product.css", "text/css; charset=utf-8", "--surface: #ffffff"},
+		{"/plan/assets/plan.css", "text/css; charset=utf-8", "Plan-specific layout"},
+		{"/plan/assets/plan.js", "text/javascript; charset=utf-8", "X-TeleCrypt-Request-ID"},
+		{"/plan/assets/logo-mark.png", "image/png", ""},
+	} {
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, asset.path, nil))
+		if got, want := rec.Code, http.StatusOK; got != want {
+			t.Errorf("GET %s status = %d, want %d", asset.path, got, want)
+		}
+		if got, want := rec.Header().Get("Content-Type"), asset.contentType; got != want {
+			t.Errorf("GET %s Content-Type = %q, want %q", asset.path, got, want)
+		}
+		if asset.marker != "" && !strings.Contains(rec.Body.String(), asset.marker) {
+			t.Errorf("GET %s is missing %q", asset.path, asset.marker)
+		}
+	}
+}
+
+func TestServerRendersTeamPlanControlsForEachSubscriptionState(t *testing.T) {
+	tests := []struct {
+		name    string
+		team    *Team
+		seats   []Seat
+		want    []string
+		notWant []string
+	}{
+		{
+			name:  "checkout",
+			team:  &Team{SubscriptionStatus: "none", PaidSeats: 1, HasBillingAccount: true},
+			seats: []Seat{{MXID: "@member:telecrypt.test"}},
+			want: []string{
+				"Start checkout", "Manage subscription, card, invoices, or cancellation",
+				"id=\"add-seat\"", "data-mxid=\"@member:telecrypt.test\"",
+			},
+		},
+		{
+			name:    "active subscription",
+			team:    &Team{SubscriptionStatus: "active", PaidSeats: 3},
+			want:    []string{"Update paid seats", "value=\"3\"", "No seats attached yet."},
+			notWant: []string{"Start checkout"},
+		},
+		{
+			name:    "pending checkout",
+			team:    &Team{SubscriptionStatus: "pending", PaidSeats: 2},
+			want:    []string{"Checkout is in progress. Your plan updates after payment is confirmed."},
+			notWant: []string{"Start checkout", "Update paid seats"},
+		},
+		{
+			name:    "no team",
+			want:    []string{"Create your team", "Create team"},
+			notWant: []string{"id=\"add-seat\""},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := renderAuthenticatedPlan(t, State{Team: tt.team, Seats: tt.seats})
+			for _, marker := range tt.want {
+				if !strings.Contains(body, marker) {
+					t.Errorf("rendered Plan page is missing %q", marker)
+				}
+			}
+			for _, marker := range tt.notWant {
+				if strings.Contains(body, marker) {
+					t.Errorf("rendered Plan page unexpectedly contains %q", marker)
+				}
+			}
+		})
+	}
+}
+
+func renderAuthenticatedPlan(t *testing.T, state State) string {
+	t.Helper()
+	srv := testServer()
+	srv.cashier = &fakeCashier{state: state}
+	cookieRecorder := httptest.NewRecorder()
+	srv.session.Set(cookieRecorder, "@alice:telecrypt.test")
+	cookie := cookieRecorder.Result().Cookies()[0]
+	req := httptest.NewRequest(http.MethodGet, "/plan", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+	if got, want := rec.Code, http.StatusOK; got != want {
+		t.Fatalf("GET /plan status = %d, want %d; body: %s", got, want, rec.Body.String())
+	}
+	return rec.Body.String()
 }
 
 func TestServerHealth(t *testing.T) {
