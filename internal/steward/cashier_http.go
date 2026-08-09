@@ -46,21 +46,33 @@ func NewHTTPCashierClient(baseURL, encodedPrivateKey string, httpClient *http.Cl
 	return &HTTPCashierClient{baseURL: strings.TrimRight(baseURL, "/"), privateKey: ed25519.PrivateKey(key), httpClient: httpClient}, nil
 }
 
-func (c *HTTPCashierClient) PlanState(ctx context.Context, principal Principal) (State, error) {
-	var state State
-	err := c.do(ctx, principal, http.MethodGet, "/internal/v1/plan-state", uuid.NewString(), nil, &state)
-	return state, err
+func (c *HTTPCashierClient) PlanState(ctx context.Context, principal Principal) (PlanState, error) {
+	// Cashier's private response retains its historical `team` key. Translate that wire-only
+	// compatibility shape at the transport boundary so Steward's owned model remains plan-native.
+	var response struct {
+		LegacyTeam *Plan  `json:"team"`
+		Seats      []Seat `json:"seats"`
+	}
+	err := c.do(ctx, principal, http.MethodGet, "/internal/v1/plan-state", uuid.NewString(), nil, &response)
+	return PlanState{Plan: response.LegacyTeam, Seats: response.Seats}, err
 }
 
-func (c *HTTPCashierClient) CreateTeam(ctx context.Context, p Principal, requestID string) (Team, error) {
-	var team Team
-	err := c.do(ctx, p, http.MethodPost, "/internal/v1/teams", requestID, []byte(`{}`), &team)
-	return team, err
+// CreatePlan keeps Cashier's historical /teams path because Cashier is a separate, private
+// service that is not present in this repository. The public Plan product does not expose that
+// implementation term.
+func (c *HTTPCashierClient) CreatePlan(ctx context.Context, p Principal, requestID string) (Plan, error) {
+	var plan Plan
+	err := c.do(ctx, p, http.MethodPost, "/internal/v1/teams", requestID, []byte(`{}`), &plan)
+	return plan, err
 }
 
 func (c *HTTPCashierClient) AttachSeat(ctx context.Context, p Principal, requestID, mxid string) error {
-	body, err := json.Marshal(struct { MXID string `json:"mxid"` }{MXID: mxid})
-	if err != nil { return err }
+	body, err := json.Marshal(struct {
+		MXID string `json:"mxid"`
+	}{MXID: mxid})
+	if err != nil {
+		return err
+	}
 	return c.do(ctx, p, http.MethodPost, "/internal/v1/team/seats", requestID, body, nil)
 }
 
@@ -69,22 +81,34 @@ func (c *HTTPCashierClient) RemoveSeat(ctx context.Context, p Principal, request
 }
 
 func (c *HTTPCashierClient) StartCheckout(ctx context.Context, p Principal, requestID string, quantity int) (string, error) {
-	var response struct { PaymentLink string `json:"payment_link"` }
-	body, err := json.Marshal(struct { Quantity int `json:"quantity"` }{Quantity: quantity})
-	if err != nil { return "", err }
+	var response struct {
+		PaymentLink string `json:"payment_link"`
+	}
+	body, err := json.Marshal(struct {
+		Quantity int `json:"quantity"`
+	}{Quantity: quantity})
+	if err != nil {
+		return "", err
+	}
 	err = c.do(ctx, p, http.MethodPost, "/internal/v1/team/checkout", requestID, body, &response)
 	return response.PaymentLink, err
 }
 
 func (c *HTTPCashierClient) OpenCustomerPortal(ctx context.Context, p Principal, requestID string) (string, error) {
-	var response struct { Link string `json:"link"` }
+	var response struct {
+		Link string `json:"link"`
+	}
 	err := c.do(ctx, p, http.MethodPost, "/internal/v1/team/portal", requestID, []byte(`{}`), &response)
 	return response.Link, err
 }
 
 func (c *HTTPCashierClient) ChangeSeatCount(ctx context.Context, p Principal, requestID string, quantity int) error {
-	body, err := json.Marshal(struct { Quantity int `json:"quantity"` }{Quantity: quantity})
-	if err != nil { return err }
+	body, err := json.Marshal(struct {
+		Quantity int `json:"quantity"`
+	}{Quantity: quantity})
+	if err != nil {
+		return err
+	}
 	return c.do(ctx, p, http.MethodPost, "/internal/v1/team/seat-count", requestID, body, nil)
 }
 
@@ -100,15 +124,25 @@ func (c *HTTPCashierClient) do(ctx context.Context, principal Principal, method,
 		return fmt.Errorf("invalid Plan request ID")
 	}
 	assertion, err := c.assertion(principal.MXID, method, path, requestID, body)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bytes.NewReader(body))
-	if err != nil { return fmt.Errorf("create cashier request: %w", err) }
+	if err != nil {
+		return fmt.Errorf("create cashier request: %w", err)
+	}
 	req.Header.Set("Authorization", "Bearer "+assertion)
-	if method != http.MethodGet { req.Header.Set(planRequestIDHeader, requestID) }
-	if len(body) > 0 { req.Header.Set("Content-Type", "application/json") }
+	if method != http.MethodGet {
+		req.Header.Set(planRequestIDHeader, requestID)
+	}
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	response, err := c.httpClient.Do(req)
-	if err != nil { return fmt.Errorf("call cashier: %w", err) }
+	if err != nil {
+		return fmt.Errorf("call cashier: %w", err)
+	}
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 8<<10))
@@ -122,16 +156,27 @@ func (c *HTTPCashierClient) do(ctx context.Context, principal Principal, method,
 	return nil
 }
 
-type CashierError struct { StatusCode int; Message string }
+type CashierError struct {
+	StatusCode int
+	Message    string
+}
+
 func (e *CashierError) Error() string { return fmt.Sprintf("cashier returned %d", e.StatusCode) }
 
 func (c *HTTPCashierClient) assertion(subject, method, path, requestID string, body []byte) (string, error) {
 	sum := sha256.Sum256(body)
 	payload, err := json.Marshal(struct {
-		Subject string `json:"sub"`; Audience string `json:"aud"`; Expires int64 `json:"exp"`
-		Method string `json:"method"`; Path string `json:"path"`; RequestID string `json:"request_id"`; BodySHA256 string `json:"body_sha256"`
+		Subject    string `json:"sub"`
+		Audience   string `json:"aud"`
+		Expires    int64  `json:"exp"`
+		Method     string `json:"method"`
+		Path       string `json:"path"`
+		RequestID  string `json:"request_id"`
+		BodySHA256 string `json:"body_sha256"`
 	}{subject, planAssertionAudience, time.Now().Add(time.Minute).Unix(), method, path, requestID, base64.RawURLEncoding.EncodeToString(sum[:])})
-	if err != nil { return "", fmt.Errorf("marshal Plan assertion: %w", err) }
+	if err != nil {
+		return "", fmt.Errorf("marshal Plan assertion: %w", err)
+	}
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"EdDSA","typ":"JWT"}`))
 	encodedPayload := base64.RawURLEncoding.EncodeToString(payload)
 	signingInput := header + "." + encodedPayload

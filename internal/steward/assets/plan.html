@@ -28,7 +28,7 @@
       <main class="plan-main">
         {{if not .LoggedIn}}
         <section class="auth-card" aria-labelledby="plan-title">
-          <p class="eyebrow">TEAM BILLING</p>
+          <p class="eyebrow">PLAN &amp; BILLING</p>
           <h1 id="plan-title">Manage your TeleCrypt Plan</h1>
           <p class="intro">Registration is free and does not require a card.</p>
           <div class="actions">
@@ -38,14 +38,14 @@
           <p class="session-note">Sign-in is handled by your TeleCrypt account.</p>
         </section>
         {{else}}
+        {{if .Plan}}
         <section class="page-heading" aria-labelledby="plan-title">
           <div>
-            <p class="eyebrow">TEAM BILLING</p>
+            <p class="eyebrow">PLAN &amp; BILLING</p>
             <h1 id="plan-title">Your Plan</h1>
           </div>
         </section>
 
-        {{if .Team}}
         <div class="plan-grid">
           <section class="card plan-overview" aria-labelledby="subscription-title">
             <div class="card-heading">
@@ -53,11 +53,11 @@
                 <p class="eyebrow">SUBSCRIPTION</p>
                 <h2 id="subscription-title">Plan status</h2>
               </div>
-              <span class="status-pill">{{.Team.SubscriptionStatus}}</span>
+              <span class="status-pill">{{.Plan.SubscriptionStatus}}</span>
             </div>
             <dl class="metrics">
-              <div><dt>Paid seats</dt><dd>{{.Team.PaidSeats}}</dd></div>
-              {{if .Team.PendingPaidSeats}}<div><dt>Pending seats</dt><dd>{{.Team.PendingPaidSeats}}</dd></div>{{end}}
+              <div><dt>Paid seats</dt><dd>{{.Plan.PaidSeats}}</dd></div>
+              {{if .Plan.PendingPaidSeats}}<div><dt>Pending seats</dt><dd>{{.Plan.PendingPaidSeats}}</dd></div>{{end}}
             </dl>
             {{if .CheckoutActive}}<p class="notice">Checkout is in progress. Your plan updates after payment is confirmed.</p>{{end}}
             <div class="card-actions">
@@ -68,11 +68,11 @@
               </form>
               {{else if .CanChangeSeats}}
               <form class="quantity-action" onsubmit="return changeSeatCount(event)">
-                <label>Paid seats <input name="quantity" type="number" min="1" value="{{.Team.PaidSeats}}" required></label>
+                <label>Paid seats <input name="quantity" type="number" min="1" value="{{.Plan.PaidSeats}}" required></label>
                 <button class="btn">Update paid seats</button>
               </form>
               {{end}}
-              {{if .Team.HasBillingAccount}}<button class="btn" type="button" onclick="openPortal()">Manage subscription, card, invoices, or cancellation</button>{{end}}
+              {{if .Plan.HasBillingAccount}}<button class="btn" type="button" onclick="openPortal()">Manage subscription, card, invoices, or cancellation</button>{{end}}
             </div>
           </section>
 
@@ -104,11 +104,11 @@
           </section>
         </div>
         {{else}}
-        <section class="card empty-team" aria-labelledby="team-title">
-          <p class="eyebrow">TEAM BILLING</p>
-          <h2 id="team-title">Create your team</h2>
-          <p>Set up a team to attach seats and manage a subscription.</p>
-          <button class="btn btn-primary" type="button" onclick="createTeam()">Create team</button>
+          <section class="card empty-plan" aria-labelledby="plan-setup-title">
+            <p class="eyebrow">PLAN &amp; BILLING</p>
+            <h2 id="plan-setup-title">Set up your plan</h2>
+            <p>Add the Matrix accounts you want covered, then choose your paid seats.</p>
+            <button class="btn btn-primary" type="button" onclick="createPlan()">Set up plan</button>
         </section>
         {{end}}
         {{end}}

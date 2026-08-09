@@ -4,7 +4,7 @@ Public source for the non-payment control-plane components of a TeleCrypt Matrix
 
 - `redpill` provisions Matrix agent accounts without holding a database connection.
 - `janitor` locks stale accounts and sends owner digests. It reads Cashier-owned billing grants but cannot modify them.
-- `steward` is the browser-facing account and team UI at the stable `/plan` URL. It uses MAS OIDC and a narrow signed private Cashier API.
+- `steward` is the browser-facing account and plan-management UI at the stable `/plan` URL. It uses MAS OIDC and a narrow signed private Cashier API.
 - `synapse/tier_controller` is the fail-closed Synapse capability-policy module.
 
 Cashier, Dodo integration, subscription records, payment-provider credentials, and database migrations for billing are private to the `cashier` repository. This public image contains no Cashier binary or payment-provider SDK.
@@ -37,7 +37,7 @@ private in Harness.
 
 ## Browser service boundary
 
-Steward keeps the historic public URL `/plan` for compatibility. It owns MAS PKCE/OIDC, browser cookies, Origin protection, local MXID validation, and the team UI. It has no Dodo, Synapse-admin, or Postgres credentials. Commands are signed to the private Cashier service, which alone handles checkout, payment webhooks, entitlement mutation, and Dodo customer portal links.
+Steward keeps the historic public URL `/plan` for compatibility. It owns MAS PKCE/OIDC, browser cookies, Origin protection, local MXID validation, and the plan UI. It has no Dodo, Synapse-admin, or Postgres credentials. Commands are signed to the private Cashier service, which alone handles checkout, payment webhooks, entitlement mutation, and Dodo customer portal links.
 
 `BILLING_ENV` is explicit. A test configuration visibly renders `TEST / SANDBOX — no real charges` on every Steward page. Payment card data is entered only on the Dodo-hosted checkout or customer-portal page, never at TeleCrypt.
 

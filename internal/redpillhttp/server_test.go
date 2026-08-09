@@ -106,7 +106,7 @@ func TestHandleRedpill_HappyPath(t *testing.T) {
 	}
 	plan, ok := resp["plan_url"]
 	if !ok {
-		t.Fatal("response must contain plan_url — guidance for attaching to a paid team")
+		t.Fatal("response must contain plan_url — guidance for attaching to a paid plan")
 	}
 	if plan != "https://backend.telecrypt.io/plan" {
 		t.Errorf("plan_url = %v, want https://backend.telecrypt.io/plan", plan)

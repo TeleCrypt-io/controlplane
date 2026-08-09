@@ -53,9 +53,9 @@ input { min-height: 32px; padding: 5px 8px; border: 1px solid var(--border-stron
 .add-seat { padding-top: 1px; }
 .add-seat > div { display: flex; gap: 8px; margin-top: 4px; }
 .add-seat input { min-width: 0; flex: 1; }
-.empty-team { max-width: 540px; margin: 0 auto; text-align: center; }
-.empty-team h2 { margin-bottom: 8px; }
-.empty-team p:not(.eyebrow) { margin: 0 0 18px; color: var(--text-secondary); }
+.empty-plan { max-width: 540px; margin: 0 auto; text-align: center; }
+.empty-plan h2 { margin-bottom: 8px; }
+.empty-plan p:not(.eyebrow) { margin: 0 0 18px; color: var(--text-secondary); }
 
 .auth-card { max-width: 500px; margin: 8vh auto 0; padding: 28px; text-align: center; }
 .auth-card .intro { margin: 10px 0 22px; color: var(--text-secondary); }

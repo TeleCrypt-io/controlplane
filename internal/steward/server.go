@@ -47,17 +47,24 @@ func NewServer(cfg Config, cashier CashierClient) *Server {
 	s.mux.HandleFunc("GET /plan/assets/plan.js", s.handlePlanJS)
 	s.mux.HandleFunc("GET /plan/login", s.handleLogin)
 	s.mux.HandleFunc("GET /plan/callback", s.handleCallback)
-	s.mux.Handle("POST /api/team", s.requireBrowserSession(http.HandlerFunc(s.handleCreateTeam)))
-	s.mux.Handle("POST /api/team/seats", s.requireBrowserSession(http.HandlerFunc(s.handleAddSeat)))
-	s.mux.Handle("DELETE /api/team/seats/{mxid}", s.requireBrowserSession(http.HandlerFunc(s.handleDeleteSeat)))
-	s.mux.Handle("POST /api/team/checkout", s.requireBrowserSession(http.HandlerFunc(s.handleCheckout)))
-	s.mux.Handle("POST /api/team/portal", s.requireBrowserSession(http.HandlerFunc(s.handlePortal)))
-	s.mux.Handle("POST /api/team/seat-count", s.requireBrowserSession(http.HandlerFunc(s.handleChangeSeatCount)))
-	s.mux.Handle("POST /api/team/seat-count/reconcile", s.requireBrowserSession(http.HandlerFunc(s.handleReconcileSeatCount)))
-	// Compatibility route for a cached legacy Plan iframe. It has the same authenticated command.
-	s.mux.Handle("POST /api/team/downgrade-request", s.requireBrowserSession(http.HandlerFunc(s.handleChangeSeatCount)))
+	s.registerPlanCommands("/api/plan", s.handleCreatePlan)
+	// Existing Plan pages may have the former browser API cached. Keep those routes and response
+	// shape as compatibility aliases while the current UI and public concept use /api/plan.
+	s.registerPlanCommands("/api/team", s.handleCreateTeamCompatibility)
 	s.mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	return s
+}
+
+func (s *Server) registerPlanCommands(prefix string, create http.HandlerFunc) {
+	s.mux.Handle("POST "+prefix, s.requireBrowserSession(create))
+	s.mux.Handle("POST "+prefix+"/seats", s.requireBrowserSession(http.HandlerFunc(s.handleAddSeat)))
+	s.mux.Handle("DELETE "+prefix+"/seats/{mxid}", s.requireBrowserSession(http.HandlerFunc(s.handleDeleteSeat)))
+	s.mux.Handle("POST "+prefix+"/checkout", s.requireBrowserSession(http.HandlerFunc(s.handleCheckout)))
+	s.mux.Handle("POST "+prefix+"/portal", s.requireBrowserSession(http.HandlerFunc(s.handlePortal)))
+	s.mux.Handle("POST "+prefix+"/seat-count", s.requireBrowserSession(http.HandlerFunc(s.handleChangeSeatCount)))
+	s.mux.Handle("POST "+prefix+"/seat-count/reconcile", s.requireBrowserSession(http.HandlerFunc(s.handleReconcileSeatCount)))
+	// Compatibility route for a cached legacy Plan iframe. It has the same authenticated command.
+	s.mux.Handle("POST "+prefix+"/downgrade-request", s.requireBrowserSession(http.HandlerFunc(s.handleChangeSeatCount)))
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
@@ -121,9 +128,9 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Plan is temporarily unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		data.Team, data.Seats = state.Team, state.Seats
-		if data.Team != nil {
-			switch data.Team.SubscriptionStatus {
+		data.Plan, data.Seats = state.Plan, state.Seats
+		if data.Plan != nil {
+			switch data.Plan.SubscriptionStatus {
 			case "none", "failed", "cancelled", "expired":
 				data.CanCheckout = true
 			case "pending":
@@ -227,18 +234,28 @@ func commandUnavailable(w http.ResponseWriter) {
 	http.Error(w, "Plan is temporarily unavailable", http.StatusServiceUnavailable)
 }
 
-func (s *Server) handleCreateTeam(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCreatePlan(w http.ResponseWriter, r *http.Request) {
+	s.createPlan(w, r, "plan_id", "set up plan failed")
+}
+
+// handleCreateTeamCompatibility preserves the old browser API response for already-cached Plan
+// pages. New code must use handleCreatePlan and the /api/plan routes.
+func (s *Server) handleCreateTeamCompatibility(w http.ResponseWriter, r *http.Request) {
+	s.createPlan(w, r, "team_id", "create team failed")
+}
+
+func (s *Server) createPlan(w http.ResponseWriter, r *http.Request, responseKey, failureMessage string) {
 	client, p, id, ok := s.command(r)
 	if !ok {
 		commandUnavailable(w)
 		return
 	}
-	team, err := client.CreateTeam(r.Context(), p, id)
+	plan, err := client.CreatePlan(r.Context(), p, id)
 	if err != nil {
-		http.Error(w, "create team failed", http.StatusBadGateway)
+		http.Error(w, failureMessage, http.StatusBadGateway)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{"team_id": team.ID})
+	writeJSON(w, http.StatusCreated, map[string]string{responseKey: plan.ID})
 }
 
 type seatRequest struct {
@@ -363,7 +380,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 type pageData struct {
 	LoggedIn, TestMode                          bool
 	MXID, RegisterURL                           string
-	Team                                        *Team
+	Plan                                        *Plan
 	Seats                                       []Seat
 	CanCheckout, CheckoutActive, CanChangeSeats bool
 }

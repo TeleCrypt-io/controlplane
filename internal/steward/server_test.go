@@ -12,13 +12,13 @@ import (
 type fakeCashier struct {
 	principal Principal
 	requestID string
-	state     State
+	state     PlanState
 }
 
-func (f *fakeCashier) PlanState(context.Context, Principal) (State, error) { return f.state, nil }
-func (f *fakeCashier) CreateTeam(_ context.Context, p Principal, requestID string) (Team, error) {
+func (f *fakeCashier) PlanState(context.Context, Principal) (PlanState, error) { return f.state, nil }
+func (f *fakeCashier) CreatePlan(_ context.Context, p Principal, requestID string) (Plan, error) {
 	f.principal, f.requestID = p, requestID
-	return Team{ID: "team-id"}, nil
+	return Plan{ID: "plan-id"}, nil
 }
 func (f *fakeCashier) AttachSeat(context.Context, Principal, string, string) error {
 	return errors.New("unused")
@@ -119,17 +119,17 @@ func TestPlanAssetsAreLocalAndCarryCommandContract(t *testing.T) {
 	}
 }
 
-func TestServerRendersTeamPlanControlsForEachSubscriptionState(t *testing.T) {
+func TestServerRendersPlanControlsForEachSubscriptionState(t *testing.T) {
 	tests := []struct {
 		name    string
-		team    *Team
+		plan    *Plan
 		seats   []Seat
 		want    []string
 		notWant []string
 	}{
 		{
 			name:  "checkout",
-			team:  &Team{SubscriptionStatus: "none", PaidSeats: 1, HasBillingAccount: true},
+			plan:  &Plan{SubscriptionStatus: "none", PaidSeats: 1, HasBillingAccount: true},
 			seats: []Seat{{MXID: "@member:telecrypt.test"}},
 			want: []string{
 				"Start checkout", "Manage subscription, card, invoices, or cancellation",
@@ -138,26 +138,26 @@ func TestServerRendersTeamPlanControlsForEachSubscriptionState(t *testing.T) {
 		},
 		{
 			name:    "active subscription",
-			team:    &Team{SubscriptionStatus: "active", PaidSeats: 3},
+			plan:    &Plan{SubscriptionStatus: "active", PaidSeats: 3},
 			want:    []string{"Update paid seats", "value=\"3\"", "No seats attached yet."},
 			notWant: []string{"Start checkout"},
 		},
 		{
 			name:    "pending checkout",
-			team:    &Team{SubscriptionStatus: "pending", PaidSeats: 2},
+			plan:    &Plan{SubscriptionStatus: "pending", PaidSeats: 2},
 			want:    []string{"Checkout is in progress. Your plan updates after payment is confirmed."},
 			notWant: []string{"Start checkout", "Update paid seats"},
 		},
 		{
-			name:    "no team",
-			want:    []string{"Create your team", "Create team"},
-			notWant: []string{"id=\"add-seat\""},
+			name:    "no plan",
+			want:    []string{"Set up your plan", "Set up plan", "Add the Matrix accounts you want covered"},
+			notWant: []string{"id=\"add-seat\"", "<h1 id=\"plan-title\">Your Plan</h1>"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			body := renderAuthenticatedPlan(t, State{Team: tt.team, Seats: tt.seats})
+			body := renderAuthenticatedPlan(t, PlanState{Plan: tt.plan, Seats: tt.seats})
 			for _, marker := range tt.want {
 				if !strings.Contains(body, marker) {
 					t.Errorf("rendered Plan page is missing %q", marker)
@@ -172,7 +172,7 @@ func TestServerRendersTeamPlanControlsForEachSubscriptionState(t *testing.T) {
 	}
 }
 
-func renderAuthenticatedPlan(t *testing.T, state State) string {
+func renderAuthenticatedPlan(t *testing.T, state PlanState) string {
 	t.Helper()
 	srv := testServer()
 	srv.cashier = &fakeCashier{state: state}
@@ -203,19 +203,41 @@ func TestServerHealth(t *testing.T) {
 }
 
 func TestPlanCommandsRequireAuthenticatedBrowserSession(t *testing.T) {
-	srv := testServer()
-	req := httptest.NewRequest(http.MethodPost, "/api/team", nil)
-	req.Header.Set("Origin", "https://backend.test.telecrypt.io")
-	rec := httptest.NewRecorder()
+	for _, command := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/api/plan"},
+		{http.MethodPost, "/api/plan/seats"},
+		{http.MethodDelete, "/api/plan/seats/@member:telecrypt.test"},
+		{http.MethodPost, "/api/plan/checkout"},
+		{http.MethodPost, "/api/plan/portal"},
+		{http.MethodPost, "/api/plan/seat-count"},
+		{http.MethodPost, "/api/plan/seat-count/reconcile"},
+		{http.MethodPost, "/api/plan/downgrade-request"},
+		{http.MethodPost, "/api/team"},
+		{http.MethodPost, "/api/team/seats"},
+		{http.MethodDelete, "/api/team/seats/@member:telecrypt.test"},
+		{http.MethodPost, "/api/team/checkout"},
+		{http.MethodPost, "/api/team/portal"},
+		{http.MethodPost, "/api/team/seat-count"},
+		{http.MethodPost, "/api/team/seat-count/reconcile"},
+		{http.MethodPost, "/api/team/downgrade-request"},
+	} {
+		srv := testServer()
+		req := httptest.NewRequest(command.method, command.path, nil)
+		req.Header.Set("Origin", "https://backend.test.telecrypt.io")
+		rec := httptest.NewRecorder()
 
-	srv.ServeHTTP(rec, req)
+		srv.ServeHTTP(rec, req)
 
-	if got, want := rec.Code, http.StatusUnauthorized; got != want {
-		t.Fatalf("unauthenticated POST /api/team status = %d, want %d", got, want)
+		if got, want := rec.Code, http.StatusUnauthorized; got != want {
+			t.Errorf("unauthenticated %s %s status = %d, want %d", command.method, command.path, got, want)
+		}
 	}
 }
 
-func TestCreateTeamUsesAuthenticatedPrincipalAndRequestID(t *testing.T) {
+func TestCreatePlanUsesAuthenticatedPrincipalAndRequestID(t *testing.T) {
 	cashier := &fakeCashier{}
 	srv := testServer()
 	srv.cashier = cashier
@@ -223,7 +245,7 @@ func TestCreateTeamUsesAuthenticatedPrincipalAndRequestID(t *testing.T) {
 	srv.session.Set(cookieRecorder, "@alice:telecrypt.test")
 	cookie := cookieRecorder.Result().Cookies()[0]
 	requestID := "b3987ed2-51a4-4b04-b5f5-b915683d0cf5"
-	req := httptest.NewRequest(http.MethodPost, "/api/team", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/plan", nil)
 	req.AddCookie(cookie)
 	req.Header.Set("Origin", "https://backend.test.telecrypt.io")
 	req.Header.Set("X-TeleCrypt-Request-ID", requestID)
@@ -232,12 +254,38 @@ func TestCreateTeamUsesAuthenticatedPrincipalAndRequestID(t *testing.T) {
 	srv.ServeHTTP(rec, req)
 
 	if got, want := rec.Code, http.StatusCreated; got != want {
-		t.Fatalf("POST /api/team status = %d, want %d", got, want)
+		t.Fatalf("POST /api/plan status = %d, want %d", got, want)
 	}
 	if got, want := cashier.principal.MXID, "@alice:telecrypt.test"; got != want {
 		t.Fatalf("Cashier principal = %q, want %q", got, want)
 	}
 	if got, want := cashier.requestID, requestID; got != want {
 		t.Fatalf("Cashier request ID = %q, want %q", got, want)
+	}
+	if !strings.Contains(rec.Body.String(), `"plan_id":"plan-id"`) {
+		t.Fatalf("POST /api/plan response = %s, want plan_id", rec.Body.String())
+	}
+}
+
+func TestLegacyTeamCreateRouteRemainsCompatible(t *testing.T) {
+	cashier := &fakeCashier{}
+	srv := testServer()
+	srv.cashier = cashier
+	cookieRecorder := httptest.NewRecorder()
+	srv.session.Set(cookieRecorder, "@alice:telecrypt.test")
+	cookie := cookieRecorder.Result().Cookies()[0]
+	req := httptest.NewRequest(http.MethodPost, "/api/team", nil)
+	req.AddCookie(cookie)
+	req.Header.Set("Origin", "https://backend.test.telecrypt.io")
+	req.Header.Set("X-TeleCrypt-Request-ID", "b3987ed2-51a4-4b04-b5f5-b915683d0cf5")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if got, want := rec.Code, http.StatusCreated; got != want {
+		t.Fatalf("POST /api/team status = %d, want %d", got, want)
+	}
+	if !strings.Contains(rec.Body.String(), `"team_id":"plan-id"`) {
+		t.Fatalf("POST /api/team response = %s, want legacy team_id", rec.Body.String())
 	}
 }
