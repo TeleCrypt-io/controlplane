@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -27,6 +28,12 @@ type Config struct {
 }
 
 var errCashierUnavailable = errors.New("cashier client is not configured")
+
+const (
+	maxPlanJSONBodyBytes      = 4096
+	planSeatPrice             = "15 EUR per seat"
+	planContentSecurityPolicy = "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self'; object-src 'none'; script-src 'self'; style-src 'self'"
+)
 
 // Server owns all public Plan routes. Its only billing dependency is CashierClient.
 type Server struct {
@@ -67,7 +74,10 @@ func (s *Server) registerPlanCommands(prefix string, create http.HandlerFunc) {
 	s.mux.Handle("POST "+prefix+"/downgrade-request", s.requireBrowserSession(http.HandlerFunc(s.handleChangeSeatCount)))
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Security-Policy", planContentSecurityPolicy)
+	s.mux.ServeHTTP(w, r)
+}
 
 func (s *Server) requireBrowserSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +126,7 @@ func (s *Server) client() (CashierClient, error) {
 func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	mxid, err := s.session.MXID(r)
-	data := pageData{LoggedIn: err == nil, TestMode: s.cfg.BillingEnv == "test", MXID: mxid, RegisterURL: strings.TrimRight(s.cfg.Homeserver, "/") + "/auth/register"}
+	data := pageData{LoggedIn: err == nil, TestMode: s.cfg.BillingEnv == "test", MXID: mxid, RegisterURL: strings.TrimRight(s.cfg.Homeserver, "/") + "/auth/register", SeatPrice: planSeatPrice}
 	if data.LoggedIn {
 		client, err := s.client()
 		if err != nil {
@@ -278,7 +288,7 @@ func (s *Server) handleAddSeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req seatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !validateLocalMXID(req.MXID, s.cfg.ServerName) {
+	if err := decodePlanJSON(w, r, &req); err != nil || !validateLocalMXID(req.MXID, s.cfg.ServerName) {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
@@ -294,7 +304,12 @@ func (s *Server) handleDeleteSeat(w http.ResponseWriter, r *http.Request) {
 		commandUnavailable(w)
 		return
 	}
-	if err := client.RemoveSeat(r.Context(), p, id, r.PathValue("mxid")); err != nil {
+	mxid := r.PathValue("mxid")
+	if !validateLocalMXID(mxid, s.cfg.ServerName) {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if err := client.RemoveSeat(r.Context(), p, id, mxid); err != nil {
 		http.Error(w, "could not remove seat", http.StatusBadGateway)
 		return
 	}
@@ -307,11 +322,28 @@ type quantityRequest struct {
 
 func decodeQuantity(w http.ResponseWriter, r *http.Request) (int, bool) {
 	var req quantityRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Quantity < 1 {
+	if err := decodePlanJSON(w, r, &req); err != nil || req.Quantity < 1 {
 		http.Error(w, "quantity must be at least 1", http.StatusBadRequest)
 		return 0, false
 	}
 	return req.Quantity, true
+}
+
+func decodePlanJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	body := http.MaxBytesReader(w, r.Body, maxPlanJSONBodyBytes)
+	decoder := json.NewDecoder(body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("request body must contain exactly one JSON value")
+		}
+		return err
+	}
+	return nil
 }
 func (s *Server) handleCheckout(w http.ResponseWriter, r *http.Request) {
 	client, p, id, ok := s.command(r)
@@ -379,7 +411,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 type pageData struct {
 	LoggedIn, TestMode                          bool
-	MXID, RegisterURL                           string
+	MXID, RegisterURL, SeatPrice                string
 	Plan                                        *Plan
 	Seats                                       []Seat
 	CanCheckout, CheckoutActive, CanChangeSeats bool

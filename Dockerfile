@@ -16,9 +16,8 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/steward ./cmd/stew
 
 # Runtime: scratch — no shell, no package manager. The public control-plane image ships redpill,
 # janitor, and Steward. The private Cashier image owns all billing service code and Dodo access.
-# redpill needs no CA trust store (MAS is reached over plain HTTP on the internal telecrypt_net
-# network) but janitor's SMTP digest does, so the bundle is copied in even though redpill itself
-# never touches it.
+# Redpill reaches MAS through its browser-visible HTTPS URL and Janitor's SMTP digest also uses
+# verified TLS, so the shared runtime bundle must contain the CA trust store.
 #
 # The tier controller is intentionally absent from this image. GitHub Actions releases it only as a
 # wheel; the standalone telecrypt-synapse builder downloads that exact release asset and verifies

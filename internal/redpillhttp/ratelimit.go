@@ -12,54 +12,44 @@ import (
 // on restart and don't share state across replicas; acceptable for a single-instance deployment.
 type RateLimiter struct {
 	mu             sync.Mutex
-	counts         map[string]windowCount
+	counts         map[string]int
 	PerSourceLimit int
 	GlobalLimit    int
 	Window         time.Duration
-}
-
-type windowCount struct {
-	windowStart time.Time
-	count       int
+	windowStart    time.Time
 }
 
 func NewRateLimiter(perSourceLimit, globalLimit int, window time.Duration) *RateLimiter {
 	return &RateLimiter{
-		counts:         map[string]windowCount{},
+		counts:         map[string]int{},
 		PerSourceLimit: perSourceLimit,
 		GlobalLimit:    globalLimit,
 		Window:         window,
 	}
 }
 
-// increment bumps key's fixed-window counter (time.Now() truncated to r.Window) and returns the
-// post-increment count, resetting to 1 whenever the window has rolled over. Mirrors the semantics
-// of the old DB-backed IncrementRateLimit (internal/db.Store), just in memory.
-func (r *RateLimiter) increment(key string) int {
+// Allow increments the global counter and, while the global ceiling still permits work, the
+// per-source counter for the current fixed window. The complete map is discarded at rollover.
+// Refusing before adding a new source after the global ceiling is reached bounds map cardinality
+// to GlobalLimit plus the global key, even under a flood of distinct client addresses.
+func (r *RateLimiter) Allow(sourceIP string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	windowStart := time.Now().Truncate(r.Window)
-	c := r.counts[key]
-	if c.windowStart != windowStart {
-		c = windowCount{windowStart: windowStart, count: 0}
+	if r.windowStart != windowStart {
+		r.counts = make(map[string]int)
+		r.windowStart = windowStart
 	}
-	c.count++
-	r.counts[key] = c
-	return c.count
-}
-
-// Allow increments both the per-source and global counters for the current window and reports
-// whether the call should proceed. Both counters are always incremented, even if one is already
-// over its limit, so a blocked burst still counts against whichever ceiling it tripped. An empty
-// sourceIP (no distinguishing X-Forwarded-For signal) only checks the global ceiling.
-func (r *RateLimiter) Allow(sourceIP string) bool {
-	allowed := r.increment("global") <= r.GlobalLimit
+	r.counts["global"]++
+	if r.counts["global"] > r.GlobalLimit {
+		return false
+	}
 
 	if sourceIP != "" {
-		if r.increment("ip:"+sourceIP) > r.PerSourceLimit {
-			allowed = false
-		}
+		key := "ip:" + sourceIP
+		r.counts[key]++
+		return r.counts[key] <= r.PerSourceLimit
 	}
-	return allowed
+	return true
 }

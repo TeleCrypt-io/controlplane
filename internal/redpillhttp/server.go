@@ -55,7 +55,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // (RateLimiter.Allow treats an empty sourceIP that way already).
 func clientIP(r *http.Request, ignoredProxyIP string) string {
 	xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
-	slog.Debug("clientIP: raw X-Forwarded-For", "xff", xff, "remote_addr", r.RemoteAddr)
 	if xff == "" || (ignoredProxyIP != "" && xff == ignoredProxyIP) {
 		return ""
 	}

@@ -75,3 +75,31 @@ func TestRateLimiter_WindowRollsOver(t *testing.T) {
 		t.Error("a call in a new window should be allowed again")
 	}
 }
+
+func TestRateLimiter_DiscardsPriorWindowSourceKeys(t *testing.T) {
+	rl := NewRateLimiter(1000, 1000, 10*time.Millisecond)
+	if !rl.Allow("1.2.3.4") {
+		t.Fatal("first source should be allowed")
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	if !rl.Allow("5.6.7.8") {
+		t.Fatal("second source should be allowed in the next window")
+	}
+	if _, ok := rl.counts["ip:1.2.3.4"]; ok {
+		t.Fatal("prior-window source key was retained")
+	}
+	if len(rl.counts) != 2 { // current global and current source keys only
+		t.Fatalf("current-window count keys = %d, want 2", len(rl.counts))
+	}
+}
+
+func TestRateLimiter_GlobalCeilingBoundsSourceMap(t *testing.T) {
+	rl := NewRateLimiter(1000, 2, time.Minute)
+	for _, source := range []string{"1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"} {
+		rl.Allow(source)
+	}
+	if len(rl.counts) != 3 { // global plus only the two sources admitted under the ceiling
+		t.Fatalf("count keys after global limit = %d, want 3", len(rl.counts))
+	}
+}
