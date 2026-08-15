@@ -64,6 +64,9 @@ func TestServerRendersPublicPlanLoginSurface(t *testing.T) {
 	if got, want := rec.Header().Get("Cache-Control"), "no-store"; got != want {
 		t.Fatalf("GET /plan Cache-Control = %q, want %q", got, want)
 	}
+	if got := rec.Header().Get("Content-Security-Policy"); got != planContentSecurityPolicy {
+		t.Fatalf("GET /plan Content-Security-Policy = %q, want %q", got, planContentSecurityPolicy)
+	}
 	body := rec.Body.String()
 	if !strings.Contains(body, "/plan/login") {
 		t.Fatal("GET /plan does not offer the MAS login route")
@@ -119,6 +122,14 @@ func TestPlanAssetsAreLocalAndCarryCommandContract(t *testing.T) {
 	}
 }
 
+func TestPlanTemplateHasNoInlineScriptHandlers(t *testing.T) {
+	for _, forbidden := range []string{"onclick=", "onsubmit=", "javascript:"} {
+		if strings.Contains(strings.ToLower(planHTML), forbidden) {
+			t.Fatalf("Plan template contains CSP-incompatible inline script marker %q", forbidden)
+		}
+	}
+}
+
 func TestServerRendersPlanControlsForEachSubscriptionState(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -132,14 +143,14 @@ func TestServerRendersPlanControlsForEachSubscriptionState(t *testing.T) {
 			plan:  &Plan{SubscriptionStatus: "none", PaidSeats: 1, HasBillingAccount: true},
 			seats: []Seat{{MXID: "@member:telecrypt.test"}},
 			want: []string{
-				"Start checkout", "Manage subscription, card, invoices, or cancellation",
+				"Start checkout", "15 EUR per seat", "Manage subscription, card, invoices, or cancellation",
 				"id=\"add-seat\"", "data-mxid=\"@member:telecrypt.test\"",
 			},
 		},
 		{
 			name:    "active subscription",
 			plan:    &Plan{SubscriptionStatus: "active", PaidSeats: 3},
-			want:    []string{"Update paid seats", "value=\"3\"", "No seats attached yet."},
+			want:    []string{"Update paid seats", "15 EUR per seat", "value=\"3\"", "No seats attached yet."},
 			notWant: []string{"Start checkout"},
 		},
 		{
@@ -288,4 +299,47 @@ func TestLegacyTeamCreateRouteRemainsCompatible(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `"team_id":"plan-id"`) {
 		t.Fatalf("POST /api/team response = %s, want legacy team_id", rec.Body.String())
 	}
+}
+
+func TestPlanCommandsRejectUnsafeRequestBodies(t *testing.T) {
+	for _, tt := range []struct {
+		name, path, body string
+	}{
+		{"unknown field", "/api/plan/seats", `{"mxid":"@member:telecrypt.test","unexpected":true}`},
+		{"trailing JSON", "/api/plan/seat-count", `{"quantity":1}{"quantity":2}`},
+		{"oversized JSON", "/api/plan/seats", `{"mxid":"@` + strings.Repeat("a", maxPlanJSONBodyBytes) + `:telecrypt.test"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := testServer()
+			srv.cashier = &fakeCashier{}
+			req := authenticatedPlanRequest(t, srv, http.MethodPost, tt.path, tt.body)
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, req)
+			if got, want := rec.Code, http.StatusBadRequest; got != want {
+				t.Fatalf("%s status = %d, want %d", tt.path, got, want)
+			}
+		})
+	}
+}
+
+func TestDeleteSeatRejectsNonLocalMXID(t *testing.T) {
+	srv := testServer()
+	srv.cashier = &fakeCashier{}
+	req := authenticatedPlanRequest(t, srv, http.MethodDelete, "/api/plan/seats/@member:elsewhere.test", "")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if got, want := rec.Code, http.StatusBadRequest; got != want {
+		t.Fatalf("DELETE remote MXID status = %d, want %d", got, want)
+	}
+}
+
+func authenticatedPlanRequest(t *testing.T, srv *Server, method, path, body string) *http.Request {
+	t.Helper()
+	cookieRecorder := httptest.NewRecorder()
+	srv.session.Set(cookieRecorder, "@alice:telecrypt.test")
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.AddCookie(cookieRecorder.Result().Cookies()[0])
+	req.Header.Set("Origin", "https://backend.test.telecrypt.io")
+	req.Header.Set("X-TeleCrypt-Request-ID", "b3987ed2-51a4-4b04-b5f5-b915683d0cf5")
+	return req
 }

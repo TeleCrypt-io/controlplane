@@ -1,4 +1,4 @@
-// Command steward is TeleCrypt's public account, team, and subscription-management service.
+// Command steward is TeleCrypt's public account, plan, and subscription-management service.
 package main
 
 import (
@@ -41,6 +41,10 @@ func main() {
 			SessionKey:      cfg.SessionKey,
 		}, cashierClient),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	go func() {
 		slog.Info("steward listening", "addr", cfg.ListenAddr)

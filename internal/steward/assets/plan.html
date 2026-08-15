@@ -62,17 +62,17 @@
             {{if .CheckoutActive}}<p class="notice">Checkout is in progress. Your plan updates after payment is confirmed.</p>{{end}}
             <div class="card-actions">
               {{if .CanCheckout}}
-              <form id="checkout" class="quantity-action" onsubmit="return checkout(event)">
-                <label>Seats <input name="quantity" type="number" min="1" value="1" required></label>
+              <form id="checkout" class="quantity-action">
+                <label>Seats ({{.SeatPrice}}) <input name="quantity" type="number" min="1" value="1" required></label>
                 <button class="btn btn-primary">Start {{if $.TestMode}}sandbox {{end}}checkout</button>
               </form>
               {{else if .CanChangeSeats}}
-              <form class="quantity-action" onsubmit="return changeSeatCount(event)">
-                <label>Paid seats <input name="quantity" type="number" min="1" value="{{.Plan.PaidSeats}}" required></label>
+              <form id="seat-count" class="quantity-action">
+                <label>Paid seats ({{.SeatPrice}}) <input name="quantity" type="number" min="1" value="{{.Plan.PaidSeats}}" required></label>
                 <button class="btn">Update paid seats</button>
               </form>
               {{end}}
-              {{if .Plan.HasBillingAccount}}<button class="btn" type="button" onclick="openPortal()">Manage subscription, card, invoices, or cancellation</button>{{end}}
+              {{if .Plan.HasBillingAccount}}<button id="open-portal" class="btn" type="button">Manage subscription, card, invoices, or cancellation</button>{{end}}
             </div>
           </section>
 
@@ -88,13 +88,13 @@
               {{range .Seats}}
               <li>
                 <span>{{.MXID}}</span>
-                <button class="btn btn-danger btn-small" type="button" data-mxid="{{.MXID}}" onclick="removeSeat(this.dataset.mxid)">Remove</button>
+                <button class="btn btn-danger btn-small" type="button" data-remove-seat data-mxid="{{.MXID}}">Remove</button>
               </li>
               {{else}}
               <li class="empty-state">No seats attached yet.</li>
               {{end}}
             </ul>
-            <form id="add-seat" class="add-seat" onsubmit="return addSeat(event)">
+            <form id="add-seat" class="add-seat">
               <label for="seat-mxid">Add a Matrix ID</label>
               <div>
                 <input id="seat-mxid" name="mxid" placeholder="@name:server" required>
@@ -108,7 +108,7 @@
             <p class="eyebrow">PLAN &amp; BILLING</p>
             <h2 id="plan-setup-title">Set up your plan</h2>
             <p>Add the Matrix accounts you want covered, then choose your paid seats.</p>
-            <button class="btn btn-primary" type="button" onclick="createPlan()">Set up plan</button>
+            <button id="create-plan" class="btn btn-primary" type="button">Set up plan</button>
         </section>
         {{end}}
         {{end}}

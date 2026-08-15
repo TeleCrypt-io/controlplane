@@ -6,10 +6,8 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -39,6 +37,10 @@ func main() {
 		Addr:              cfg.ListenAddr,
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      65 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	go func() {
@@ -61,8 +63,8 @@ func main() {
 }
 
 func build(cfg *config.Config) (http.Handler, error) {
-	if _, err := url.Parse(cfg.Homeserver); err != nil {
-		return nil, fmt.Errorf("parse homeserver URL: %w", err)
+	if err := cfg.ValidateRedpill(); err != nil {
+		return nil, err
 	}
 
 	// MAS registration and device OAuth use browser-visible public URLs because MAS builds
