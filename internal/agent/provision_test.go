@@ -91,7 +91,6 @@ func (f *fakeMASServer) server() *httptest.Server {
 	mux.HandleFunc("POST /oauth2/registration", f.clientRegister)
 	mux.HandleFunc("POST /oauth2/device", f.deviceAuthorization)
 	mux.HandleFunc("GET /link", f.linkGet)
-	mux.HandleFunc("POST /link", f.linkPost)
 	mux.HandleFunc("GET /device/approve", f.deviceGet)
 	mux.HandleFunc("POST /device/approve", f.devicePost)
 	mux.HandleFunc("POST /oauth2/token", f.tokenPost)
@@ -171,10 +170,7 @@ func (f *fakeMASServer) linkGet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not authenticated", http.StatusUnauthorized)
 		return
 	}
-	f.form(w)
-}
-func (f *fakeMASServer) linkPost(w http.ResponseWriter, r *http.Request) {
-	if !f.authenticated(r) || !f.validCSRF(r) || r.FormValue("code") != "ABCD-EFGH" {
+	if r.FormValue("code") != "ABCD-EFGH" {
 		http.Error(w, "bad link", http.StatusBadRequest)
 		return
 	}
