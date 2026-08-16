@@ -345,27 +345,30 @@ func (s *session) startDeviceAuthorization(ctx context.Context, clientID, device
 }
 
 func (s *session) approveDeviceAuthorization(ctx context.Context, userCode string) error {
-	csrf, _, body, err := s.getForm(ctx, s.baseURL+"/link")
+	// MAS 1.16's /link page is a GET form carrying only the user code; it has
+	// no CSRF field. A valid code redirects (303) to the consent page, which
+	// is CSRF-protected. getForm follows the redirect, so the returned CSRF
+	// and URL are the consent page's. See
+	// crates/handlers/src/oauth2/device/link.rs and
+	// templates/pages/device_link.html in matrix-authentication-service v1.16.0.
+	linkURL, err := url.Parse(s.baseURL + "/link")
 	if err != nil {
-		return fmt.Errorf("load link form: %w", err)
+		return fmt.Errorf("parse device link URL: %w", err)
 	}
-	if csrf == "" {
-		return fmt.Errorf("no csrf token found on device link page: %s", sniffError(body))
-	}
-
-	linkForm := url.Values{"csrf": {csrf}, "code": {userCode}}
-	deviceURL, err := s.postFormNoRedirect(ctx, s.baseURL+"/link", linkForm)
+	query := linkURL.Query()
+	query.Set("code", userCode)
+	linkURL.RawQuery = query.Encode()
+	csrf, deviceURL, body, err := s.getForm(ctx, linkURL.String())
 	if err != nil {
-		return fmt.Errorf("submit device link: %w", err)
+		return fmt.Errorf("load device link: %w", err)
 	}
-	csrf, _, body, err = s.getForm(ctx, deviceURL)
-	if err != nil {
-		return fmt.Errorf("load device consent: %w", err)
+	if deviceURL == nil {
+		return fmt.Errorf("device link did not redirect: %s", sniffError(body))
 	}
 	if csrf == "" {
 		return fmt.Errorf("no csrf token found on device consent page: %s", sniffError(body))
 	}
-	_, _, body, err = s.postForm(ctx, deviceURL, url.Values{
+	_, _, body, err = s.postForm(ctx, deviceURL.String(), url.Values{
 		"csrf":           {csrf},
 		"confirm_device": {"on"},
 		"action":         {"consent"},
@@ -374,41 +377,6 @@ func (s *session) approveDeviceAuthorization(ctx context.Context, userCode strin
 		return fmt.Errorf("submit device consent: %w", err)
 	}
 	return nil
-}
-
-func (s *session) postFormNoRedirect(ctx context.Context, target string, form url.Values) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	client := *s.httpClient
-	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusSeeOther {
-		return "", unexpectedStatus(resp)
-	}
-	location := resp.Header.Get("Location")
-	if location == "" {
-		return "", fmt.Errorf("redirect has no location")
-	}
-	u, err := url.Parse(location)
-	if err != nil {
-		return "", fmt.Errorf("parse redirect location: %w", err)
-	}
-	base, err := url.Parse(s.baseURL)
-	if err != nil {
-		return "", err
-	}
-	resolved := base.ResolveReference(u)
-	if resolved.Scheme != base.Scheme || resolved.Host != base.Host || !strings.HasPrefix(resolved.Path, "/") {
-		return "", fmt.Errorf("device link redirected outside MAS")
-	}
-	return resolved.String(), nil
 }
 
 func (s *session) pollDeviceToken(ctx context.Context, clientID string, device *deviceAuthorization) (*DeviceTokens, error) {
