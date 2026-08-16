@@ -318,7 +318,7 @@ func (s *session) startDeviceAuthorization(ctx context.Context, clientID, device
 		"client_id": {clientID},
 		"scope":     {"openid urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:" + deviceID},
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/oauth2/device_authorization", strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/oauth2/device", strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}

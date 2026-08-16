@@ -89,7 +89,7 @@ func (f *fakeMASServer) server() *httptest.Server {
 	mux.HandleFunc("GET /register/steps/{id}/display-name", f.displayNameGet)
 	mux.HandleFunc("POST /register/steps/{id}/display-name", f.displayNamePost)
 	mux.HandleFunc("POST /oauth2/registration", f.clientRegister)
-	mux.HandleFunc("POST /oauth2/device_authorization", f.deviceAuthorization)
+	mux.HandleFunc("POST /oauth2/device", f.deviceAuthorization)
 	mux.HandleFunc("GET /link", f.linkGet)
 	mux.HandleFunc("POST /link", f.linkPost)
 	mux.HandleFunc("GET /device/approve", f.deviceGet)
