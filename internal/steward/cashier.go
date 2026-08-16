@@ -10,8 +10,7 @@ import (
 
 // Principal is the authenticated Matrix identity established by Plan's MAS OIDC session.
 // Cashier must treat it as an assertion to verify, not as a client-supplied authorization
-// decision. A future transport implementation carries it in a short-lived, audience-bound,
-// signed assertion.
+// decision. HTTPCashierClient carries it in a short-lived, audience-bound, signed assertion.
 type Principal struct {
 	MXID string
 }
