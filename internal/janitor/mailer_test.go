@@ -22,6 +22,7 @@ type fakeSMTP struct {
 	listener   net.Listener
 	addr       string
 	host       string
+	port       string
 	startTLS   bool
 	tlsConfig  *tls.Config
 	gotMail    bool
@@ -47,11 +48,6 @@ func newFakeSMTP(t *testing.T, advertiseSTARTTLS bool) *fakeSMTP {
 	}
 	go f.serve()
 	return f
-}
-
-func (f *fakeSMTP) port() string {
-	_, p, _ := net.SplitHostPort(f.addr)
-	return p
 }
 
 func (f *fakeSMTP) serve() {
