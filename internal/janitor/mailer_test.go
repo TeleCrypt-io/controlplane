@@ -153,7 +153,7 @@ func TestSMTPMailer_SendSucceedsWithSTARTTLS(t *testing.T) {
 
 	m := &SMTPMailer{
 		Host:       srv.host,
-		Port:       srv.port(),
+		Port:       srv.port,
 		Username:   "user",
 		Password:   "pass",
 		From:       "from@test",
@@ -179,7 +179,7 @@ func TestSMTPMailer_SendFailsWithoutSTARTTLS(t *testing.T) {
 
 	m := &SMTPMailer{
 		Host:       srv.host,
-		Port:       srv.port(),
+		Port:       srv.port,
 		Username:   "user",
 		Password:   "pass",
 		From:       "from@test",
