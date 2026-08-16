@@ -51,7 +51,7 @@ func (m *SMTPMailer) Send(ctx context.Context, to, subject, body string) error {
 		return fmt.Errorf("smtp hello: %w", err)
 	}
 
-	if !client.Extension("STARTTLS") {
+	if ok, _ := client.Extension("STARTTLS"); !ok {
 		return errors.New("smtp: server does not advertise STARTTLS — refusing to send in plaintext")
 	}
 
