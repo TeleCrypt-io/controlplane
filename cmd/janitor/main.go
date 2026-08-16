@@ -93,11 +93,12 @@ func build(cfg *config.LockerConfig, pool *pgxpool.Pool) *janitor.Sweeper {
 	var mailer janitor.Mailer
 	if cfg.SMTPHost != "" {
 		mailer = &janitor.SMTPMailer{
-			Host:     cfg.SMTPHost,
-			Port:     cfg.SMTPPort,
-			Username: cfg.SMTPUsername,
-			Password: cfg.SMTPPassword,
-			From:     cfg.SMTPFrom,
+			Host:      cfg.SMTPHost,
+			Port:      cfg.SMTPPort,
+			Username:  cfg.SMTPUsername,
+			Password:  cfg.SMTPPassword,
+			From:      cfg.SMTPFrom,
+			TimeoutSec: cfg.SMTPTimeoutSec,
 		}
 	} else {
 		mailer = janitor.LogMailer{}

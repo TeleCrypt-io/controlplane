@@ -116,6 +116,7 @@ type LockerConfig struct {
 	SMTPUsername         string
 	SMTPPassword         string
 	SMTPFrom             string
+	SMTPTimeoutSec       int
 }
 
 func LoadLocker() (*LockerConfig, error) {
@@ -143,6 +144,7 @@ func LoadLocker() (*LockerConfig, error) {
 		SMTPUsername:         os.Getenv("SMTP_USERNAME"),
 		SMTPPassword:         os.Getenv("SMTP_PASSWORD"),
 		SMTPFrom:             os.Getenv("SMTP_FROM"),
+		SMTPTimeoutSec:       getenvIntDefault("SMTP_TIMEOUT_SEC", 30),
 	}
 	var missing []string
 	for _, req := range []struct{ name, value string }{

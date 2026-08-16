@@ -2,28 +2,92 @@ package janitor
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/smtp"
+	"time"
 )
 
-// SMTPMailer sends the owner digest as plain text via net/smtp: smtp.SendMail negotiates STARTTLS
-// automatically when the server advertises the extension, then authenticates with PLAIN auth.
-// Verifying the server's TLS certificate this way needs a working CA trust store in the runtime
+// SMTPMailer sends the owner digest as plain text over a TLS-required SMTP connection.
+// It negotiates STARTTLS explicitly and fails closed if the server does not advertise STARTTLS
+// or if the TLS handshake fails — it never authenticates or sends in plaintext. Authentication
+// uses smtp.PlainAuth only after a successful STARTTLS upgrade. The request context is applied
+// as a connection deadline via net.DialTimeout; SMTPTimeoutSec (default 30) caps the overall
+// dial timeout. Certificate verification requires a working CA trust store in the runtime
 // environment — see the Dockerfile's ca-certificates note (scratch has none by default).
 type SMTPMailer struct {
 	Host, Port, Username, Password, From string
+	TimeoutSec                            int
+	// tlsConfig, when non-nil, overrides the default TLS config used for STARTTLS.
+	// Production code leaves this nil; tests use it to skip certificate verification
+	// for self-signed test certificates.
+	tlsConfig *tls.Config
 }
 
 func (m *SMTPMailer) Send(ctx context.Context, to, subject, body string) error {
-	addr := fmt.Sprintf("%s:%s", m.Host, m.Port)
-	auth := smtp.PlainAuth("", m.Username, m.Password, m.Host)
-	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s", m.From, to, subject, body)
-
-	if err := smtp.SendMail(addr, auth, m.From, []string{to}, []byte(msg)); err != nil {
-		return fmt.Errorf("smtp send: %w", err)
+	timeout := time.Duration(m.TimeoutSec) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
 	}
-	return nil
+	addr := net.JoinHostPort(m.Host, m.Port)
+
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf("smtp dial %s: %w", addr, err)
+	}
+
+	client, err := smtp.NewClient(conn, m.Host)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("smtp new client: %w", err)
+	}
+	defer client.Close()
+
+	if err := client.Hello("telecrypt.io"); err != nil {
+		return fmt.Errorf("smtp hello: %w", err)
+	}
+
+	if !client.Extension("STARTTLS") {
+		return errors.New("smtp: server does not advertise STARTTLS — refusing to send in plaintext")
+	}
+
+	tlsCfg := m.tlsConfig
+	if tlsCfg == nil {
+		tlsCfg = &tls.Config{ServerName: m.Host}
+	}
+	if err := client.StartTLS(tlsCfg); err != nil {
+		return fmt.Errorf("smtp starttls: %w", err)
+	}
+
+	auth := smtp.PlainAuth("", m.Username, m.Password, m.Host)
+	if err := client.Auth(auth); err != nil {
+		return fmt.Errorf("smtp auth: %w", err)
+	}
+
+	if err := client.Mail(m.From); err != nil {
+		return fmt.Errorf("smtp mail from: %w", err)
+	}
+	if err := client.Rcpt(to); err != nil {
+		return fmt.Errorf("smtp rcpt to: %w", err)
+	}
+
+	wc, err := client.Data()
+	if err != nil {
+		return fmt.Errorf("smtp data: %w", err)
+	}
+	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s", m.From, to, subject, body)
+	if _, err := wc.Write([]byte(msg)); err != nil {
+		return fmt.Errorf("smtp write body: %w", err)
+	}
+	if err := wc.Close(); err != nil {
+		return fmt.Errorf("smtp close body: %w", err)
+	}
+
+	return client.Quit()
 }
 
 // LogMailer is the degraded-but-not-fatal fallback used when no SMTP env vars are configured: it
