@@ -20,8 +20,8 @@ const (
 var errUnauthorized = errors.New("unauthorized")
 
 // Session holds Plan's browser-session signing key. It is deliberately Plan-owned rather than
-// shared with Cashier: Cashier receives a separate short-lived internal assertion in the later
-// transport implementation.
+// shared with Cashier: Cashier receives a separate short-lived internal assertion from
+// HTTPCashierClient.
 type Session struct{ key []byte }
 
 func NewSession(key string) *Session { return &Session{key: []byte(key)} }
