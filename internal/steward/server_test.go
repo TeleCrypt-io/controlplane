@@ -333,6 +333,64 @@ func TestDeleteSeatRejectsNonLocalMXID(t *testing.T) {
 	}
 }
 
+// errorCashier returns a CashierError carrying the provider's exact message and status so the
+// tests prove the Plan boundary surfaces Cashier's actionable rejection text instead of a
+// generic failure.
+type errorCashier struct {
+	status  int
+	message string
+}
+
+func (c *errorCashier) PlanState(_ context.Context, _ Principal) (PlanState, error) {
+	return PlanState{}, &CashierError{StatusCode: c.status, Message: c.message}
+}
+func (c *errorCashier) CreatePlan(_ context.Context, _ Principal, _ string) (Plan, error) {
+	return Plan{}, &CashierError{StatusCode: c.status, Message: c.message}
+}
+func (c *errorCashier) AttachSeat(_ context.Context, _ Principal, _ string, _ string) error {
+	return &CashierError{StatusCode: c.status, Message: c.message}
+}
+func (c *errorCashier) RemoveSeat(_ context.Context, _ Principal, _ string, _ string) error {
+	return &CashierError{StatusCode: c.status, Message: c.message}
+}
+func (c *errorCashier) StartCheckout(_ context.Context, _ Principal, _ string, _ int) (string, error) {
+	return "", &CashierError{StatusCode: c.status, Message: c.message}
+}
+func (c *errorCashier) OpenCustomerPortal(_ context.Context, _ Principal, _ string) (string, error) {
+	return "", &CashierError{StatusCode: c.status, Message: c.message}
+}
+func (c *errorCashier) ChangeSeatCount(_ context.Context, _ Principal, _ string, _ int) error {
+	return &CashierError{StatusCode: c.status, Message: c.message}
+}
+func (c *errorCashier) ReconcileSeatCount(_ context.Context, _ Principal, _ string) error {
+	return &CashierError{StatusCode: c.status, Message: c.message}
+}
+
+func TestCashierRejectionMessagesPropagateToPlanBoundary(t *testing.T) {
+	const message = "remove 1 seat(s) before lowering to 1 paid seats"
+	for _, tt := range []struct {
+		name, method, path, body string
+	}{
+		{"seat-count", http.MethodPost, "/api/plan/seat-count", `{"quantity":1}`},
+		{"attach", http.MethodPost, "/api/plan/seats", `{"mxid":"@bot:telecrypt.test"}`},
+		{"remove", http.MethodDelete, "/api/plan/seats/@bot:telecrypt.test", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := testServer()
+			srv.cashier = &errorCashier{status: http.StatusConflict, message: message}
+			req := authenticatedPlanRequest(t, srv, tt.method, tt.path, tt.body)
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, req)
+			if got, want := rec.Code, http.StatusConflict; got != want {
+				t.Fatalf("%s status = %d, want %d", tt.name, got, want)
+			}
+			if got := strings.TrimSpace(rec.Body.String()); got != message {
+				t.Fatalf("%s body = %q, want %q", tt.name, got, message)
+			}
+		})
+	}
+}
+
 func authenticatedPlanRequest(t *testing.T, srv *Server, method, path, body string) *http.Request {
 	t.Helper()
 	cookieRecorder := httptest.NewRecorder()

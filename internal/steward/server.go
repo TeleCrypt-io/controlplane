@@ -293,6 +293,11 @@ func (s *Server) handleAddSeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := client.AttachSeat(r.Context(), p, id, req.MXID); err != nil {
+		var cashierErr *CashierError
+		if errors.As(err, &cashierErr) && cashierErr.Message != "" {
+			http.Error(w, cashierErr.Message, cashierErr.StatusCode)
+			return
+		}
 		http.Error(w, "could not attach seat", http.StatusBadGateway)
 		return
 	}
@@ -310,6 +315,11 @@ func (s *Server) handleDeleteSeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := client.RemoveSeat(r.Context(), p, id, mxid); err != nil {
+		var cashierErr *CashierError
+		if errors.As(err, &cashierErr) && cashierErr.Message != "" {
+			http.Error(w, cashierErr.Message, cashierErr.StatusCode)
+			return
+		}
 		http.Error(w, "could not remove seat", http.StatusBadGateway)
 		return
 	}
@@ -386,6 +396,14 @@ func (s *Server) handleChangeSeatCount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := client.ChangeSeatCount(r.Context(), p, id, q); err != nil {
+		// Surface Cashier's specific rejection message (e.g. the downgrade capacity
+		// requirement "remove N seat(s) before lowering to M paid seats") so the Plan
+		// UI can tell the user what to do. Unknown/transport errors stay generic.
+		var cashierErr *CashierError
+		if errors.As(err, &cashierErr) && cashierErr.Message != "" {
+			http.Error(w, cashierErr.Message, cashierErr.StatusCode)
+			return
+		}
 		http.Error(w, "seat count change failed", http.StatusBadGateway)
 		return
 	}
