@@ -24,16 +24,28 @@ type Config struct {
 }
 
 func Load() (*Config, error) {
+	rateLimitPerSource, err := getenvIntDefault("RATE_LIMIT_PER_SOURCE", 5)
+	if err != nil {
+		return nil, err
+	}
+	rateLimitGlobal, err := getenvIntDefault("RATE_LIMIT_GLOBAL", 60)
+	if err != nil {
+		return nil, err
+	}
+	rateLimitWindowSec, err := getenvIntDefault("RATE_LIMIT_WINDOW_SEC", 60)
+	if err != nil {
+		return nil, err
+	}
 	return &Config{
 		LogLevel:           getenvDefault("LOG_LEVEL", "info"),
 		ListenAddr:         getenvDefault("LISTEN_ADDR", ":9009"),
-		MASBaseURL:         getenvDefault("MAS_BASE_URL", "https://backend.telecrypt.io/auth"),
-		Homeserver:         getenvDefault("HOMESERVER", "https://backend.telecrypt.io"),
-		PlanURL:            getenvDefault("PLAN_URL", "https://backend.telecrypt.io/plan"),
+		MASBaseURL:         os.Getenv("MAS_BASE_URL"),
+		Homeserver:         os.Getenv("HOMESERVER"),
+		PlanURL:            os.Getenv("PLAN_URL"),
 		ServerName:         getenvDefault("SERVER_NAME", ""),
-		RateLimitPerSource: getenvIntDefault("RATE_LIMIT_PER_SOURCE", 5),
-		RateLimitGlobal:    getenvIntDefault("RATE_LIMIT_GLOBAL", 60),
-		RateLimitWindowSec: getenvIntDefault("RATE_LIMIT_WINDOW_SEC", 60),
+		RateLimitPerSource: rateLimitPerSource,
+		RateLimitGlobal:    rateLimitGlobal,
+		RateLimitWindowSec: rateLimitWindowSec,
 		IgnoredProxyIP:     strings.TrimSpace(os.Getenv("IGNORED_PROXY_IP")),
 	}, nil
 }
@@ -70,16 +82,16 @@ func getenvDefault(key, def string) string {
 	return def
 }
 
-func getenvIntDefault(key string, def int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
+func getenvIntDefault(key string, def int) (int, error) {
+	v, set := os.LookupEnv(key)
+	if !set {
+		return def, nil
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return def
+		return 0, fmt.Errorf("%s must be an integer: %w", key, err)
 	}
-	return n
+	return n, nil
 }
 
 func getenvBool(key string) bool { return os.Getenv(key) == "1" }
@@ -124,19 +136,31 @@ func LoadLocker() (*LockerConfig, error) {
 	for _, mxid := range getenvList("EXCLUDE_MXIDS") {
 		exclude[mxid] = true
 	}
+	sweepIntervalSec, err := getenvIntDefault("SWEEP_INTERVAL_SEC", 3600)
+	if err != nil {
+		return nil, err
+	}
+	lockAfterHours, err := getenvIntDefault("LOCK_AFTER_HOURS", 48)
+	if err != nil {
+		return nil, err
+	}
+	smtpTimeoutSec, err := getenvIntDefault("SMTP_TIMEOUT_SEC", 30)
+	if err != nil {
+		return nil, err
+	}
 	c := &LockerConfig{
 		LogLevel:             getenvDefault("LOG_LEVEL", "info"),
 		BillingEnv:           os.Getenv("BILLING_ENV"),
 		MatrixDeployment:     os.Getenv("MATRIX_DEPLOYMENT_ID"),
 		RunOnce:              getenvBool("RUN_ONCE"),
 		DryRun:               getenvBool("DRY_RUN"),
-		SweepIntervalSec:     getenvIntDefault("SWEEP_INTERVAL_SEC", 3600),
+		SweepIntervalSec:     sweepIntervalSec,
 		MASBaseURL:           os.Getenv("MAS_BASE_URL"),
 		MASAdminClientID:     os.Getenv("MAS_ADMIN_CLIENT_ID"),
 		MASAdminClientSecret: os.Getenv("MAS_ADMIN_CLIENT_SECRET"),
 		ControlplaneDBURL:    os.Getenv("CONTROLPLANE_DB_URL"),
 		ServerName:           os.Getenv("SERVER_NAME"),
-		LockAfterHours:       getenvIntDefault("LOCK_AFTER_HOURS", 48),
+		LockAfterHours:       lockAfterHours,
 		ExcludeMXIDs:         exclude,
 		OwnerEmail:           os.Getenv("OWNER_EMAIL"),
 		SMTPHost:             os.Getenv("SMTP_HOST"),
@@ -144,7 +168,7 @@ func LoadLocker() (*LockerConfig, error) {
 		SMTPUsername:         os.Getenv("SMTP_USERNAME"),
 		SMTPPassword:         os.Getenv("SMTP_PASSWORD"),
 		SMTPFrom:             os.Getenv("SMTP_FROM"),
-		SMTPTimeoutSec:       getenvIntDefault("SMTP_TIMEOUT_SEC", 30),
+		SMTPTimeoutSec:       smtpTimeoutSec,
 	}
 	var missing []string
 	for _, req := range []struct{ name, value string }{
@@ -192,9 +216,9 @@ func LoadSteward() (*StewardConfig, error) {
 		ListenAddr:                 getenvDefault("LISTEN_ADDR", ":9012"),
 		BillingEnv:                 os.Getenv("BILLING_ENV"),
 		ServerName:                 os.Getenv("SERVER_NAME"),
-		Homeserver:                 getenvDefault("HOMESERVER", "https://backend.telecrypt.io"),
+		Homeserver:                 os.Getenv("HOMESERVER"),
 		MASBaseURL:                 os.Getenv("MAS_BASE_URL"),
-		PlanPublicURL:              getenvDefault("PLAN_PUBLIC_URL", "https://backend.telecrypt.io/plan"),
+		PlanPublicURL:              os.Getenv("PLAN_PUBLIC_URL"),
 		CashierInternalURL:         getenvDefault("CASHIER_INTERNAL_URL", "http://cashier:9011"),
 		MASClientID:                os.Getenv("MAS_OIDC_CLIENT_ID"),
 		MASClientSecret:            os.Getenv("MAS_OIDC_CLIENT_SECRET"),

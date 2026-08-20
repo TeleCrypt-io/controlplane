@@ -220,6 +220,10 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "login failed", http.StatusBadGateway)
 		return
 	}
+	if !validateLocalpart(username) {
+		http.Error(w, "login failed", http.StatusBadGateway)
+		return
+	}
 	clearOAuthCookies(w)
 	s.session.Set(w, fmt.Sprintf("@%s:%s", username, s.cfg.ServerName))
 	http.Redirect(w, r, s.cfg.PlanPublicURL, http.StatusFound)
@@ -274,12 +278,16 @@ type seatRequest struct {
 
 var matrixLocalpart = regexp.MustCompile(`^[0-9a-z=_\-./]+$`)
 
+func validateLocalpart(localpart string) bool {
+	return matrixLocalpart.MatchString(localpart)
+}
+
 func validateLocalMXID(mxid, serverName string) bool {
 	if !strings.HasPrefix(mxid, "@") || serverName == "" {
 		return false
 	}
 	parts := strings.SplitN(strings.TrimPrefix(mxid, "@"), ":", 2)
-	return len(parts) == 2 && parts[1] == serverName && matrixLocalpart.MatchString(parts[0])
+	return len(parts) == 2 && parts[1] == serverName && validateLocalpart(parts[0])
 }
 func (s *Server) handleAddSeat(w http.ResponseWriter, r *http.Request) {
 	client, p, id, ok := s.command(r)

@@ -3,6 +3,7 @@ package steward
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,10 @@ type fakeCashier struct {
 	requestID string
 	state     PlanState
 }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func (f *fakeCashier) PlanState(context.Context, Principal) (PlanState, error) { return f.state, nil }
 func (f *fakeCashier) CreatePlan(_ context.Context, p Principal, requestID string) (Plan, error) {
@@ -92,6 +97,59 @@ func TestServerRendersPersistentSandboxBanner(t *testing.T) {
 	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/plan", nil))
 	if !strings.Contains(rec.Body.String(), "TEST / SANDBOX") {
 		t.Fatal("GET /plan does not visibly identify the test billing environment")
+	}
+}
+
+func TestValidateLocalpartMatchesMatrixUserLocalpartRules(t *testing.T) {
+	for _, tt := range []struct {
+		localpart string
+		valid     bool
+	}{
+		{localpart: "alice", valid: true},
+		{localpart: "user_name-1.2/3=4", valid: true},
+		{localpart: "", valid: false},
+		{localpart: "Alice", valid: false},
+		{localpart: "alice:remote", valid: false},
+		{localpart: "alice@example", valid: false},
+	} {
+		t.Run(tt.localpart, func(t *testing.T) {
+			if got := validateLocalpart(tt.localpart); got != tt.valid {
+				t.Fatalf("validateLocalpart(%q) = %t, want %t", tt.localpart, got, tt.valid)
+			}
+		})
+	}
+}
+
+func TestCallbackRejectsInvalidProviderUsername(t *testing.T) {
+	srv := testServer()
+	srv.oidc.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body := `{"access_token":"token"}`
+		if req.URL.Path != "/oauth2/token" {
+			body = `{"username":"invalid:username"}`
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    req,
+		}, nil
+	})
+	cookies := httptest.NewRecorder()
+	setOAuthCookies(cookies, "state", "verifier")
+	req := httptest.NewRequest(http.MethodGet, "/plan/callback?state=state&code=code", nil)
+	for _, cookie := range cookies.Result().Cookies() {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if got, want := rec.Code, http.StatusBadGateway; got != want {
+		t.Fatalf("callback status = %d, want %d", got, want)
+	}
+	for _, cookie := range rec.Result().Cookies() {
+		if cookie.Name == sessionCookieName {
+			t.Fatal("callback issued a session for an invalid provider username")
+		}
 	}
 }
 

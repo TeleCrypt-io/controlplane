@@ -136,7 +136,7 @@ jobs:
           target: controlplane
           tags: ghcr.io/telecrypt-io/controlplane:${{ github.ref_name }}
 
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@v3.10.1
 
       - name: Sign image with cosign keyless
         env:
