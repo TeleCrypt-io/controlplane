@@ -1,7 +1,7 @@
 {
   "vendor": "@telecrypt-io/ui",
   "version": "0.1.0",
-  "canonical_source": "https://github.com/TeleCrypt-io/ui",
+  "canonical_source": "https://github.com/TeleCrypt-io/ui-shared-css",
   "canonical_release": "v0.1.0",
   "canonical_commit": "77d2a49b6f16accd58d47bbdf743906a040d3557",
   "source_file": "src/product.css",

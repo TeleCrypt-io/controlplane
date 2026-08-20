@@ -63,6 +63,48 @@ func TestLoadLocker_RejectsUnknownBillingEnvironment(t *testing.T) {
 	}
 }
 
+func TestLoad_RejectsMalformedRateLimit(t *testing.T) {
+	for _, key := range []string{"RATE_LIMIT_PER_SOURCE", "RATE_LIMIT_GLOBAL", "RATE_LIMIT_WINDOW_SEC"} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, "not-an-integer")
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("Load error = %v, want malformed %s error", err, key)
+			}
+		})
+	}
+}
+
+func TestLoad_DoesNotDefaultPublicEnvironmentURLs(t *testing.T) {
+	for _, key := range []string{"MAS_BASE_URL", "HOMESERVER", "PLAN_URL"} {
+		t.Setenv(key, "")
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load error = %v", err)
+	}
+	if err := cfg.ValidateRedpill(); err == nil {
+		t.Fatal("ValidateRedpill accepted missing environment-specific public URLs")
+	}
+}
+
+func TestLoadLocker_RejectsMalformedNumericSetting(t *testing.T) {
+	for _, key := range []string{"SWEEP_INTERVAL_SEC", "LOCK_AFTER_HOURS", "SMTP_TIMEOUT_SEC"} {
+		t.Run(key, func(t *testing.T) {
+			for envKey, value := range map[string]string{
+				"BILLING_ENV": "test", "MATRIX_DEPLOYMENT_ID": "test", "MAS_BASE_URL": "http://mas:8080",
+				"MAS_ADMIN_CLIENT_ID": "janitor", "MAS_ADMIN_CLIENT_SECRET": "secret",
+				"CONTROLPLANE_DB_URL": "postgres://janitor@db/test", "SERVER_NAME": "telecrypt.test",
+			} {
+				t.Setenv(envKey, value)
+			}
+			t.Setenv(key, "not-an-integer")
+			if _, err := LoadLocker(); err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("LoadLocker error = %v, want malformed %s error", err, key)
+			}
+		})
+	}
+}
+
 func TestValidateRedpill_RequiresPublicEndpointsAndPositiveLimits(t *testing.T) {
 	cfg := &Config{
 		MASBaseURL:         "https://backend.telecrypt.io/auth",
