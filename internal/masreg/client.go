@@ -26,9 +26,9 @@
 //     exact input names, including the hidden "csrf" and "action" fields.
 //
 // Every step's success response is a 303 redirect. net/http.Client's default redirect policy
-// converts a POST into a followed GET on a 303, so Register below issues one explicit HTTP call
-// per logical step and lets the client follow the intermediate hops transparently — the same way
-// a browser would.
+// converts a POST into a followed GET on a 303, so the registration part of
+// RegisterAndAuthorizeDevice issues one explicit HTTP call per logical step and lets the client
+// follow the intermediate hops transparently — the same way a browser would.
 package masreg
 
 import (
@@ -47,10 +47,10 @@ import (
 )
 
 // Client drives the registration flow against one MAS deployment. Safe for concurrent use: each
-// Register call runs in its own session with a fresh cookie jar. The jar isolation matters even
-// for strictly sequential calls — a jar reused across registrations would present the previous
-// account's live MAS session cookie on the next GET /register, and MAS redirects an
-// already-authenticated visitor away from the form instead of serving it.
+// RegisterAndAuthorizeDevice call runs in its own session with a fresh cookie jar. The jar
+// isolation matters even for strictly sequential calls — a jar reused across registrations would
+// present the previous account's live MAS session cookie on the next GET /register, and MAS
+// redirects an already-authenticated visitor away from the form instead of serving it.
 type Client struct {
 	baseURL string
 }
@@ -60,7 +60,8 @@ func NewClient(baseURL string) *Client {
 	return &Client{baseURL: strings.TrimRight(baseURL, "/")}
 }
 
-// session is the HTTP state of one Register call: one cookie jar, one client, discarded after.
+// session is the HTTP state of one RegisterAndAuthorizeDevice call: one cookie jar, one client,
+// discarded after.
 type session struct {
 	baseURL          string
 	httpClient       *http.Client
@@ -90,19 +91,6 @@ func extractCSRF(body []byte) string {
 		return ""
 	}
 	return string(m[1])
-}
-
-// Register drives the full public registration flow for the given username/password and returns
-// once MAS has created the account. It exists for callers that need registration alone.
-//
-// Assumes (unverified outside a live spike): password registration is enabled, no upstream OAuth
-// provider is configured (so GET /register redirects straight to /register/password), email is
-// not required (password_registration_email_required is false), no CAPTCHA is configured, and no
-// registration token is required. Any of these being true in prod would make Register fail
-// closed with a descriptive error rather than silently mis-register.
-func (c *Client) Register(ctx context.Context, username, password string) error {
-	_, err := c.registerSession(ctx, username, password)
-	return err
 }
 
 // RegisterAndAuthorizeDevice creates an account through MAS's public forms, dynamically
