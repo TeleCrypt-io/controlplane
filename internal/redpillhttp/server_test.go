@@ -29,7 +29,7 @@ func (p *contextProvisioner) ProvisionAgent(ctx context.Context) (*agent.Provisi
 
 func TestHandleRedpill_BoundsProvisioningTime(t *testing.T) {
 	p := &contextProvisioner{}
-	s := New(p, NewRateLimiter(5, 60, time.Minute), "https://telecrypt.io/plan", "")
+	s := New(p, NewRateLimiter(5, 60, time.Minute), "https://telecrypt.io/plan")
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest("POST", "/redpill", nil))
 	if !p.hasDeadline {
@@ -43,7 +43,7 @@ func TestHandleRedpill_DoesNotLogProvisioningError(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 	secret := "generated-password-must-not-appear"
-	s := New(&fakeProvisioner{err: errors.New(secret)}, NewRateLimiter(5, 60, time.Minute), "https://telecrypt.io/plan", "")
+	s := New(&fakeProvisioner{err: errors.New(secret)}, NewRateLimiter(5, 60, time.Minute), "https://telecrypt.io/plan")
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest("POST", "/redpill", nil))
 	if strings.Contains(logs.String(), secret) {
@@ -72,7 +72,7 @@ func TestHandleRedpill_HappyPath(t *testing.T) {
 		OAuthClientID:      "dynamic-client",
 		OAuthTokenEndpoint: "https://telecrypt.io/auth/oauth2/token",
 	}}
-	s := New(p, NewRateLimiter(5, 60, time.Minute), "https://backend.telecrypt.io/plan", "")
+	s := New(p, NewRateLimiter(5, 60, time.Minute), "https://backend.telecrypt.io/plan")
 
 	req := httptest.NewRequest("POST", "/redpill", nil)
 	w := httptest.NewRecorder()
@@ -98,12 +98,6 @@ func TestHandleRedpill_HappyPath(t *testing.T) {
 	if w.Header().Get("Cache-Control") != "no-store" {
 		t.Errorf("Cache-Control = %q, want no-store", w.Header().Get("Cache-Control"))
 	}
-	if _, ok := resp["adopt_url"]; ok {
-		t.Error("response must not contain adopt_url — the nonce-based adopt flow is gone")
-	}
-	if _, ok := resp["adopt_instructions"]; ok {
-		t.Error("response must not contain adopt_instructions — the DM handshake is gone")
-	}
 	plan, ok := resp["plan_url"]
 	if !ok {
 		t.Fatal("response must contain plan_url — guidance for attaching to a paid plan")
@@ -115,7 +109,7 @@ func TestHandleRedpill_HappyPath(t *testing.T) {
 
 func TestHandleRedpill_ProvisioningFails(t *testing.T) {
 	p := &fakeProvisioner{err: errors.New("mas unreachable")}
-	s := New(p, NewRateLimiter(5, 60, time.Minute), "https://backend.telecrypt.io/plan", "")
+	s := New(p, NewRateLimiter(5, 60, time.Minute), "https://backend.telecrypt.io/plan")
 
 	req := httptest.NewRequest("POST", "/redpill", nil)
 	w := httptest.NewRecorder()
@@ -131,7 +125,7 @@ func TestHandleRedpill_ProvisioningFails(t *testing.T) {
 
 func TestHandleRedpill_RateLimited(t *testing.T) {
 	p := &fakeProvisioner{result: &agent.Provisioned{MXID: "@x:telecrypt.io"}}
-	s := New(p, NewRateLimiter(1, 1000, time.Minute), "https://telecrypt.io/plan", "")
+	s := New(p, NewRateLimiter(1, 1000, time.Minute), "https://telecrypt.io/plan")
 
 	req1 := httptest.NewRequest("POST", "/redpill", nil)
 	req1.Header.Set("X-Forwarded-For", "9.9.9.9")
@@ -154,7 +148,7 @@ func TestHandleRedpill_RateLimited(t *testing.T) {
 }
 
 func TestHandleHealth(t *testing.T) {
-	s := New(&fakeProvisioner{}, NewRateLimiter(5, 60, time.Minute), "https://telecrypt.io/plan", "")
+	s := New(&fakeProvisioner{}, NewRateLimiter(5, 60, time.Minute), "https://telecrypt.io/plan")
 
 	req := httptest.NewRequest("GET", "/health", nil)
 	w := httptest.NewRecorder()

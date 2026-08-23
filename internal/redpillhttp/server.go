@@ -22,20 +22,18 @@ type provisioner interface {
 }
 
 type Server struct {
-	provisioner    provisioner
-	rateLimiter    *RateLimiter
-	planURL        string
-	ignoredProxyIP string
-	mux            *http.ServeMux
+	provisioner provisioner
+	rateLimiter *RateLimiter
+	planURL     string
+	mux         *http.ServeMux
 }
 
-func New(p provisioner, rl *RateLimiter, planURL, ignoredProxyIP string) *Server {
+func New(p provisioner, rl *RateLimiter, planURL string) *Server {
 	s := &Server{
-		provisioner:    p,
-		rateLimiter:    rl,
-		planURL:        planURL,
-		ignoredProxyIP: strings.TrimSpace(ignoredProxyIP),
-		mux:            http.NewServeMux(),
+		provisioner: p,
+		rateLimiter: rl,
+		planURL:     planURL,
+		mux:         http.NewServeMux(),
 	}
 	s.mux.HandleFunc("POST /redpill", s.handleRedpill)
 	s.mux.HandleFunc("GET /health", s.handleHealth)
@@ -53,9 +51,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // clientIP extracts the original client IP for per-source rate limiting, returning "" when no
 // real per-client signal is available — the caller then falls back to the global-only ceiling
 // (RateLimiter.Allow treats an empty sourceIP that way already).
-func clientIP(r *http.Request, ignoredProxyIP string) string {
+func clientIP(r *http.Request) string {
 	xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
-	if xff == "" || (ignoredProxyIP != "" && xff == ignoredProxyIP) {
+	if xff == "" {
 		return ""
 	}
 	return strings.TrimSpace(strings.Split(xff, ",")[0])
@@ -76,11 +74,11 @@ type redpillResponse struct {
 }
 
 // handleRedpill provisions a fresh agent account through MAS's public registration and OAuth
-// flow — no admin credential, compatibility login, edge token, or database. Rate-limited
+// flow — no admin credential, password login, edge token, or database. Rate-limited
 // in-memory per source IP and globally.
 func (s *Server) handleRedpill(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	allowed := s.rateLimiter.Allow(clientIP(r, s.ignoredProxyIP))
+	allowed := s.rateLimiter.Allow(clientIP(r))
 	if !allowed {
 		http.Error(w, "rate limit exceeded, try again later", http.StatusTooManyRequests)
 		return

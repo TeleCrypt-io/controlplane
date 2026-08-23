@@ -22,17 +22,13 @@ const digestHighWaterKey = "digest_high_water"
 // call (for example, the process crashed after writing intent but before sending the request).
 const pendingLockMaxCommitDelay = time.Minute
 
-// Config holds one Sweeper's tunables — see cmd/janitor for how these map to env vars.
+const lockAfter = 48 * time.Hour
+
+// Config holds the Janitor inputs that remain environment-specific.
 type Config struct {
-	// LockAfterHours: an account must be at least this old, unclaimed, and email-less to be
-	// locked.
-	LockAfterHours int
 	// ServerName is the Matrix server name used to turn a MAS username into an MXID
 	// (@username:ServerName).
 	ServerName string
-	// ExcludeMXIDs is a defensive belt-and-suspenders exclusion list (service accounts like the
-	// service accounts) — checked unconditionally regardless of what else would otherwise match.
-	ExcludeMXIDs map[string]bool
 	// DryRun logs every action this sweep would take (lock or send) without doing it. In dry-run,
 	// the digest high-water mark is not advanced either — nothing was actually delivered.
 	DryRun bool
@@ -138,7 +134,7 @@ func (s *Sweeper) sweepLocks(
 	hasEmail, verified map[string]bool,
 	janitorLocked, pendingLocks map[string]time.Time,
 ) {
-	cutoff := time.Now().Add(-time.Duration(s.cfg.LockAfterHours) * time.Hour)
+	cutoff := time.Now().Add(-lockAfter)
 	locked, unlocked, skipped := 0, 0, 0
 
 	for _, u := range users {
@@ -248,7 +244,7 @@ func (s *Sweeper) sweepLocks(
 			delete(pendingLocks, u.ID)
 		}
 
-		reason := skipReason(u, cutoff, mxid, hasEmail, verified, s.cfg.ExcludeMXIDs)
+		reason := skipReason(u, cutoff, mxid, hasEmail, verified, s.cfg.ServerName)
 		if reason != "" {
 			log.Debug("skip lock", "reason", reason)
 			skipped++
@@ -359,7 +355,7 @@ func lockMatchesIntent(lockedAt, intentAt time.Time) bool {
 }
 
 // skipReason returns why u should NOT be locked, or "" if it should be.
-func skipReason(u masadmin.User, cutoff time.Time, mxid string, hasEmail, verified, excluded map[string]bool) string {
+func skipReason(u masadmin.User, cutoff time.Time, mxid string, hasEmail, verified map[string]bool, serverName string) string {
 	switch {
 	case u.DeactivatedAt != nil:
 		return "deactivated"
@@ -369,8 +365,8 @@ func skipReason(u masadmin.User, cutoff time.Time, mxid string, hasEmail, verifi
 		return "has email (human awaiting review)"
 	case verified[mxid]:
 		return "verified"
-	case excluded[mxid]:
-		return "excluded via EXCLUDE_MXIDS"
+	case mxid == "@cashier_admin:"+serverName:
+		return "Cashier admin account"
 	default:
 		return ""
 	}

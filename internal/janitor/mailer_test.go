@@ -152,13 +152,12 @@ func TestSMTPMailer_SendSucceedsWithSTARTTLS(t *testing.T) {
 	defer srv.close()
 
 	m := &SMTPMailer{
-		Host:       srv.host,
-		Port:       srv.port,
-		Username:   "user",
-		Password:   "pass",
-		From:       "from@test",
-		TimeoutSec: 10,
-		tlsConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: srv.host},
+		Host:      srv.host,
+		Port:      srv.port,
+		Username:  "user",
+		Password:  "pass",
+		From:      "from@test",
+		tlsConfig: &tls.Config{InsecureSkipVerify: true, ServerName: srv.host},
 	}
 
 	err := m.Send(context.Background(), "to@test", "Test", "body")
@@ -178,13 +177,12 @@ func TestSMTPMailer_SendFailsWithoutSTARTTLS(t *testing.T) {
 	defer srv.close()
 
 	m := &SMTPMailer{
-		Host:       srv.host,
-		Port:       srv.port,
-		Username:   "user",
-		Password:   "pass",
-		From:       "from@test",
-		TimeoutSec: 10,
-		tlsConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: srv.host},
+		Host:      srv.host,
+		Port:      srv.port,
+		Username:  "user",
+		Password:  "pass",
+		From:      "from@test",
+		tlsConfig: &tls.Config{InsecureSkipVerify: true, ServerName: srv.host},
 	}
 
 	err := m.Send(context.Background(), "to@test", "Test", "body")

@@ -1,7 +1,6 @@
 // Command redpill runs TeleCrypt.io's stateless agent-registration shim: POST /redpill drives
 // MAS's public registration and OAuth device flow (no admin credentials, database, or password
-// compatibility login — see internal/agent and internal/masreg) and GET /health is a liveness
-// probe.
+// login — see internal/agent and internal/masreg) and GET /health is a liveness probe.
 package main
 
 import (
@@ -25,7 +24,7 @@ func main() {
 		slog.Error("config", "error", err)
 		os.Exit(1)
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLogLevel(cfg.LogLevel)})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	handler, err := build(cfg)
 	if err != nil {
@@ -34,7 +33,7 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Addr:              cfg.ListenAddr,
+		Addr:              redpillListenAddr,
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -44,7 +43,7 @@ func main() {
 	}
 
 	go func() {
-		slog.Info("listening", "addr", cfg.ListenAddr)
+		slog.Info("listening", "addr", redpillListenAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("server", "error", err)
 			os.Exit(1)
@@ -69,28 +68,22 @@ func build(cfg *config.Config) (http.Handler, error) {
 
 	// MAS registration and device OAuth use browser-visible public URLs because MAS builds
 	// redirects and native-client metadata from its configured public base URL.
-	masRegClient := masreg.NewClient(cfg.MASBaseURL)
+	masRegClient := masreg.NewClient(cfg.MASPublicURL)
 
-	provisioner, err := agent.NewProvisioner(masRegClient, cfg.Homeserver, cfg.ServerName)
+	provisioner, err := agent.NewProvisioner(masRegClient, cfg.BackendPublicURL, cfg.ServerName)
 	if err != nil {
 		return nil, err
 	}
 
 	rateLimiter := redpillhttp.NewRateLimiter(
-		cfg.RateLimitPerSource, cfg.RateLimitGlobal, time.Duration(cfg.RateLimitWindowSec)*time.Second)
+		redpillRateLimitPerSource, redpillRateLimitGlobal, redpillRateLimitWindow)
 
-	return redpillhttp.New(provisioner, rateLimiter, cfg.PlanURL, cfg.IgnoredProxyIP), nil
+	return redpillhttp.New(provisioner, rateLimiter, cfg.PlanPublicURL), nil
 }
 
-func parseLogLevel(s string) slog.Level {
-	switch s {
-	case "debug":
-		return slog.LevelDebug
-	case "warn":
-		return slog.LevelWarn
-	case "error":
-		return slog.LevelError
-	default:
-		return slog.LevelInfo
-	}
-}
+const (
+	redpillListenAddr         = ":9009"
+	redpillRateLimitPerSource = 5
+	redpillRateLimitGlobal    = 60
+	redpillRateLimitWindow    = time.Minute
+)

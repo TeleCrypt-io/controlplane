@@ -11,14 +11,15 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
-        image: postgres:17.6-alpine
+        image: postgres:17.6-bookworm
         env:
           POSTGRES_USER: telecrypt_test
           POSTGRES_PASSWORD: telecrypt_test
           POSTGRES_DB: telecrypt_test
+          POSTGRES_INITDB_ARGS: --auth-local=scram-sha-256 --auth-host=scram-sha-256
         ports:
           - 5432:5432
         options: >-
@@ -52,13 +53,13 @@ jobs:
           python -m pip install --disable-pip-version-check build==1.3.0 pytest==9.0.2 pytest-asyncio==1.4.0
           python -m build --wheel --outdir dist/tier-controller synapse/tier_controller
           python -m venv /tmp/tier-controller-venv
-          /tmp/tier-controller-venv/bin/python -m pip install --disable-pip-version-check matrix-synapse==1.155.0 pytest==9.0.2 pytest-asyncio==1.4.0 dist/tier-controller/*.whl
+          /tmp/tier-controller-venv/bin/python -m pip install --disable-pip-version-check matrix-synapse==1.159.0 pytest==9.0.2 pytest-asyncio==1.4.0 dist/tier-controller/*.whl
           /tmp/tier-controller-venv/bin/python -m pytest -q synapse/tier_controller/test_tier_controller.py
 
   release:
     if: startsWith(github.ref, 'refs/tags/')
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     concurrency:
       group: controlplane-release-${{ github.ref }}
       cancel-in-progress: false
@@ -80,8 +81,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE: ${{ github.ref_name }}
         run: |
-          if gh release view "$RELEASE" >/dev/null 2>&1; then
+          set +e
+          inspection="$(gh api --include "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE" 2>&1)"
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
             echo "GitHub Release $RELEASE already exists; refusing to replace release artifacts" >&2
+            exit 1
+          elif printf '%s\n' "$inspection" | grep -Eq '^HTTP/[0-9.]+ 404([[:space:]]|$)'; then
+            echo "confirmed immutable GitHub Release is unused: $RELEASE"
+          else
+            echo "cannot prove whether GitHub Release exists: $RELEASE" >&2
             exit 1
           fi
 
@@ -122,6 +132,20 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse to replace an existing image tag
+        env:
+          IMAGE: ghcr.io/telecrypt-io/controlplane:${{ github.ref_name }}
+        run: |
+          if inspection="$(docker manifest inspect "$IMAGE" 2>&1)"; then
+            echo "refusing to replace existing immutable image tag $IMAGE" >&2
+            exit 1
+          elif printf '%s\n' "$inspection" | grep -Eqi 'manifest unknown|no such manifest|not found'; then
+            echo "confirmed immutable image tag is unused: $IMAGE"
+          else
+            echo "cannot prove whether immutable image tag exists: $IMAGE" >&2
+            exit 1
+          fi
 
       - name: Set up buildx
         uses: docker/setup-buildx-action@v4.3.0

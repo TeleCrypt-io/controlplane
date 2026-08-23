@@ -5,7 +5,7 @@ unrelated repository from importing these packages. The public entry points are 
 small `main` packages in `cmd/`:
 
 - `cmd/redpill` serves `POST /redpill` and provisions a newly registered user's Matrix agent.
-- `cmd/janitor` is a scheduled, non-listening maintenance process.
+- `cmd/janitor` is a one-shot, non-listening maintenance process.
 - `cmd/steward` serves the authenticated account, plan, and subscription UI at `/plan`.
 
 ## Package responsibilities
@@ -14,7 +14,7 @@ small `main` packages in `cmd/`:
 | --- | --- | --- |
 | `agent` | Coordinates Matrix-agent provisioning after a user registers. | No database or MAS-admin credential. |
 | `config` | Loads and validates the narrowly scoped configuration of each executable. | Rejects incomplete or inconsistent runtime configuration. |
-| `db` | Janitor's small maintenance-state schema and read-side billing-grant access. | Does not create payments, subscriptions, or provider records. |
+| `db` | Janitor's small locker-state schema and read-side billing-grant access. | Does not create payments, subscriptions, or provider records. |
 | `janitor` | Finds stale unclaimed accounts, locks them through MAS, and sends the owner digest. | No HTTP listener. |
 | `masadmin` | MAS admin OAuth client used only by Janitor. | Never used by Redpill or Steward. |
 | `masreg` | MAS public registration, dynamic-client, and device-OAuth client used by Redpill. | Does not use MAS-admin authority or a client secret. |

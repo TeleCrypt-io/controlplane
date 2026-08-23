@@ -23,29 +23,28 @@ type Provisioned struct {
 }
 
 type Provisioner struct {
-	masReg     masRegClient
-	homeserver string // e.g. https://backend.telecrypt.io
-	serverName string // e.g. telecrypt.io — used to build MXIDs, decoupled from homeserver host
+	masReg           masRegClient
+	backendPublicURL string // e.g. https://backend.telecrypt.io
+	serverName       string // e.g. telecrypt.io — Matrix data-plane identity
 }
 
-// NewProvisioner creates a Provisioner. The serverName override is optional: when non-empty it is
-// used for MXID construction (allowing the homeserver endpoint and the server_name to differ);
-// when empty it falls back to the host from homeserver for backward compatibility.
-func NewProvisioner(m masRegClient, homeserver, serverName string) (*Provisioner, error) {
-	u, err := url.Parse(homeserver)
+// NewProvisioner creates a Provisioner. ServerName is required because it is the Matrix data-plane
+// identity and must not silently change when the public backend origin changes.
+func NewProvisioner(m masRegClient, backendPublicURL, serverName string) (*Provisioner, error) {
+	u, err := url.Parse(backendPublicURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse homeserver URL: %w", err)
+		return nil, fmt.Errorf("parse backend public URL: %w", err)
 	}
-	if u.Host == "" {
-		return nil, fmt.Errorf("homeserver URL %q has no host", homeserver)
+	if u.Hostname() == "" {
+		return nil, fmt.Errorf("backend public URL %q has no host", backendPublicURL)
 	}
 	if serverName == "" {
-		serverName = u.Host
+		return nil, fmt.Errorf("server name must not be empty")
 	}
 	return &Provisioner{
-		masReg:     m,
-		homeserver: homeserver,
-		serverName: serverName,
+		masReg:           m,
+		backendPublicURL: backendPublicURL,
+		serverName:       serverName,
 	}, nil
 }
 
@@ -69,7 +68,7 @@ func (p *Provisioner) ProvisionAgent(ctx context.Context) (*Provisioned, error) 
 		return nil, fmt.Errorf("generate device id: %w", err)
 	}
 
-	tokens, err := p.masReg.RegisterAndAuthorizeDevice(ctx, localpart, password, deviceID, p.homeserver)
+	tokens, err := p.masReg.RegisterAndAuthorizeDevice(ctx, localpart, password, deviceID, p.backendPublicURL)
 	if err != nil {
 		return nil, fmt.Errorf("MAS public registration and OAuth device authorization: %w", err)
 	}
@@ -84,7 +83,7 @@ func (p *Provisioner) ProvisionAgent(ctx context.Context) (*Provisioned, error) 
 		RefreshToken:       tokens.RefreshToken,
 		ExpiresIn:          tokens.ExpiresIn,
 		DeviceID:           deviceID,
-		Homeserver:         p.homeserver,
+		Homeserver:         p.backendPublicURL,
 		OAuthIssuer:        tokens.Issuer,
 		OAuthClientID:      tokens.ClientID,
 		OAuthTokenEndpoint: tokens.TokenEndpoint,

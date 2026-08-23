@@ -21,8 +21,8 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 	defer conn.Release()
 
-	// Cashier and the one-shot janitor can start together during Compose convergence. Serialize
-	// their migration runners at the database, not in-process, so both remain safe under replicas.
+	// Serialize Janitor migration runners at the database so concurrent one-shot invocations are
+	// safe; Cashier uses its own private-schema migration history and lock.
 	const migrationLockID int64 = 0x54454c4543525950
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLockID); err != nil {
 		return fmt.Errorf("acquire migration lock: %w", err)

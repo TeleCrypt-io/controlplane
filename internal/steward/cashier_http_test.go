@@ -59,7 +59,7 @@ func TestHTTPCashierClientPreservesPrivatePlanCreationProtocol(t *testing.T) {
 	}
 }
 
-func TestHTTPCashierClientMapsPrivateTeamStateToPlanModel(t *testing.T) {
+func TestHTTPCashierClientReadsPrivatePlanState(t *testing.T) {
 	_, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate Ed25519 key: %v", err)
@@ -70,7 +70,7 @@ func TestHTTPCashierClientMapsPrivateTeamStateToPlanModel(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"team":{"id":"legacy-team-id","subscription_status":"active","paid_seats":2},"seats":[{"mxid":"@alice:telecrypt.io"}]}`))
+		_, _ = w.Write([]byte(`{"plan":{"id":"plan-id","subscription_status":"active","paid_seats":2},"seats":[{"mxid":"@alice:telecrypt.io"}]}`))
 	}))
 	defer server.Close()
 
@@ -82,8 +82,8 @@ func TestHTTPCashierClientMapsPrivateTeamStateToPlanModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanState: %v", err)
 	}
-	if state.Plan == nil || state.Plan.ID != "legacy-team-id" || state.Plan.PaidSeats != 2 {
-		t.Fatalf("PlanState plan = %#v, want mapped private team", state.Plan)
+	if state.Plan == nil || state.Plan.ID != "plan-id" || state.Plan.PaidSeats != 2 {
+		t.Fatalf("PlanState plan = %#v, want private plan", state.Plan)
 	}
 	if len(state.Seats) != 1 || state.Seats[0].MXID != "@alice:telecrypt.io" {
 		t.Fatalf("PlanState seats = %#v", state.Seats)
@@ -92,8 +92,8 @@ func TestHTTPCashierClientMapsPrivateTeamStateToPlanModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal PlanState: %v", err)
 	}
-	if strings.Contains(string(encoded), `"team"`) || !strings.Contains(string(encoded), `"plan"`) {
-		t.Fatalf("owned PlanState JSON = %s, want plan key and no team key", encoded)
+	if !strings.Contains(string(encoded), `"plan"`) {
+		t.Fatalf("owned PlanState JSON = %s, want plan key", encoded)
 	}
 }
 

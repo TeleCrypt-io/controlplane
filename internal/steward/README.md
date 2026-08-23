@@ -8,15 +8,12 @@ and billing-portal actions. MAS embeds this stable URL in its account-management
 It must not receive Dodo credentials, Dodo webhook secrets, Synapse-admin credentials, or a
 billing database URL.  It calls the private Cashier only through `CashierClient`.
 
-Plan's browser API is rooted at `/api/plan`. The former `/api/team` routes remain authenticated
-compatibility aliases for cached clients; their legacy `team_id` create response is retained only
-there. The current UI and all new integrations must use `/api/plan` and `plan_id`.
+Plan's browser API is rooted at `/api/plan`; plan creation returns `plan_id`.
 
 ## Intended private protocol
 
-Cashier exposes an internal-only versioned API corresponding exactly to `CashierClient`. Its
-historical `team` route names are protocol compatibility details, not the public Plan product
-terminology:
+Cashier exposes an internal-only versioned API corresponding exactly to `CashierClient`. The
+internal team-domain paths are private protocol names and are not public Plan terminology:
 
 - `GET /internal/v1/plan-state`
 - `POST /internal/v1/teams`

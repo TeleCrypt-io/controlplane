@@ -1,9 +1,8 @@
-// Package masreg drives MAS 1.16.0's public password-registration and OAuth device flows as a
+// Package masreg drives MAS 1.23.0's public password-registration and OAuth device flows as a
 // plain HTTP client — the same request sequence a browser runs, with no admin credentials or
 // pre-registered OAuth client involved.
 //
-// The endpoint sequence and form field names below are derived from the MAS v1.16.0 source
-// (github.com/element-hq/matrix-authentication-service, tag v1.16.0):
+// The endpoint sequence and form field names below implement the MAS 1.23.0 public contract:
 //   - crates/handlers/src/views/register/mod.rs — GET /register redirects (303) straight to
 //     /register/password when password registration is enabled and no upstream OAuth provider
 //     is configured; otherwise it renders a combined provider-choice page instead (not handled
@@ -22,6 +21,8 @@
 //   - crates/axum-utils/src/csrf.rs — ProtectedForm: the CSRF token lives in an opaque "csrf"
 //     cookie (cookiejar carries it automatically) and must be echoed back as a hidden "csrf" form
 //     field; there is no Origin/Referer check, only the token match.
+//   - crates/handlers/src/oauth2/device/link.rs — GET /link returns a CSRF-protected form;
+//     POST /link with the echoed token and user code redirects (303) to the consent page.
 //   - templates/pages/register/password.html, templates/pages/register/steps/display_name.html —
 //     exact input names, including the hidden "csrf" and "action" fields.
 //
@@ -273,7 +274,7 @@ func (s *session) registerPublicNativeClient(ctx context.Context, clientURI stri
 	if err != nil {
 		return "", err
 	}
-	// MAS v1.16.0's DynamicClientRegistration route is /oauth2/registration. The grant types
+	// MAS 1.23.0's DynamicClientRegistration route is /oauth2/registration. The grant types
 	// are explicit: MAS otherwise defaults to authorization_code, which cannot issue this device
 	// grant or its refresh token.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/oauth2/registration", bytes.NewReader(b))
@@ -333,30 +334,47 @@ func (s *session) startDeviceAuthorization(ctx context.Context, clientID, device
 }
 
 func (s *session) approveDeviceAuthorization(ctx context.Context, userCode string) error {
-	// MAS 1.16's /link page is a GET form carrying only the user code; it has
-	// no CSRF field. A valid code redirects (303) to the consent page, which
-	// is CSRF-protected. getForm follows the redirect, so the returned CSRF
-	// and URL are the consent page's. See
+	// MAS 1.23's /link page is a CSRF-protected GET form. POSTing its token and
+	// the user code redirects (303) to the consent page, which has its own CSRF
+	// token. See
 	// crates/handlers/src/oauth2/device/link.rs and
-	// templates/pages/device_link.html in matrix-authentication-service v1.16.0.
+	// templates/pages/device_link.html in matrix-authentication-service v1.23.0.
 	linkURL, err := url.Parse(s.baseURL + "/link")
 	if err != nil {
 		return fmt.Errorf("parse device link URL: %w", err)
 	}
-	query := linkURL.Query()
-	query.Set("code", userCode)
-	linkURL.RawQuery = query.Encode()
-	csrf, deviceURL, body, err := s.getForm(ctx, linkURL.String())
+	csrf, formURL, body, err := s.getForm(ctx, linkURL.String())
 	if err != nil {
 		return fmt.Errorf("load device link: %w", err)
 	}
-	if deviceURL == nil {
-		return fmt.Errorf("device link did not redirect: %s", sniffError(body))
+	if formURL == nil || formURL.Path != linkURL.Path {
+		path := "<nil>"
+		if formURL != nil {
+			path = formURL.Path
+		}
+		return fmt.Errorf("device link form landed at %q: %s", path, sniffError(body))
+	}
+	if csrf == "" {
+		return fmt.Errorf("no csrf token found on device link form: %s", sniffError(body))
+	}
+	csrf, consentURL, body, err := s.postForm(ctx, formURL.String(), url.Values{
+		"csrf": {csrf},
+		"code": {userCode},
+	})
+	if err != nil {
+		return fmt.Errorf("submit device code: %w", err)
+	}
+	if consentURL == nil || !s.isDeviceConsentPath(consentURL.Path) {
+		path := "<nil>"
+		if consentURL != nil {
+			path = consentURL.Path
+		}
+		return fmt.Errorf("device link did not redirect to consent: %q: %s", path, sniffError(body))
 	}
 	if csrf == "" {
 		return fmt.Errorf("no csrf token found on device consent page: %s", sniffError(body))
 	}
-	_, _, body, err = s.postForm(ctx, deviceURL.String(), url.Values{
+	_, _, _, err = s.postForm(ctx, consentURL.String(), url.Values{
 		"csrf":           {csrf},
 		"confirm_device": {"on"},
 		"action":         {"consent"},
@@ -365,6 +383,15 @@ func (s *session) approveDeviceAuthorization(ctx context.Context, userCode strin
 		return fmt.Errorf("submit device consent: %w", err)
 	}
 	return nil
+}
+
+func (s *session) isDeviceConsentPath(path string) bool {
+	base, err := url.Parse(s.baseURL)
+	if err != nil {
+		return false
+	}
+	prefix := strings.TrimRight(base.Path, "/") + "/device/"
+	return strings.HasPrefix(path, prefix) && len(path) > len(prefix)
 }
 
 func (s *session) pollDeviceToken(ctx context.Context, clientID string, device *deviceAuthorization) (*DeviceTokens, error) {

@@ -1,17 +1,16 @@
-// Package masadmin is a client for MAS's admin API (v1.16.0) — janitor's one job that
-// needs a standing MAS admin credential. Everything below is derived from the MAS v1.16.0 source
-// (github.com/element-hq/matrix-authentication-service, tag v1.16.0), not guessed:
+// Package masadmin is a client for MAS 1.23.0's admin API — janitor's one job that
+// needs a standing MAS admin credential. The paths, authentication, response fields, and
+// pagination below implement MAS's current admin API contract:
 //
 //   - crates/router/src/endpoints.rs — OAuth2TokenEndpoint's path is "/oauth2/token" (same
-//     no-/auth-prefix convention internal/masreg already uses against MASBaseURL).
+//     no-/auth-prefix convention internal/masreg already uses against the MAS internal origin).
 //   - crates/handlers/src/oauth2/token.rs (client_credentials_grant) and
 //     crates/axum-utils/src/client_authorization.rs (Credentials::verify) — client_credentials
 //     authentication is checked against the client's *registered* token_endpoint_auth_method:
 //     ClientSecretPost only matches a client configured for client_secret_post, ClientSecretBasic
 //     only matches one configured for client_secret_basic. The admin client here is provisioned
 //     as client_secret_basic, so sending the secret in the POST body instead of the Authorization
-//     header fails with a misleading invalid_client — learned the hard way, per the task brief.
-//     This client always sends HTTP Basic.
+//     header fails with invalid_client. This client always sends HTTP Basic.
 //   - crates/handlers/src/admin/mod.rs — the whole admin API is mounted at "/api/admin/v1".
 //   - crates/handlers/src/admin/call_context.rs — every admin endpoint requires a bearer token
 //     whose session scope contains "urn:mas:admin".
@@ -30,11 +29,6 @@
 //     just the previous page's last resource ID); count=false skips MAS's incidental COUNT(*)
 //     query since this client never needs a total; a response's "links.next" key is present iff
 //     there is a next page.
-//
-// Flagged for the live spike: expires_in is trusted as returned rather than hardcoded to any
-// particular value (the task brief says ~300s); the exact number of admin-scoped users/emails in
-// prod, and whether MAS's default page size assumption holds up, are unverified outside this
-// package's tests against a fake server.
 package masadmin
 
 import (
@@ -78,8 +72,8 @@ type Client struct {
 	tokenExpiry time.Time
 }
 
-// NewClient targets the given MAS base URL (e.g. http://mas:8080, no /auth prefix — same
-// convention as internal/masreg.NewClient) with the given admin
+// NewClient targets the MAS admin origin (e.g. http://mas:8081, no /auth prefix) with the given
+// admin
 // client_credentials client_id/client_secret.
 func NewClient(baseURL, clientID, clientSecret string) *Client {
 	return &Client{
@@ -110,9 +104,8 @@ type UserEmail struct {
 }
 
 // token returns a valid bearer token, fetching a fresh one via client_credentials if the cached
-// one is missing or within tokenSafetyMargin of expiry. Never cached indefinitely — the ~300s TTL
-// means a long-running ticker will refetch several times an hour, and RUN_ONCE always fetches
-// fresh since there's nothing yet to cache.
+// one is missing or within tokenSafetyMargin of expiry. A one-shot sweep normally fetches one
+// token; the cache also keeps retries within that sweep efficient.
 func (c *Client) token(ctx context.Context) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

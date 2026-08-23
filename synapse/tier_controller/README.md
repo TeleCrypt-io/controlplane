@@ -24,7 +24,7 @@ room.
 
 ## Denial behavior
 
-Restricted uploads are rejected through Synapse's boolean media callback. Synapse 1.155.0 supplies
+Restricted uploads are rejected through Synapse's boolean media callback. Synapse 1.159.0 supplies
 the client-facing upload error itself, so that path cannot include the verification guidance.
 Restricted room creation and encryption-event callbacks return `Codes.FORBIDDEN` with the guidance
 from the module; Synapse exposes it to clients as the error message. Encrypted `initial_state` in a
@@ -44,7 +44,7 @@ modules:
 
 ## Tests
 
-The GitHub workflow builds the wheel, installs it with Synapse `1.155.0` into a clean virtual
+The GitHub workflow builds the wheel, installs it with Synapse `1.159.0` into a clean virtual
 environment, and runs the fake-`module_api` unit suite. A tag build fails unless the wheel version
 exactly equals the Controlplane release tag, then publishes the wheel and checksum together on that
 GitHub Release.

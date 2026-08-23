@@ -15,12 +15,11 @@ import (
 // It negotiates STARTTLS explicitly and fails closed if the server does not advertise STARTTLS
 // or if the TLS handshake fails — it never authenticates or sends in plaintext. Authentication
 // uses smtp.PlainAuth only after a successful STARTTLS upgrade. The request context is applied
-// as a connection deadline via net.DialTimeout; SMTPTimeoutSec (default 30) caps the overall
-// dial timeout. Certificate verification requires a working CA trust store in the runtime
+// as a connection deadline via net.DialTimeout; a fixed 30-second timeout caps the overall dial
+// timeout. Certificate verification requires a working CA trust store in the runtime
 // environment — see the Dockerfile's ca-certificates note (scratch has none by default).
 type SMTPMailer struct {
 	Host, Port, Username, Password, From string
-	TimeoutSec                            int
 	// tlsConfig, when non-nil, overrides the default TLS config used for STARTTLS.
 	// Production code leaves this nil; tests use it to skip certificate verification
 	// for self-signed test certificates.
@@ -28,10 +27,7 @@ type SMTPMailer struct {
 }
 
 func (m *SMTPMailer) Send(ctx context.Context, to, subject, body string) error {
-	timeout := time.Duration(m.TimeoutSec) * time.Second
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
+	const timeout = 30 * time.Second
 	addr := net.JoinHostPort(m.Host, m.Port)
 
 	dialer := &net.Dialer{Timeout: timeout}
