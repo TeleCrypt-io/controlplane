@@ -65,14 +65,14 @@ func TestProvisionAgent_FailsClosed(t *testing.T) {
 	}
 }
 
-// fakeMASServer models the complete supported public sequence. Its catch-all records any old
-// compatibility-login or admin route, proving ProvisionAgent does not retain either path.
+// fakeMASServer models the complete supported public sequence. Its catch-all records any
+// unsupported password-login or admin route, proving ProvisionAgent does not retain either path.
 type fakeMASServer struct {
 	csrf             string
 	users            map[string]string
 	registeredClient bool
 	approved         bool
-	legacyCalls      int
+	fallbackCalls    int
 	deviceID         string
 }
 
@@ -91,8 +91,9 @@ func (f *fakeMASServer) server() *httptest.Server {
 	mux.HandleFunc("POST /oauth2/registration", f.clientRegister)
 	mux.HandleFunc("POST /oauth2/device", f.deviceAuthorization)
 	mux.HandleFunc("GET /link", f.linkGet)
-	mux.HandleFunc("GET /device/approve", f.deviceGet)
-	mux.HandleFunc("POST /device/approve", f.devicePost)
+	mux.HandleFunc("POST /link", f.linkPost)
+	mux.HandleFunc("GET /device/device-123", f.deviceGet)
+	mux.HandleFunc("POST /device/device-123", f.devicePost)
 	mux.HandleFunc("POST /oauth2/token", f.tokenPost)
 	mux.HandleFunc("GET /_matrix/client/v3/account/whoami", f.whoami)
 	mux.HandleFunc("/", f.other)
@@ -170,11 +171,14 @@ func (f *fakeMASServer) linkGet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not authenticated", http.StatusUnauthorized)
 		return
 	}
-	if r.FormValue("code") != "ABCD-EFGH" {
+	f.form(w)
+}
+func (f *fakeMASServer) linkPost(w http.ResponseWriter, r *http.Request) {
+	if !f.authenticated(r) || !f.validCSRF(r) || r.FormValue("code") != "ABCD-EFGH" {
 		http.Error(w, "bad link", http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, "/device/approve", http.StatusSeeOther)
+	http.Redirect(w, r, "/device/device-123", http.StatusSeeOther)
 }
 func (f *fakeMASServer) deviceGet(w http.ResponseWriter, r *http.Request) {
 	if !f.authenticated(r) {
@@ -213,7 +217,7 @@ func (f *fakeMASServer) whoami(w http.ResponseWriter, r *http.Request) {
 }
 func (f *fakeMASServer) other(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(r.URL.Path, "/login") || strings.Contains(r.URL.Path, "/api/admin/") {
-		f.legacyCalls++
+		f.fallbackCalls++
 	}
 	w.Write([]byte("done"))
 }
@@ -240,22 +244,25 @@ func TestProvisionAgent_FullPublicRegistrationAndDeviceOAuth(t *testing.T) {
 	if !fake.approved {
 		t.Fatal("MAS device consent was not completed through the registration session")
 	}
-	if fake.legacyCalls != 0 {
-		t.Fatalf("compatibility login/admin calls = %d, want 0", fake.legacyCalls)
+	if fake.fallbackCalls != 0 {
+		t.Fatalf("password-login/admin calls = %d, want 0", fake.fallbackCalls)
 	}
 }
 
-func TestProvisionerRejectsInvalidHomeserver(t *testing.T) {
-	if _, err := NewProvisioner(&fakeMASReg{}, "not a URL", ""); err == nil {
-		t.Fatal("accepted invalid homeserver")
+func TestProvisionerValidatesBackendHostAndServerName(t *testing.T) {
+	if _, err := NewProvisioner(&fakeMASReg{}, "not a URL", "telecrypt.io"); err == nil {
+		t.Fatal("accepted invalid backend URL")
 	}
-	if _, err := NewProvisioner(&fakeMASReg{}, "https://backend.example", ""); err != nil {
-		t.Fatalf("valid homeserver: %v", err)
+	if _, err := NewProvisioner(&fakeMASReg{}, "https://backend.example", ""); err == nil {
+		t.Fatal("accepted missing server name")
+	}
+	if _, err := NewProvisioner(&fakeMASReg{}, "http://127.0.0.1:9009", "telecrypt.io"); err != nil {
+		t.Fatalf("valid loopback backend URL: %v", err)
 	}
 }
 
 func TestFullFlowRejectsOAuthFailure(t *testing.T) {
-	// A device authorization failure is fatal; there is no compatibility-login fallback.
+	// A device authorization failure is fatal; there is no password-login fallback.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/register" {
 			http.Redirect(w, r, "/register/password", http.StatusSeeOther)
@@ -287,7 +294,7 @@ func TestFullFlowRejectsOAuthFailure(t *testing.T) {
 		w.Write([]byte("done"))
 	}))
 	defer srv.Close()
-	_, err := masreg.NewClient(srv.URL).RegisterAndAuthorizeDevice(context.Background(), "agent", "password", "DEVICE", srv.URL)
+	_, err := masreg.NewClient(srv.URL).RegisterAndAuthorizeDevice(context.Background(), "agent", "password", "DEVICE-12345", srv.URL)
 	if err == nil || !strings.Contains(err.Error(), "register public OAuth client") {
 		t.Fatalf("error = %v, want DCR failure", err)
 	}

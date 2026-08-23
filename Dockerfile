@@ -28,6 +28,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/steward ./cmd/stew
 FROM scratch AS controlplane
 LABEL org.opencontainers.image.source="https://github.com/TeleCrypt-io/controlplane"
 LABEL org.opencontainers.image.licenses="BUSL-1.1"
+LABEL io.telecrypt.config-contract="1"
 COPY --from=controlplane-build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=controlplane-build /out/redpill /redpill
 COPY --from=controlplane-build /out/janitor /janitor

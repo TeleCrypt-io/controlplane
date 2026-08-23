@@ -18,7 +18,7 @@ import (
 
 // --- httptest fake MAS admin server ---------------------------------------------------------
 //
-// Reproduces just enough of MAS 1.16.0's admin API (token, paginated users, paginated
+// Reproduces just enough of MAS 1.23.0's admin API (token, paginated users, paginated
 // user-emails, lock) for Sweeper to run against a real *masadmin.Client, per the task's test
 // requirements. See internal/masadmin/client_test.go for the more thorough per-endpoint tests of
 // the client itself; this fake is deliberately simpler (no real cursor-boundary edge cases) since
@@ -421,7 +421,7 @@ func TestSweep_LocksOnlyStaleUnclaimedEmaillessAccounts(t *testing.T) {
 	mas.addUser("u-has-email", "hasemail", old)             // human awaiting review -> skip
 	mas.emails["u-has-email"] = "human@example.com"
 	mas.addUser("u-verified", "verifieduser", old)                         // verified -> skip
-	mas.addUser("u-excluded", "excludedbot", old)                          // defensive exclusion -> skip
+	mas.addUser("u-excluded", "cashier_admin", old)                        // Cashier admin -> skip
 	mas.addUser("u-young", "younguser", young)                             // not stale yet -> skip
 	alreadyLocked := mas.addUser("u-already-locked", "alreadylocked", old) // already locked -> skip
 	lockedAt := old.Add(time.Minute)
@@ -433,11 +433,7 @@ func TestSweep_LocksOnlyStaleUnclaimedEmaillessAccounts(t *testing.T) {
 	store := newFakeStore()
 	store.verified["@verifieduser:"+serverName] = true
 
-	cfg := Config{
-		LockAfterHours: 48,
-		ExcludeMXIDs:   map[string]bool{"@excludedbot:" + serverName: true},
-		OwnerEmail:     "", // digest not under test here
-	}
+	cfg := Config{OwnerEmail: ""} // digest not under test here
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -459,7 +455,7 @@ func TestSweep_PreLockRecheckProtectsNewGrant(t *testing.T) {
 	// committed after that snapshot but before janitor reaches the candidate.
 	store.queueVerification(mxid, verificationResult{verified: true})
 
-	cfg := Config{LockAfterHours: 48}
+	cfg := Config{}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -477,7 +473,7 @@ func TestSweep_PreLockRecheckErrorRefusesToLock(t *testing.T) {
 	store := newFakeStore()
 	store.queueVerification("@dbuncertain:"+serverName, verificationResult{err: errors.New("database unavailable")})
 
-	cfg := Config{LockAfterHours: 48}
+	cfg := Config{}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -495,7 +491,7 @@ func TestSweep_PreLockIntentFailureRefusesToLock(t *testing.T) {
 	store := newFakeStore()
 	store.beginErr = errors.New("database unavailable")
 
-	cfg := Config{LockAfterHours: 48}
+	cfg := Config{}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -516,7 +512,7 @@ func TestSweep_UnlocksVerifiedAccountFoundLocked(t *testing.T) {
 	store.setVerified("@entitledlocked:"+serverName, true)
 	store.setJanitorLocked("u-entitled-locked", lockedAt)
 
-	cfg := Config{LockAfterHours: 48}
+	cfg := Config{}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -543,7 +539,7 @@ func TestSweep_DoesNotReverseExternalLockOnVerifiedAccount(t *testing.T) {
 	store.setVerified("@externallylocked:"+serverName, true)
 	store.setJanitorLocked("u-externally-locked", lockedAt.Add(-time.Hour))
 
-	cfg := Config{LockAfterHours: 48}
+	cfg := Config{}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -570,7 +566,7 @@ func TestSweep_DoesNotAdoptExternalLockAfterAbandonedIntent(t *testing.T) {
 	store.setVerified("@abandonedintent:"+serverName, true)
 	store.setPendingLock("u-abandoned-intent", lockedAt.Add(-2*pendingLockMaxCommitDelay))
 
-	cfg := Config{LockAfterHours: 48}
+	cfg := Config{}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -595,7 +591,7 @@ func TestSweep_LeavesUnverifiedJanitorAccountLocked(t *testing.T) {
 
 	store := newFakeStore()
 	store.setJanitorLocked("u-unverified-locked", lockedAt)
-	cfg := Config{LockAfterHours: 48}
+	cfg := Config{}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -621,7 +617,7 @@ func TestSweep_DoesNotUnlockDeactivatedVerifiedAccount(t *testing.T) {
 	store.setVerified("@deactivatedentitled:"+serverName, true)
 	store.setJanitorLocked("u-deactivated-entitled", lockedAt)
 
-	cfg := Config{LockAfterHours: 48}
+	cfg := Config{}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -658,7 +654,7 @@ func TestSweep_CompensatesWhenGrantAppearsDuringLock(t *testing.T) {
 	mxid := "@racedgrant:" + serverName
 	mas.afterLock = func() { store.setVerified(mxid, true) }
 
-	cfg := Config{LockAfterHours: 48}
+	cfg := Config{}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -686,7 +682,7 @@ func TestSweep_PostLockVerificationErrorCompensates(t *testing.T) {
 		verificationResult{err: errors.New("database unavailable")},
 	)
 
-	cfg := Config{LockAfterHours: 48}
+	cfg := Config{}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -710,7 +706,7 @@ func TestSweep_ConfirmationFailureCompensatesImmediately(t *testing.T) {
 	store := newFakeStore()
 	store.confirmErr = errors.New("database unavailable")
 
-	cfg := Config{LockAfterHours: 48}
+	cfg := Config{}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -739,7 +735,7 @@ func TestSweep_FailedCompensationConvergesOnNextSweep(t *testing.T) {
 	mxid := "@retryunlock:" + serverName
 	mas.afterLock = func() { store.setVerified(mxid, true) }
 
-	cfg := Config{LockAfterHours: 48}
+	cfg := Config{}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -769,7 +765,7 @@ func TestSweep_AmbiguousLockResponseNeverAuthorizesUnlock(t *testing.T) {
 	mxid := "@ambiguouslock:" + serverName
 	mas.afterLock = func() { store.setVerified(mxid, true) }
 
-	cfg := Config{LockAfterHours: 48}
+	cfg := Config{}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -803,7 +799,7 @@ func TestSweep_DryRunLocksNothing(t *testing.T) {
 	mas.addUser("u-stale-unclaimed", "staleunclaimed", time.Now().Add(-72*time.Hour))
 
 	store := newFakeStore()
-	cfg := Config{LockAfterHours: 48, DryRun: true}
+	cfg := Config{DryRun: true}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -820,7 +816,7 @@ func TestSweep_DryRunDoesNotDeleteStaleProvenance(t *testing.T) {
 
 	store := newFakeStore()
 	store.setJanitorLocked("u-dry-run-stale-record", time.Now().Add(-time.Hour))
-	cfg := Config{LockAfterHours: 48, DryRun: true}
+	cfg := Config{DryRun: true}
 	sweeper, _ := newSweeperForTest(t, mas, store, LogMailer{}, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -857,7 +853,7 @@ func TestSweep_Digest_SendsOnlyAccountsAfterHighWaterMarkAndAdvancesIt(t *testin
 	store.highWater["digest_high_water"] = base.Add(30 * time.Minute) // u-old-reported already covered
 
 	mailer := &fakeMailer{}
-	cfg := Config{LockAfterHours: 48, OwnerEmail: "owner@telecrypt.io"}
+	cfg := Config{OwnerEmail: "owner@telecrypt.io"}
 	sweeper, _ := newSweeperForTest(t, mas, store, mailer, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -900,7 +896,7 @@ func TestSweep_Digest_FailedSendDoesNotAdvanceMark(t *testing.T) {
 
 	store := newFakeStore()
 	mailer := &fakeMailer{sendErr: errors.New("smtp: connection refused")}
-	cfg := Config{LockAfterHours: 48, OwnerEmail: "owner@telecrypt.io"}
+	cfg := Config{OwnerEmail: "owner@telecrypt.io"}
 	sweeper, _ := newSweeperForTest(t, mas, store, mailer, cfg)
 
 	// Sweep itself doesn't return an error for a digest failure -- it's independent of the lock
@@ -922,7 +918,7 @@ func TestSweep_Digest_DryRunSendsNothingAndDoesNotAdvanceMark(t *testing.T) {
 
 	store := newFakeStore()
 	mailer := &fakeMailer{}
-	cfg := Config{LockAfterHours: 48, OwnerEmail: "owner@telecrypt.io", DryRun: true}
+	cfg := Config{OwnerEmail: "owner@telecrypt.io", DryRun: true}
 	sweeper, _ := newSweeperForTest(t, mas, store, mailer, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {
@@ -944,7 +940,7 @@ func TestSweep_Digest_NoOwnerEmailSkipsDigestButStillLocks(t *testing.T) {
 
 	store := newFakeStore()
 	mailer := &fakeMailer{}
-	cfg := Config{LockAfterHours: 48, OwnerEmail: ""}
+	cfg := Config{OwnerEmail: ""}
 	sweeper, _ := newSweeperForTest(t, mas, store, mailer, cfg)
 
 	if err := sweeper.Sweep(context.Background()); err != nil {

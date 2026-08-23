@@ -17,14 +17,14 @@ import (
 // Config is Plan's browser-facing configuration. It deliberately excludes every Dodo,
 // Synapse-admin, and database setting.
 type Config struct {
-	BillingEnv      string
-	ServerName      string
-	Homeserver      string
-	MASBaseURL      string
-	PlanPublicURL   string
-	MASClientID     string
-	MASClientSecret string
-	SessionKey      string
+	BillingEnv       string
+	ServerName       string
+	BackendPublicURL string
+	MASInternalURL   string
+	PlanPublicURL    string
+	MASClientID      string
+	MASClientSecret  string
+	SessionKey       string
 }
 
 var errCashierUnavailable = errors.New("cashier client is not configured")
@@ -46,7 +46,7 @@ type Server struct {
 
 func NewServer(cfg Config, cashier CashierClient) *Server {
 	s := &Server{cfg: cfg, cashier: cashier, session: NewSession(cfg.SessionKey), mux: http.NewServeMux()}
-	s.oidc = NewOIDCClient(cfg.Homeserver, cfg.MASBaseURL, cfg.MASClientID, cfg.MASClientSecret, strings.TrimRight(cfg.PlanPublicURL, "/")+"/callback")
+	s.oidc = NewOIDCClient(cfg.BackendPublicURL, cfg.MASInternalURL, cfg.MASClientID, cfg.MASClientSecret, strings.TrimRight(cfg.PlanPublicURL, "/")+"/callback")
 	s.mux.HandleFunc("GET /plan", s.handlePlan)
 	s.mux.HandleFunc("GET /plan/assets/logo-mark.png", s.handlePlanLogo)
 	s.mux.HandleFunc("GET /plan/assets/product.css", s.handlePlanProductCSS)
@@ -55,9 +55,6 @@ func NewServer(cfg Config, cashier CashierClient) *Server {
 	s.mux.HandleFunc("GET /plan/login", s.handleLogin)
 	s.mux.HandleFunc("GET /plan/callback", s.handleCallback)
 	s.registerPlanCommands("/api/plan", s.handleCreatePlan)
-	// Existing Plan pages may have the former browser API cached. Keep those routes and response
-	// shape as compatibility aliases while the current UI and public concept use /api/plan.
-	s.registerPlanCommands("/api/team", s.handleCreateTeamCompatibility)
 	s.mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	return s
 }
@@ -70,8 +67,6 @@ func (s *Server) registerPlanCommands(prefix string, create http.HandlerFunc) {
 	s.mux.Handle("POST "+prefix+"/portal", s.requireBrowserSession(http.HandlerFunc(s.handlePortal)))
 	s.mux.Handle("POST "+prefix+"/seat-count", s.requireBrowserSession(http.HandlerFunc(s.handleChangeSeatCount)))
 	s.mux.Handle("POST "+prefix+"/seat-count/reconcile", s.requireBrowserSession(http.HandlerFunc(s.handleReconcileSeatCount)))
-	// Compatibility route for a cached legacy Plan iframe. It has the same authenticated command.
-	s.mux.Handle("POST "+prefix+"/downgrade-request", s.requireBrowserSession(http.HandlerFunc(s.handleChangeSeatCount)))
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -126,7 +121,7 @@ func (s *Server) client() (CashierClient, error) {
 func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	mxid, err := s.session.MXID(r)
-	data := pageData{LoggedIn: err == nil, TestMode: s.cfg.BillingEnv == "test", MXID: mxid, RegisterURL: strings.TrimRight(s.cfg.Homeserver, "/") + "/auth/register", SeatPrice: planSeatPrice}
+	data := pageData{LoggedIn: err == nil, TestMode: s.cfg.BillingEnv == "test", MXID: mxid, RegisterURL: strings.TrimRight(s.cfg.BackendPublicURL, "/") + "/auth/register", SeatPrice: planSeatPrice}
 	if data.LoggedIn {
 		client, err := s.client()
 		if err != nil {
@@ -249,16 +244,6 @@ func commandUnavailable(w http.ResponseWriter) {
 }
 
 func (s *Server) handleCreatePlan(w http.ResponseWriter, r *http.Request) {
-	s.createPlan(w, r, "plan_id", "set up plan failed")
-}
-
-// handleCreateTeamCompatibility preserves the old browser API response for already-cached Plan
-// pages. New code must use handleCreatePlan and the /api/plan routes.
-func (s *Server) handleCreateTeamCompatibility(w http.ResponseWriter, r *http.Request) {
-	s.createPlan(w, r, "team_id", "create team failed")
-}
-
-func (s *Server) createPlan(w http.ResponseWriter, r *http.Request, responseKey, failureMessage string) {
 	client, p, id, ok := s.command(r)
 	if !ok {
 		commandUnavailable(w)
@@ -266,10 +251,10 @@ func (s *Server) createPlan(w http.ResponseWriter, r *http.Request, responseKey,
 	}
 	plan, err := client.CreatePlan(r.Context(), p, id)
 	if err != nil {
-		http.Error(w, failureMessage, http.StatusBadGateway)
+		http.Error(w, "set up plan failed", http.StatusBadGateway)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{responseKey: plan.ID})
+	writeJSON(w, http.StatusCreated, map[string]string{"plan_id": plan.ID})
 }
 
 type seatRequest struct {

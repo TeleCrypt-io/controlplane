@@ -20,9 +20,9 @@ type OIDCClient struct {
 	httpClient                                                               *http.Client
 }
 
-func NewOIDCClient(homeserver, masBaseURL, clientID, clientSecret, redirectURI string) *OIDCClient {
-	homeserver, masBaseURL = strings.TrimRight(homeserver, "/"), strings.TrimRight(masBaseURL, "/")
-	return &OIDCClient{authorizeURL: homeserver + "/auth/authorize", tokenURL: masBaseURL + "/oauth2/token", userinfoURL: masBaseURL + "/oauth2/userinfo", clientID: clientID, clientSecret: clientSecret, redirectURI: redirectURI, httpClient: &http.Client{Timeout: 10 * time.Second}}
+func NewOIDCClient(backendPublicURL, masInternalURL, clientID, clientSecret, redirectURI string) *OIDCClient {
+	backendPublicURL, masInternalURL = strings.TrimRight(backendPublicURL, "/"), strings.TrimRight(masInternalURL, "/")
+	return &OIDCClient{authorizeURL: backendPublicURL + "/auth/authorize", tokenURL: masInternalURL + "/oauth2/token", userinfoURL: masInternalURL + "/oauth2/userinfo", clientID: clientID, clientSecret: clientSecret, redirectURI: redirectURI, httpClient: &http.Client{Timeout: 10 * time.Second}}
 }
 
 func NewPKCEPair() (string, string, error) {

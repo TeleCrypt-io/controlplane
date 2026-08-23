@@ -1,9 +1,15 @@
 """Unit tests for tier_controller using a fake module_api — no live Synapse required.
 
-Run: docker build --target synapse-tier-controller --tag tier-controller:test .
-Then: docker run --rm --user 0:0 --entrypoint sh tier-controller:test -c
-'python -m pip install pytest==9.0.2 pytest-asyncio==1.4.0 && cd /modules/tier_controller &&
-python -m pytest -v test_tier_controller.py'
+From the repository root, run these commands in an isolated environment::
+
+    python3 -m venv /tmp/tier-controller-venv
+    /tmp/tier-controller-venv/bin/python -m pip install --disable-pip-version-check \
+        matrix-synapse==1.159.0 pytest==9.0.2 pytest-asyncio==1.4.0
+    PYTHONPATH=synapse/tier_controller /tmp/tier-controller-venv/bin/python -m pytest -q \
+        synapse/tier_controller/test_tier_controller.py
+
+GitHub Actions alone builds and verifies release wheels; local testing runs directly from this
+source tree.
 """
 from types import SimpleNamespace
 

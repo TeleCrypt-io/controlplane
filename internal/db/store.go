@@ -1,4 +1,4 @@
-// Package db stores Janitor's manual verification and maintenance state.
+// Package db stores Janitor's maintenance state and its read-only view of Cashier entitlements.
 package db
 
 import (
@@ -16,48 +16,47 @@ type Store struct{ pool *pgxpool.Pool }
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
 // BindBillingEnvironment verifies the guard written exclusively by private Cashier.
-func (s *Store) BindBillingEnvironment(ctx context.Context, billingEnv, matrixDeployment string) error {
-	var boundEnv, boundDeployment string
-	err := s.pool.QueryRow(ctx, `SELECT billing_env, matrix_deployment_id FROM cashier.billing_environment_guard WHERE singleton = TRUE`).Scan(&boundEnv, &boundDeployment)
+func (s *Store) BindBillingEnvironment(ctx context.Context, billingEnv, serverName string) error {
+	var boundEnv, boundServerName string
+	err := s.pool.QueryRow(ctx, `SELECT billing_env, server_name FROM cashier.billing_environment_guard WHERE singleton = TRUE`).Scan(&boundEnv, &boundServerName)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("private cashier has not bound the billing environment")
 	}
 	if err != nil {
 		return fmt.Errorf("read private cashier billing environment binding: %w", err)
 	}
-	if boundEnv != billingEnv || boundDeployment != matrixDeployment {
-		return fmt.Errorf("billing database is bound to environment %q and deployment %q, not %q and %q", boundEnv, boundDeployment, billingEnv, matrixDeployment)
+	if boundEnv != billingEnv || boundServerName != serverName {
+		return fmt.Errorf("billing database is bound to environment %q and server %q, not %q and %q", boundEnv, boundServerName, billingEnv, serverName)
 	}
 	return nil
 }
 
-// VerifiedMXIDs combines manual grants with Cashier-owned billing grants without allowing
-// Janitor to modify either source.
+// VerifiedMXIDs returns Cashier-owned billing grants without allowing Janitor to modify them.
 func (s *Store) VerifiedMXIDs(ctx context.Context) (map[string]bool, error) {
-	rows, err := s.pool.Query(ctx, `SELECT mxid FROM verified UNION SELECT mxid FROM cashier.billing_verification_grants`)
+	rows, err := s.pool.Query(ctx, `SELECT mxid FROM cashier.billing_verification_grants`)
 	if err != nil {
-		return nil, fmt.Errorf("query verified: %w", err)
+		return nil, fmt.Errorf("query Cashier billing grants: %w", err)
 	}
 	defer rows.Close()
 	set := make(map[string]bool)
 	for rows.Next() {
 		var mxid string
 		if err := rows.Scan(&mxid); err != nil {
-			return nil, fmt.Errorf("scan verified row: %w", err)
+			return nil, fmt.Errorf("scan Cashier billing grant: %w", err)
 		}
 		set[mxid] = true
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate verified rows: %w", err)
+		return nil, fmt.Errorf("iterate Cashier billing grants: %w", err)
 	}
 	return set, nil
 }
 
 func (s *Store) IsVerified(ctx context.Context, mxid string) (bool, error) {
 	var exists bool
-	err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM verified WHERE mxid = $1 UNION ALL SELECT 1 FROM cashier.billing_verification_grants WHERE mxid = $1)`, mxid).Scan(&exists)
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM cashier.billing_verification_grants WHERE mxid = $1)`, mxid).Scan(&exists)
 	if err != nil {
-		return false, fmt.Errorf("query verified %s: %w", mxid, err)
+		return false, fmt.Errorf("query Cashier billing grant %s: %w", mxid, err)
 	}
 	return exists, nil
 }

@@ -7,7 +7,7 @@
 # restricted; only an explicit 'verified' user_type lifts the restriction. There is no second
 # tier — 'verified' is uncapped, everything else shares one cap.
 #
-# Callback signatures + return-value handling verified against Synapse 1.155.0 package source:
+# Callback signatures + return-value handling verified against the exact Synapse 1.159.0 package:
 #   - media_repository_callbacks.is_user_allowed_to_upload_media_of_size(user_id, size) -> bool.
 #   - spamchecker_callbacks.user_may_create_room(user_id, room_config) accepts NOT_SPAM, Codes,
 #     (Codes, dict), or bool.

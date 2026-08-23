@@ -20,7 +20,7 @@ func main() {
 		slog.Error("config", "error", err)
 		os.Exit(1)
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLogLevel(cfg.LogLevel)})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	cashierClient, err := steward.NewHTTPCashierClient(cfg.CashierInternalURL, cfg.StewardAssertionPrivateKey, nil)
 	if err != nil {
@@ -29,16 +29,16 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Addr: cfg.ListenAddr,
+		Addr: stewardListenAddr,
 		Handler: steward.NewServer(steward.Config{
-			BillingEnv:      cfg.BillingEnv,
-			ServerName:      cfg.ServerName,
-			Homeserver:      cfg.Homeserver,
-			MASBaseURL:      cfg.MASBaseURL,
-			PlanPublicURL:   cfg.PlanPublicURL,
-			MASClientID:     cfg.MASClientID,
-			MASClientSecret: cfg.MASClientSecret,
-			SessionKey:      cfg.SessionKey,
+			BillingEnv:       cfg.BillingEnv,
+			ServerName:       cfg.ServerName,
+			BackendPublicURL: cfg.BackendPublicURL,
+			MASInternalURL:   cfg.MASInternalURL,
+			PlanPublicURL:    cfg.PlanPublicURL,
+			MASClientID:      cfg.MASClientID,
+			MASClientSecret:  cfg.MASClientSecret,
+			SessionKey:       cfg.SessionKey,
 		}, cashierClient),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -47,7 +47,7 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 	go func() {
-		slog.Info("steward listening", "addr", cfg.ListenAddr)
+		slog.Info("steward listening", "addr", stewardListenAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("server", "error", err)
 			os.Exit(1)
@@ -65,15 +65,4 @@ func main() {
 	}
 }
 
-func parseLogLevel(s string) slog.Level {
-	switch s {
-	case "debug":
-		return slog.LevelDebug
-	case "warn":
-		return slog.LevelWarn
-	case "error":
-		return slog.LevelError
-	default:
-		return slog.LevelInfo
-	}
-}
+const stewardListenAddr = ":9012"

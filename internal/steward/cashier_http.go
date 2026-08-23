@@ -47,19 +47,16 @@ func NewHTTPCashierClient(baseURL, encodedPrivateKey string, httpClient *http.Cl
 }
 
 func (c *HTTPCashierClient) PlanState(ctx context.Context, principal Principal) (PlanState, error) {
-	// Cashier's private response retains its historical `team` key. Translate that wire-only
-	// compatibility shape at the transport boundary so Steward's owned model remains plan-native.
 	var response struct {
-		LegacyTeam *Plan  `json:"team"`
-		Seats      []Seat `json:"seats"`
+		Plan  *Plan  `json:"plan"`
+		Seats []Seat `json:"seats"`
 	}
 	err := c.do(ctx, principal, http.MethodGet, "/internal/v1/plan-state", uuid.NewString(), nil, &response)
-	return PlanState{Plan: response.LegacyTeam, Seats: response.Seats}, err
+	return PlanState{Plan: response.Plan, Seats: response.Seats}, err
 }
 
-// CreatePlan keeps Cashier's historical /teams path because Cashier is a separate, private
-// service that is not present in this repository. The public Plan product does not expose that
-// implementation term.
+// CreatePlan invokes Cashier's private plan-creation endpoint. The private team storage model is
+// not exposed through the public Plan API.
 func (c *HTTPCashierClient) CreatePlan(ctx context.Context, p Principal, requestID string) (Plan, error) {
 	var plan Plan
 	err := c.do(ctx, p, http.MethodPost, "/internal/v1/teams", requestID, []byte(`{}`), &plan)

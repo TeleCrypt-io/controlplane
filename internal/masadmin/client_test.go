@@ -24,7 +24,7 @@ type fakeUser struct {
 	admin     bool
 }
 
-// fakeMASAdmin reproduces just enough of MAS 1.16.0's admin API — POST /oauth2/token
+// fakeMASAdmin reproduces just enough of MAS 1.23.0's admin API — POST /oauth2/token
 // (client_credentials, Basic-auth-only), GET /api/admin/v1/users and /user-emails (cursor
 // pagination via page[first]/page[after]), and POST /api/admin/v1/users/{id}/{lock,unlock} — to
 // exercise Client's HTTP mechanics end-to-end. See client.go's package doc for the MAS source

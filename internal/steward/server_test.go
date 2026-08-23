@@ -2,6 +2,10 @@ package steward
 
 import (
 	"context"
+	"crypto/sha256"
+	_ "embed"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -9,6 +13,11 @@ import (
 	"strings"
 	"testing"
 )
+
+// sharedUIProvenanceJSON is the release record for the vendored shared stylesheet.
+//
+//go:embed assets/SHARED_UI_PROVENANCE.json
+var sharedUIProvenanceJSON []byte
 
 type fakeCashier struct {
 	principal Principal
@@ -46,13 +55,13 @@ func (f *fakeCashier) ReconcileSeatCount(context.Context, Principal, string) err
 
 func testServer() *Server {
 	return NewServer(Config{
-		ServerName:      "telecrypt.test",
-		Homeserver:      "https://backend.test.telecrypt.io",
-		MASBaseURL:      "http://mas:8080",
-		PlanPublicURL:   "https://backend.test.telecrypt.io/plan",
-		MASClientID:     "plan",
-		MASClientSecret: "test-secret",
-		SessionKey:      "test-session-key",
+		ServerName:       "telecrypt.test",
+		BackendPublicURL: "https://backend.test.telecrypt.io",
+		MASInternalURL:   "http://mas:8080",
+		PlanPublicURL:    "https://backend.test.telecrypt.io/plan",
+		MASClientID:      "plan",
+		MASClientSecret:  "test-secret",
+		SessionKey:       "test-session-key",
 	}, nil)
 }
 
@@ -180,6 +189,30 @@ func TestPlanAssetsAreLocalAndCarryCommandContract(t *testing.T) {
 	}
 }
 
+func TestPlanSharedUIAssetMatchesProvenance(t *testing.T) {
+	var provenance struct {
+		SourceFile string `json:"source_file"`
+		SHA256     string `json:"sha256"`
+	}
+	if err := json.Unmarshal(sharedUIProvenanceJSON, &provenance); err != nil {
+		t.Fatalf("decode shared UI provenance: %v", err)
+	}
+	if provenance.SourceFile != "src/product.css" {
+		t.Fatalf("shared UI provenance source_file = %q, want src/product.css", provenance.SourceFile)
+	}
+	if len(provenance.SHA256) != sha256.Size*2 {
+		t.Fatalf("shared UI provenance sha256 = %q, want a SHA-256 hex digest", provenance.SHA256)
+	}
+	if _, err := hex.DecodeString(provenance.SHA256); err != nil {
+		t.Fatalf("shared UI provenance sha256 = %q is not hexadecimal: %v", provenance.SHA256, err)
+	}
+
+	actual := sha256.Sum256(planProductCSS)
+	if got := hex.EncodeToString(actual[:]); got != provenance.SHA256 {
+		t.Fatalf("vendored product.css sha256 = %q, want provenance %q", got, provenance.SHA256)
+	}
+}
+
 func TestPlanTemplateHasNoInlineScriptHandlers(t *testing.T) {
 	for _, forbidden := range []string{"onclick=", "onsubmit=", "javascript:"} {
 		if strings.Contains(strings.ToLower(planHTML), forbidden) {
@@ -283,15 +316,6 @@ func TestPlanCommandsRequireAuthenticatedBrowserSession(t *testing.T) {
 		{http.MethodPost, "/api/plan/portal"},
 		{http.MethodPost, "/api/plan/seat-count"},
 		{http.MethodPost, "/api/plan/seat-count/reconcile"},
-		{http.MethodPost, "/api/plan/downgrade-request"},
-		{http.MethodPost, "/api/team"},
-		{http.MethodPost, "/api/team/seats"},
-		{http.MethodDelete, "/api/team/seats/@member:telecrypt.test"},
-		{http.MethodPost, "/api/team/checkout"},
-		{http.MethodPost, "/api/team/portal"},
-		{http.MethodPost, "/api/team/seat-count"},
-		{http.MethodPost, "/api/team/seat-count/reconcile"},
-		{http.MethodPost, "/api/team/downgrade-request"},
 	} {
 		srv := testServer()
 		req := httptest.NewRequest(command.method, command.path, nil)
@@ -302,6 +326,16 @@ func TestPlanCommandsRequireAuthenticatedBrowserSession(t *testing.T) {
 
 		if got, want := rec.Code, http.StatusUnauthorized; got != want {
 			t.Errorf("unauthenticated %s %s status = %d, want %d", command.method, command.path, got, want)
+		}
+	}
+}
+
+func TestRetiredPlanRoutesAreNotExposed(t *testing.T) {
+	for _, path := range []string{"/api/team", "/api/team/seats", "/api/plan/downgrade-request"} {
+		rec := httptest.NewRecorder()
+		testServer().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
+		if got, want := rec.Code, http.StatusNotFound; got != want {
+			t.Errorf("POST %s status = %d, want %d", path, got, want)
 		}
 	}
 }
@@ -333,29 +367,6 @@ func TestCreatePlanUsesAuthenticatedPrincipalAndRequestID(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"plan_id":"plan-id"`) {
 		t.Fatalf("POST /api/plan response = %s, want plan_id", rec.Body.String())
-	}
-}
-
-func TestLegacyTeamCreateRouteRemainsCompatible(t *testing.T) {
-	cashier := &fakeCashier{}
-	srv := testServer()
-	srv.cashier = cashier
-	cookieRecorder := httptest.NewRecorder()
-	srv.session.Set(cookieRecorder, "@alice:telecrypt.test")
-	cookie := cookieRecorder.Result().Cookies()[0]
-	req := httptest.NewRequest(http.MethodPost, "/api/team", nil)
-	req.AddCookie(cookie)
-	req.Header.Set("Origin", "https://backend.test.telecrypt.io")
-	req.Header.Set("X-TeleCrypt-Request-ID", "b3987ed2-51a4-4b04-b5f5-b915683d0cf5")
-	rec := httptest.NewRecorder()
-
-	srv.ServeHTTP(rec, req)
-
-	if got, want := rec.Code, http.StatusCreated; got != want {
-		t.Fatalf("POST /api/team status = %d, want %d", got, want)
-	}
-	if !strings.Contains(rec.Body.String(), `"team_id":"plan-id"`) {
-		t.Fatalf("POST /api/team response = %s, want legacy team_id", rec.Body.String())
 	}
 }
 
