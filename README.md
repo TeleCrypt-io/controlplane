@@ -95,7 +95,7 @@ one-shot can apply its exact migration. The application writes only its own
 the Janitor schema. Cashier's billing migration history remains private to the Cashier repository.
 Cashier grants it schema usage and read access to only the
 `janitor_deployment_identity` and `janitor_lock_exclusions` views.
-The private schema and both read-side views must remain owned by the exact profile Cashier role
+The private `cashier` schema and both read-side views must remain owned by the exact profile Cashier role
 (`telecrypt_cashier_user` for `telecrypt.io` or `telecrypt_cashier_stage_user` for
 `stage.telecrypt.io`);
 Cashier durably binds both `SERVER_NAME` and the explicit billing environment (`live` or `test`) in
