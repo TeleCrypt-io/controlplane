@@ -18,17 +18,31 @@ type fakeMAS struct {
 	users                                     []masadmin.User
 	emails                                    []masadmin.UserEmail
 	listUsersCalls, listEmailCalls, lockCalls int
+	getUserCalls, emailChecks                 int
+	listUsersErr, listEmailsErr               error
+	getUserErrOnCall, emailErrOnCall          int
+	lockErr                                   error
 }
 
 func (m *fakeMAS) ListUsers(context.Context) ([]masadmin.User, error) {
 	m.listUsersCalls++
+	if m.listUsersErr != nil {
+		return nil, m.listUsersErr
+	}
 	return append([]masadmin.User(nil), m.users...), nil
 }
 func (m *fakeMAS) ListUserEmails(context.Context) ([]masadmin.UserEmail, error) {
 	m.listEmailCalls++
+	if m.listEmailsErr != nil {
+		return nil, m.listEmailsErr
+	}
 	return append([]masadmin.UserEmail(nil), m.emails...), nil
 }
 func (m *fakeMAS) GetUser(_ context.Context, id string) (masadmin.User, error) {
+	m.getUserCalls++
+	if m.getUserErrOnCall == m.getUserCalls {
+		return masadmin.User{}, errors.New("recheck failed")
+	}
 	for _, u := range m.users {
 		if u.ID == id {
 			return u, nil
@@ -37,6 +51,10 @@ func (m *fakeMAS) GetUser(_ context.Context, id string) (masadmin.User, error) {
 	return masadmin.User{}, errors.New("missing")
 }
 func (m *fakeMAS) HasUserEmail(_ context.Context, id string) (bool, error) {
+	m.emailChecks++
+	if m.emailErrOnCall == m.emailChecks {
+		return false, errors.New("email recheck failed")
+	}
 	for _, e := range m.emails {
 		if e.UserID == id {
 			return true, nil
@@ -46,6 +64,9 @@ func (m *fakeMAS) HasUserEmail(_ context.Context, id string) (bool, error) {
 }
 func (m *fakeMAS) LockUser(_ context.Context, id string) error {
 	m.lockCalls++
+	if m.lockErr != nil {
+		return m.lockErr
+	}
 	for i := range m.users {
 		if m.users[i].ID == id {
 			now := time.Now()
@@ -62,9 +83,12 @@ type fakeStore struct {
 	cursor                                        db.DigestCursor
 	found                                         bool
 	identityErr, viewErr, startedErr, finishedErr error
+	identityCalls                                 int
+	finishedContextCanceled                       bool
 }
 
 func (s *fakeStore) VerifyDeploymentIdentity(context.Context, string, string) error {
+	s.identityCalls++
 	return s.identityErr
 }
 func (s *fakeStore) LockExclusions(context.Context) (map[string]struct{}, error) {
@@ -80,12 +104,15 @@ func (s *fakeStore) SetJanitorDigestCursor(_ context.Context, c db.DigestCursor)
 	s.cursor, s.found = c, true
 	return nil
 }
-func (s *fakeStore) InsertRunEvent(_ context.Context, event db.RunEvent) error {
+func (s *fakeStore) InsertRunEvent(ctx context.Context, event db.RunEvent) error {
 	if event.EventKind == "started" && s.startedErr != nil {
 		return s.startedErr
 	}
 	if event.EventKind == "finished" && s.finishedErr != nil {
 		return s.finishedErr
+	}
+	if event.EventKind == "finished" {
+		s.finishedContextCanceled = ctx.Err() != nil
 	}
 	s.events = append(s.events, event)
 	return nil
@@ -130,7 +157,7 @@ func TestSweepUsesOnlyCashierExclusionViewAndWritesExactDryRunAudit(t *testing.T
 	}
 }
 
-func TestSweepLiveLocksEligibleUserWithoutUnlockOrCompensation(t *testing.T) {
+func TestSweepLiveLocksEligibleUserWithoutUnlockSurface(t *testing.T) {
 	mas := &fakeMAS{users: []masadmin.User{staleUser(testID(3), "free")}}
 	store := &fakeStore{exclusions: map[string]struct{}{}}
 	cfg := Config{ServerName: "telecrypt.io", BillingEnvironment: "live", DryRun: false, OwnerEmail: "owner@example.test"}
@@ -143,6 +170,9 @@ func TestSweepLiveLocksEligibleUserWithoutUnlockOrCompensation(t *testing.T) {
 	}
 	if got := store.events[1].Reason; got != "disabled" {
 		t.Fatalf("finished reason = %q, want disabled", got)
+	}
+	if store.identityCalls != 1 {
+		t.Fatalf("deployment identity calls = %d, want startup check only", store.identityCalls)
 	}
 }
 
@@ -157,6 +187,17 @@ func TestSweepEntitlementViewFailurePreventsMASEnumeration(t *testing.T) {
 	}
 	if len(store.events) != 2 || store.events[1].Reason != "entitlement_view" {
 		t.Fatalf("audit events = %#v", store.events)
+	}
+}
+
+func TestSweepIdentityFailurePreventsAuditAndMASEnumeration(t *testing.T) {
+	mas := &fakeMAS{}
+	store := &fakeStore{identityErr: errors.New("identity mismatch")}
+	if err := NewSweeper(mas, store, &fakeMailer{}, testConfig()).Sweep(context.Background()); err == nil {
+		t.Fatal("Sweep accepted deployment identity failure")
+	}
+	if mas.listUsersCalls != 0 || mas.listEmailCalls != 0 || len(store.events) != 0 {
+		t.Fatalf("identity failure proceeded past authorization: MAS calls=(%d,%d), events=%d", mas.listUsersCalls, mas.listEmailCalls, len(store.events))
 	}
 }
 
@@ -189,5 +230,63 @@ func TestSweepRejectsUnsupportedOrMismatchedProfile(t *testing.T) {
 		if len(store.events) != 0 {
 			t.Fatal("invalid profile emitted an audit event")
 		}
+	}
+}
+
+func TestSweepAttemptsFinishedAuditAfterCancellationWithBoundedContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	store := &fakeStore{}
+	mas := &fakeMAS{users: []masadmin.User{staleUser(testID(5), "free")}}
+	if err := NewSweeper(mas, store, &fakeMailer{}, testConfig()).Sweep(ctx); err == nil {
+		t.Fatal("canceled Sweep unexpectedly succeeded")
+	}
+	if len(store.events) != 2 || store.events[1].EventKind != "finished" || store.events[1].Reason != "cancelled" {
+		t.Fatalf("canceled Sweep events = %#v, want started and cancelled finished events", store.events)
+	}
+	if store.finishedContextCanceled {
+		t.Fatal("finished audit insert used an already-canceled context")
+	}
+}
+
+func TestSweepMASPageFailureStopsBeforeMutationAndAuditsFailure(t *testing.T) {
+	store := &fakeStore{}
+	mas := &fakeMAS{listUsersErr: errors.New("users page failed")}
+	if err := NewSweeper(mas, store, &fakeMailer{}, Config{ServerName: "telecrypt.io", BillingEnvironment: "live"}).Sweep(context.Background()); err == nil {
+		t.Fatal("Sweep accepted MAS page failure")
+	}
+	if mas.lockCalls != 0 || mas.listEmailCalls != 0 {
+		t.Fatal("MAS mutation or later page fetch occurred after users page failure")
+	}
+	if len(store.events) != 2 || store.events[1].Reason != "mas" {
+		t.Fatalf("events = %#v, want failed MAS audit", store.events)
+	}
+}
+
+func TestSweepCandidateRecheckFailureStopsBeforeLaterMutation(t *testing.T) {
+	mas := &fakeMAS{users: []masadmin.User{staleUser(testID(6), "first"), staleUser(testID(7), "second")}, getUserErrOnCall: 1}
+	store := &fakeStore{exclusions: map[string]struct{}{}}
+	if err := NewSweeper(mas, store, &fakeMailer{}, Config{ServerName: "telecrypt.io", BillingEnvironment: "live"}).Sweep(context.Background()); err == nil {
+		t.Fatal("Sweep accepted candidate recheck failure")
+	}
+	if mas.getUserCalls != 1 || mas.lockCalls != 0 {
+		t.Fatalf("candidate calls = (get=%d, lock=%d), want one recheck and no locks", mas.getUserCalls, mas.lockCalls)
+	}
+	if len(store.events) != 2 || store.events[1].Reason != "mas" {
+		t.Fatalf("events = %#v, want failed candidate-recheck audit", store.events)
+	}
+}
+
+func TestSweepLockReadbackFailureStopsBeforeLaterMutation(t *testing.T) {
+	mas := &fakeMAS{users: []masadmin.User{staleUser(testID(8), "first"), staleUser(testID(9), "second")}, getUserErrOnCall: 2}
+	store := &fakeStore{exclusions: map[string]struct{}{}}
+	if err := NewSweeper(mas, store, &fakeMailer{}, Config{ServerName: "telecrypt.io", BillingEnvironment: "live"}).Sweep(context.Background()); err == nil {
+		t.Fatal("Sweep accepted lock readback failure")
+	}
+	if mas.getUserCalls != 2 || mas.lockCalls != 1 {
+		t.Fatalf("candidate calls = (get=%d, lock=%d), want one lock then stop", mas.getUserCalls, mas.lockCalls)
+	}
+	if len(store.events) != 2 || store.events[1].Reason != "lock_readback" {
+		t.Fatalf("events = %#v, want failed lock-readback audit", store.events)
 	}
 }

@@ -77,7 +77,7 @@ func loadDryRun() (bool, error) {
 }
 
 // JanitorConfig is Janitor configuration. Cashier alone writes payment state; Janitor verifies
-// its deployment identity before it reads the Cashier-owned entitlement grants.
+// its deployment identity before it reads the two Cashier-owned Janitor views.
 type JanitorConfig struct {
 	BillingEnvironment   string
 	DryRun               bool

@@ -3,7 +3,7 @@
 Public source for the non-payment control-plane components of a TeleCrypt Matrix deployment:
 
 - `registration` provisions Matrix agent accounts without holding a database connection.
-- `janitor` runs a single-flight sweep that locks stale accounts and sends owner digests. It never unlocks accounts and reads Cashier-owned billing grants but cannot modify them.
+- `janitor` runs a single-flight sweep that locks stale accounts and sends owner digests. It never unlocks accounts and reads only the two Cashier-owned Janitor views.
 - `plan` is the browser-facing account and plan-management UI at the stable `/plan` URL. It uses MAS OIDC and a narrow signed private Cashier API.
 - `synapse/tier_controller` is the fail-closed Synapse capability-policy module.
 
@@ -82,7 +82,7 @@ backend origin: `https://backend.telecrypt.io` for the production public surface
 `https://backend.stage.telecrypt.io` for the later stage profile. Registration is topology-only;
 Plan and Janitor perform the exact frozen-profile check before billing-sensitive behavior.
 
-Janitor runs one single-flight sweep per invocation and reads Cashier-owned billing grants through
+Janitor runs one single-flight sweep per invocation and reads Cashier-owned entitlement and identity views through
 `JANITOR_DB_URL`, using a separate database credential from Cashier's `CASHIER_DB_URL`. The
 URL must use the exact profile database and Janitor role: `telecrypt.io` uses
 `telecrypt_billing` with `telecrypt_janitor_user`, while `stage.telecrypt.io` uses
@@ -91,11 +91,11 @@ billing profile. The Janitor role is owner-precreated for the private
 `janitor` schema, is read-only on Cashier's private `cashier` schema, and has schema-owner DDL
 authority (including CREATE, ALTER, and DROP) only within that private `janitor` schema so the
 one-shot can apply its exact migration. The application writes only its own
-`janitor_digest_cursor` and `schema_migrations` tables; PUBLIC and other roles must have no ACL on
+`janitor_digest_cursor`, `run_events`, and `schema_migrations` tables; PUBLIC and other roles must have no ACL on
 the Janitor schema. Cashier's billing migration history remains private to the Cashier repository.
-Cashier grants it usage of `cashier` and read access to only the
-deployment-identity and verification-grant tables.
-The private schema and both read-side tables must remain owned by the exact profile Cashier role
+Cashier grants it schema usage and read access to only the
+`janitor_deployment_identity` and `janitor_lock_exclusions` views.
+The private schema and both read-side views must remain owned by the exact profile Cashier role
 (`telecrypt_cashier_user` for `telecrypt.io` or `telecrypt_cashier_stage_user` for
 `stage.telecrypt.io`);
 Cashier durably binds both `SERVER_NAME` and the explicit billing environment (`live` or `test`) in

@@ -46,6 +46,41 @@ func TestValidateRunEventStatesAndLabels(t *testing.T) {
 	}
 }
 
+func TestValidateRunEventBindsSuccessfulOutcomeToBillingProfile(t *testing.T) {
+	base := RunEvent{
+		EventID: uuid.New(), RunID: uuid.New(), EventKind: "finished", Status: "succeeded",
+		ServerName: "stage.telecrypt.io", BillingEnvironment: "test", DryRun: true,
+		Considered: 1, LockedOrWouldLock: 1, NotificationStatus: "not_attempted",
+	}
+	for _, tc := range []struct {
+		name    string
+		outcome string
+		reason  string
+		wantErr bool
+	}{
+		{name: "test dry-run", outcome: "dry_run", reason: "would_disable"},
+		{name: "test mutation", outcome: "success", reason: "disabled", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			event := base
+			event.Outcome, event.Reason = tc.outcome, tc.reason
+			if (validateRunEvent(event) != nil) != tc.wantErr {
+				t.Fatalf("validateRunEvent(%#v) error mismatch", event)
+			}
+		})
+	}
+
+	base.ServerName, base.BillingEnvironment, base.DryRun = "telecrypt.io", "live", false
+	base.Outcome, base.Reason = "success", "disabled"
+	if err := validateRunEvent(base); err != nil {
+		t.Fatalf("valid live mutation event rejected: %v", err)
+	}
+	base.Outcome, base.Reason = "dry_run", "would_disable"
+	if err := validateRunEvent(base); err == nil {
+		t.Fatal("live dry-run event accepted")
+	}
+}
+
 func TestDigestCursorValidationAndOrdering(t *testing.T) {
 	valid := DigestCursor{CreatedAt: time.Now(), EmailID: "01J00000000000000000000000"}
 	if !valid.Valid() {

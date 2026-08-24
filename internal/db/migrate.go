@@ -26,6 +26,11 @@ const (
 	janitorRunEventsMigration    = "0002_janitor_run_events.sql"
 )
 
+var expectedJanitorMigrationNames = []string{
+	janitorDigestCursorMigration,
+	janitorRunEventsMigration,
+}
+
 type janitorRelation struct {
 	kind  string
 	owner string
@@ -217,11 +222,14 @@ func loadMigrations() ([]migration, error) {
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() {
-			continue
+			return nil, fmt.Errorf("Janitor migration namespace contains unexpected directory %q", entry.Name())
 		}
 		names = append(names, entry.Name())
 	}
 	sort.Strings(names)
+	if err := validateJanitorMigrationNames(names); err != nil {
+		return nil, err
+	}
 	migrations := make([]migration, 0, len(names))
 	for _, name := range names {
 		sqlBytes, err := migrationFiles.ReadFile("janitor_migrations/" + name)
@@ -232,6 +240,13 @@ func loadMigrations() ([]migration, error) {
 		migrations = append(migrations, migration{name: name, sql: sqlBytes, sha256: fmt.Sprintf("%x", digest[:])})
 	}
 	return migrations, nil
+}
+
+func validateJanitorMigrationNames(names []string) error {
+	if !reflect.DeepEqual(names, expectedJanitorMigrationNames) {
+		return fmt.Errorf("Janitor migration namespace must contain only the exact ordered 0001 and 0002 migrations")
+	}
+	return nil
 }
 
 func currentDatabaseRole(ctx context.Context, tx pgx.Tx) (string, error) {

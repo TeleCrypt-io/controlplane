@@ -82,6 +82,40 @@ func TestValidateMigrationStateRejectsChangedMigrationDigest(t *testing.T) {
 	}
 }
 
+func TestValidateJanitorMigrationNamesRequiresFrozenStream(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		names []string
+		valid bool
+	}{
+		{name: "exact stream", names: []string{janitorDigestCursorMigration, janitorRunEventsMigration}, valid: true},
+		{name: "extra migration", names: []string{janitorDigestCursorMigration, janitorRunEventsMigration, "0003_extra.sql"}},
+		{name: "renamed migration", names: []string{janitorDigestCursorMigration, "0002_renamed.sql"}},
+		{name: "missing migration", names: []string{janitorDigestCursorMigration}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if (validateJanitorMigrationNames(tc.names) == nil) != tc.valid {
+				t.Fatalf("validateJanitorMigrationNames(%v) validity mismatch", tc.names)
+			}
+		})
+	}
+}
+
+func TestLoadJanitorMigrationsUsesFrozenChecksummedSources(t *testing.T) {
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("loadMigrations: %v", err)
+	}
+	if len(migrations) != len(expectedJanitorMigrationNames) {
+		t.Fatalf("migration count = %d, want %d", len(migrations), len(expectedJanitorMigrationNames))
+	}
+	for i, migration := range migrations {
+		if migration.name != expectedJanitorMigrationNames[i] || len(migration.sha256) != 64 {
+			t.Fatalf("migration %d = (%q, %q), want frozen name and SHA-256 digest", i, migration.name, migration.sha256)
+		}
+	}
+}
+
 func TestValidateJanitorRelations(t *testing.T) {
 	valid := map[string]janitorRelation{
 		janitorSchemaMigrationsTable: {kind: "r", owner: "janitor"},

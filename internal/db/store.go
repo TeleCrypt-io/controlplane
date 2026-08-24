@@ -168,8 +168,20 @@ func validateRunEvent(event RunEvent) error {
 		if event.Outcome != "dry_run" && event.Outcome != "success" {
 			return fmt.Errorf("invalid Janitor success audit outcome")
 		}
+		if event.Failures != 0 {
+			return fmt.Errorf("successful Janitor audit event must have zero failures")
+		}
 		if event.Reason != "would_disable" && event.Reason != "disabled" && event.Reason != "no_eligible_accounts" {
 			return fmt.Errorf("invalid Janitor success audit reason")
+		}
+		if event.BillingEnvironment == "test" && event.Outcome != "dry_run" {
+			return fmt.Errorf("test-profile Janitor audit must be dry-run")
+		}
+		if event.BillingEnvironment == "live" && event.Outcome != "success" {
+			return fmt.Errorf("live-profile Janitor audit must be mutation mode")
+		}
+		if event.Outcome == "dry_run" && event.NotificationStatus != "not_attempted" {
+			return fmt.Errorf("dry-run Janitor audit must not attempt notification")
 		}
 		if event.Reason == "no_eligible_accounts" && event.LockedOrWouldLock != 0 {
 			return fmt.Errorf("no-eligible Janitor audit event has a lock count")

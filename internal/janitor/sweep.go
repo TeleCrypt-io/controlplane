@@ -19,6 +19,7 @@ const (
 	lockAfter           = 48 * time.Hour
 	maxDigestCandidates = 10_000
 	maxDigestBodyBytes  = 1 << 20
+	auditCleanupTimeout = 2 * time.Second
 )
 
 type Config struct {
@@ -148,6 +149,8 @@ func (s *Sweeper) Sweep(ctx context.Context) error {
 	}
 
 	finish := func(baseErr error) error {
+		finishCtx, cancelFinish := boundedAuditContext(ctx)
+		defer cancelFinish()
 		if baseErr == nil && state.failures == 0 {
 			reason := "no_eligible_accounts"
 			if state.locked > 0 {
@@ -161,7 +164,7 @@ func (s *Sweeper) Sweep(ctx context.Context) error {
 			if s.cfg.DryRun {
 				outcome = "dry_run"
 			}
-			if err := s.store.InsertRunEvent(ctx, s.finishedEvent(state, "succeeded", outcome, reason)); err != nil {
+			if err := s.store.InsertRunEvent(finishCtx, s.finishedEvent(state, "succeeded", outcome, reason)); err != nil {
 				return fmt.Errorf("janitor: finished audit event failed")
 			}
 			return nil
@@ -170,7 +173,7 @@ func (s *Sweeper) Sweep(ctx context.Context) error {
 		if reason == "" {
 			reason = "audit"
 		}
-		if err := s.store.InsertRunEvent(ctx, s.finishedEvent(state, "failed", "operational_failure", reason)); err != nil {
+		if err := s.store.InsertRunEvent(finishCtx, s.finishedEvent(state, "failed", "operational_failure", reason)); err != nil {
 			if baseErr != nil {
 				return fmt.Errorf("%v; janitor: finished audit event failed", baseErr)
 			}
@@ -218,6 +221,15 @@ func (s *Sweeper) Sweep(ctx context.Context) error {
 	return finish(nil)
 }
 
+// boundedAuditContext keeps the required terminal event writable after cancellation while still
+// bounding cleanup. An already-canceled parent would otherwise cancel its child immediately.
+func boundedAuditContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil || parent.Err() != nil {
+		return context.WithTimeout(context.Background(), auditCleanupTimeout)
+	}
+	return context.WithTimeout(parent, auditCleanupTimeout)
+}
+
 func failureLabel(reason string) string {
 	switch reason {
 	case "mas":
@@ -249,9 +261,9 @@ func (s *Sweeper) sweepLocks(ctx context.Context, users []masadmin.User, exclusi
 		if mxid == "" {
 			state.skipped++
 			state.fail("mas", "candidate_recheck")
-			continue
+			return fmt.Errorf("janitor: MAS candidate identity is invalid")
 		}
-		if snapshot.LockedAt != nil || snapshot.DeactivatedAt != nil || !snapshot.CreatedAt.Before(cutoff) || mxid == "@cashier_admin:"+s.cfg.ServerName {
+		if snapshot.LockedAt != nil || snapshot.DeactivatedAt != nil || !snapshot.CreatedAt.Before(cutoff) {
 			state.skipped++
 			continue
 		}
@@ -264,12 +276,16 @@ func (s *Sweeper) sweepLocks(ctx context.Context, users []masadmin.User, exclusi
 		if err != nil {
 			state.skipped++
 			state.fail("mas", "candidate_recheck")
-			continue
+			return fmt.Errorf("janitor: candidate recheck failed")
 		}
 		currentMXID := s.mxid(current.Username)
-		if current.ID != snapshot.ID || currentMXID == "" || current.CreatedAt.IsZero() || current.LockedAt != nil || current.DeactivatedAt != nil || !current.CreatedAt.Before(cutoff) {
+		if current.ID != snapshot.ID || currentMXID == "" || currentMXID != mxid || current.CreatedAt.IsZero() || !current.CreatedAt.Equal(snapshot.CreatedAt) {
 			state.skipped++
 			state.fail("lock_readback", "candidate_recheck")
+			return fmt.Errorf("janitor: candidate recheck returned inconsistent identity")
+		}
+		if current.LockedAt != nil || current.DeactivatedAt != nil || !current.CreatedAt.Before(cutoff) {
+			state.skipped++
 			continue
 		}
 		if _, excluded := exclusions[currentMXID]; excluded {
@@ -280,7 +296,7 @@ func (s *Sweeper) sweepLocks(ctx context.Context, users []masadmin.User, exclusi
 		if err != nil {
 			state.skipped++
 			state.fail("mas", "candidate_recheck")
-			continue
+			return fmt.Errorf("janitor: candidate email recheck failed")
 		}
 		if hasEmail {
 			state.skipped++
@@ -290,23 +306,19 @@ func (s *Sweeper) sweepLocks(ctx context.Context, users []masadmin.User, exclusi
 			state.locked++
 			continue
 		}
-		if err := s.store.VerifyDeploymentIdentity(ctx, s.cfg.ServerName, s.cfg.BillingEnvironment); err != nil {
-			state.fail("database", "database")
-			continue
-		}
 		if err := s.mas.LockUser(ctx, current.ID); err != nil {
 			state.fail("lock", "lock")
-			continue
+			return fmt.Errorf("janitor: account lock failed")
 		}
 		locked, err := s.mas.GetUser(ctx, current.ID)
 		if err != nil || locked.ID != current.ID || locked.Username != current.Username || !locked.CreatedAt.Equal(current.CreatedAt) || locked.LockedAt == nil {
 			state.fail("lock_readback", "lock_readback")
-			continue
+			return fmt.Errorf("janitor: account lock readback failed")
 		}
 		postEmail, err := s.mas.HasUserEmail(ctx, current.ID)
 		if err != nil || postEmail {
 			state.fail("lock_readback", "lock_readback")
-			continue
+			return fmt.Errorf("janitor: account lock email readback failed")
 		}
 		state.locked++
 		state.addLabel("lock")
