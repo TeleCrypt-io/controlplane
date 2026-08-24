@@ -114,9 +114,14 @@ func TestLoadPlanRequiresExactBillingProfiles(t *testing.T) {
 	if err := os.Unsetenv("BILLING_ENV"); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("DODO_API_URL", "https://attacker.invalid")
-	if _, err := LoadPlan(); err == nil || !strings.Contains(err.Error(), "DODO_API_URL") {
-		t.Fatal("LoadPlan accepted ambient Dodo endpoint override")
+	for _, name := range []string{"DODO_API_URL", "DODO_MODE", "DODO_API_KEY", "DODO_WEBHOOK_SECRET"} {
+		t.Run(name, func(t *testing.T) {
+			setRequiredPlanEnv(t)
+			t.Setenv(name, "ambient-value")
+			if _, err := LoadPlan(); err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("LoadPlan accepted ambient Dodo setting %s", name)
+			}
+		})
 	}
 }
 

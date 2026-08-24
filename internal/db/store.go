@@ -195,6 +195,9 @@ func validateRunEvent(event RunEvent) error {
 	} else if event.Status != "failed" || event.Outcome != "operational_failure" {
 		return fmt.Errorf("invalid Janitor finished audit state")
 	} else {
+		if event.Failures == 0 {
+			return fmt.Errorf("failed Janitor audit event must have a failure count")
+		}
 		switch event.Reason {
 		case "database", "mas", "entitlement_view", "notification", "audit", "cancelled", "lock", "lock_readback":
 		default:

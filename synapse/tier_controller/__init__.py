@@ -36,7 +36,7 @@ BYTES_PER_GIB = 1024**3
 MAX_MEDIA_BYTES = 128 * BYTES_PER_MIB
 MAX_USER_MEDIA_BYTES = 50 * BYTES_PER_GIB
 STAGING_FREE_RESERVE_BYTES = 10 * BYTES_PER_GIB
-DEFAULT_MEDIA_STORE_PATH = "/data"
+DEFAULT_MEDIA_STORE_PATH = "/staging/media"
 
 # PostgreSQL's SUM(integer) returns a signed BIGINT. Values outside that range are malformed for
 # this policy even though Python itself can represent arbitrarily large integers.
@@ -45,7 +45,7 @@ _MAX_SIGNED_INTEGER = (1 << 63) - 1
 _DENIAL_MESSAGE = (
     "This account is unverified. Uploads/room creation/encryption require a verified account "
     "— sign in at https://telecrypt.io with an email address to request verification. "
-    "See https://telecrypt.io/llms.txt"
+    "See https://telecrypt-io.github.io/llms-authority/llms.txt"
 )
 
 
@@ -141,7 +141,11 @@ class TierController:
             # URL-preview rows share this table but are not user-uploaded originals. Thumbnails,
             # remote media, deleted rows, and staging files are outside this query by design.
             cursor.execute(
-                "SELECT COALESCE(SUM(media_length), 0) "
+                # PostgreSQL returns SUM(bigint) as numeric. Cast the bounded result back to a
+                # BIGINT so the callback's strict integer validation sees the same value as
+                # Synapse's media metadata API, while an overflowing/malformed sum still fails
+                # closed through the database interaction error path.
+                "SELECT COALESCE(SUM(media_length), 0)::BIGINT "
                 "FROM local_media_repository "
                 "WHERE user_id = %s AND url_cache IS NULL",
                 (user_id,),

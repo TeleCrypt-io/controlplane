@@ -18,14 +18,47 @@ CREATE TABLE janitor.run_events (
     notification_status TEXT NOT NULL CHECK (notification_status IN ('not_attempted', 'succeeded', 'failed')),
     labels TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[] CHECK (
         cardinality(labels) <= 16
+        AND array_position(labels, NULL) IS NULL
         AND labels <@ ARRAY[
             'database', 'entitlement_view', 'mas_users', 'mas_emails', 'candidate_recheck',
             'lock', 'lock_readback', 'notification', 'audit_started', 'audit_finished', 'cancelled'
         ]::TEXT[]
     ),
+    CONSTRAINT run_events_profile_check CHECK (
+        (server_name = 'telecrypt.io' AND billing_environment IN ('test', 'live'))
+        OR (server_name = 'stage.telecrypt.io' AND billing_environment = 'test')
+    ),
+    CONSTRAINT run_events_dry_run_check CHECK (
+        (billing_environment = 'test' AND dry_run)
+        OR (billing_environment = 'live' AND NOT dry_run)
+    ),
     CONSTRAINT run_events_state_check CHECK (
-        (event_kind = 'started' AND status = 'started' AND outcome = 'pending' AND reason = 'pending' AND notification_status = 'not_attempted')
-        OR (event_kind = 'finished' AND status = 'succeeded' AND outcome IN ('dry_run', 'success') AND reason IN ('would_disable', 'disabled', 'no_eligible_accounts'))
-        OR (event_kind = 'finished' AND status = 'failed' AND outcome = 'operational_failure' AND reason IN ('database', 'mas', 'entitlement_view', 'notification', 'audit', 'cancelled', 'lock', 'lock_readback'))
+        (
+            event_kind = 'started' AND status = 'started' AND outcome = 'pending' AND reason = 'pending'
+            AND notification_status = 'not_attempted'
+            AND considered = 0 AND skipped = 0 AND locked_or_would_lock = 0 AND failures = 0
+        )
+        OR (
+            event_kind = 'finished' AND status = 'succeeded' AND outcome = 'dry_run'
+            AND billing_environment = 'test' AND dry_run AND failures = 0
+            AND notification_status = 'not_attempted'
+            AND (
+                (reason = 'would_disable' AND locked_or_would_lock > 0)
+                OR (reason = 'no_eligible_accounts' AND locked_or_would_lock = 0)
+            )
+        )
+        OR (
+            event_kind = 'finished' AND status = 'succeeded' AND outcome = 'success'
+            AND billing_environment = 'live' AND NOT dry_run AND failures = 0
+            AND (
+                (reason = 'disabled' AND locked_or_would_lock > 0)
+                OR (reason = 'no_eligible_accounts' AND locked_or_would_lock = 0)
+            )
+        )
+        OR (
+            event_kind = 'finished' AND status = 'failed' AND outcome = 'operational_failure'
+            AND reason IN ('database', 'mas', 'entitlement_view', 'notification', 'audit', 'cancelled', 'lock', 'lock_readback')
+            AND failures > 0
+        )
     )
 );

@@ -55,7 +55,7 @@ modules:
   - module: tier_controller.TierController
     config:
       restricted_room_cap: 3
-      media_store_path: /data
+      media_store_path: /staging/media
 ```
 
 `user_types.extra_user_types` must include `verified` in the Synapse configuration.

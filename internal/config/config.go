@@ -328,7 +328,11 @@ func loadBillingIdentity() (string, string, backendEndpoints, error) {
 	if _, present := os.LookupEnv("BILLING_ENV"); present {
 		return "", "", backendEndpoints{}, fmt.Errorf("BILLING_ENV must be unset")
 	}
-	for _, key := range []string{"DODO_ENVIRONMENT", "DODO_BASE_URL", "DODO_API_URL", "DODO_API_BASE_URL", "DODO_CHECKOUT_URL", "DODO_PORTAL_URL"} {
+	for _, key := range []string{
+		"DODO_ENVIRONMENT", "DODO_MODE", "DODO_BASE_URL", "DODO_API_URL", "DODO_API_BASE_URL",
+		"DODO_CHECKOUT_URL", "DODO_PORTAL_URL", "DODO_API_KEY", "DODO_API_TOKEN",
+		"DODO_WEBHOOK_SECRET", "DODO_SIGNING_SECRET", "DODO_PRODUCT_ID",
+	} {
 		if _, present := os.LookupEnv(key); present {
 			return "", "", backendEndpoints{}, fmt.Errorf("%s must be unset", key)
 		}

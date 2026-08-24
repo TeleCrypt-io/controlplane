@@ -172,9 +172,11 @@ def test_upload_limits_are_explicit():
     assert MAX_MEDIA_BYTES == 128 * 1024 * 1024
     assert MAX_USER_MEDIA_BYTES == 50 * 1024 * 1024 * 1024
     assert STAGING_FREE_RESERVE_BYTES == 10 * 1024 * 1024 * 1024
+    assert "https://telecrypt-io.github.io/llms-authority/llms.txt" in _DENIAL_MESSAGE
 
 
 def test_parse_config_validates_media_store_path():
+    assert TierController.parse_config({}).media_store_path == "/staging/media"
     assert (
         TierController.parse_config({"media_store_path": "/staging/media"}).media_store_path
         == "/staging/media"
@@ -258,6 +260,7 @@ async def test_upload_query_is_one_parameterized_snapshot_and_excludes_url_cache
     assert "COALESCE(SUM(media_length), 0)" in usage_sql
     assert "local_media_repository" in usage_sql
     assert "url_cache IS NULL" in usage_sql
+    assert "::BIGINT" in usage_sql
     assert usage_args == ("@a:x",)
 
 
