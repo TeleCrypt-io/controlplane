@@ -1,4 +1,4 @@
-// Package agent implements Redpill's stateless public MAS flow: generate a localpart and
+// Package agent implements Registration's stateless public MAS flow: generate a localpart and
 // password, register the account through MAS's public registration form, and obtain a Matrix
 // device token through public OAuth device authorization. It has no MAS/Synapse admin authority.
 package agent
@@ -6,7 +6,9 @@ package agent
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/url"
+	"strings"
 )
 
 type Provisioned struct {
@@ -31,12 +33,8 @@ type Provisioner struct {
 // NewProvisioner creates a Provisioner. ServerName is required because it is the Matrix data-plane
 // identity and must not silently change when the public backend origin changes.
 func NewProvisioner(m masRegClient, backendPublicURL, serverName string) (*Provisioner, error) {
-	u, err := url.Parse(backendPublicURL)
-	if err != nil {
-		return nil, fmt.Errorf("parse backend public URL: %w", err)
-	}
-	if u.Hostname() == "" {
-		return nil, fmt.Errorf("backend public URL %q has no host", backendPublicURL)
+	if _, err := validateBackendPublicURL(backendPublicURL); err != nil {
+		return nil, err
 	}
 	if serverName == "" {
 		return nil, fmt.Errorf("server name must not be empty")
@@ -48,8 +46,34 @@ func NewProvisioner(m masRegClient, backendPublicURL, serverName string) (*Provi
 	}, nil
 }
 
+func validateBackendPublicURL(raw string) (*url.URL, error) {
+	if raw == "" || len(raw) > 8<<10 {
+		return nil, fmt.Errorf("backend public URL must be non-empty and at most 8192 bytes")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" || u.Hostname() == "" || u.User != nil ||
+		u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" ||
+		(u.Path != "" && u.Path != "/") {
+		return nil, fmt.Errorf("backend public URL must be an absolute origin without credentials, path, query, or fragment")
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "https" && !(scheme == "http" && isLoopbackHost(u)) {
+		return nil, fmt.Errorf("backend public URL must use HTTPS (HTTP is allowed only for loopback tests)")
+	}
+	return u, nil
+}
+
+func isLoopbackHost(u *url.URL) bool {
+	host := strings.ToLower(u.Hostname())
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // ProvisionAgent generates a random localpart/password, registers through MAS's public form,
-// and returns the password only to the immediate Redpill caller along with a refreshable OAuth
+// and returns the password only to the immediate Registration caller along with a refreshable OAuth
 // token set. It never persists or logs any credential.
 func (p *Provisioner) ProvisionAgent(ctx context.Context) (*Provisioned, error) {
 	localpart, err := randomLocalpart()

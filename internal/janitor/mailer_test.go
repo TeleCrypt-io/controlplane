@@ -20,7 +20,6 @@ import (
 // It can be configured to advertise STARTTLS (with a self-signed cert) or not.
 type fakeSMTP struct {
 	listener   net.Listener
-	addr       string
 	host       string
 	port       string
 	startTLS   bool
@@ -38,7 +37,6 @@ func newFakeSMTP(t *testing.T, advertiseSTARTTLS bool) *fakeSMTP {
 	host, port, _ := net.SplitHostPort(listener.Addr().String())
 	f := &fakeSMTP{
 		listener: listener,
-		addr:     listener.Addr().String(),
 		host:     host,
 		port:     port,
 		startTLS: advertiseSTARTTLS,
@@ -191,5 +189,64 @@ func TestSMTPMailer_SendFailsWithoutSTARTTLS(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "STARTTLS") {
 		t.Errorf("expected STARTTLS-related error, got: %v", err)
+	}
+}
+
+func TestSMTPMailer_ContextCancelsStalledGreeting(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	host, port, _ := net.SplitHostPort(listener.Addr().String())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- conn
+		<-ctx.Done()
+		_ = conn.Close()
+	}()
+
+	m := &SMTPMailer{Host: host, Port: port, Username: "user", Password: "pass", From: "from@test"}
+	errCh := make(chan error, 1)
+	go func() { errCh <- m.Send(ctx, "to@test", "Test", "body") }()
+	select {
+	case <-accepted:
+		cancel()
+	case <-time.After(time.Second):
+		t.Fatal("SMTP client did not connect")
+	}
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("Send succeeded after greeting cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Send did not stop after context cancellation")
+	}
+}
+
+func TestValidateSMTPMessageRejectsInjectionAndOversizedFields(t *testing.T) {
+	tests := []struct {
+		name          string
+		from, to      string
+		subject, body string
+	}{
+		{name: "from injection", from: "from@test\r\nBcc: attacker@test", to: "to@test", subject: "Test", body: "body"},
+		{name: "subject injection", from: "from@test", to: "to@test", subject: "Test\nBcc: attacker@test", body: "body"},
+		{name: "body too large", from: "from@test", to: "to@test", subject: "Test", body: strings.Repeat("x", maxSMTPBodyBytes+1)},
+		{name: "header too large", from: strings.Repeat("a", maxSMTPHeaderBytes), to: "to@test", subject: "Test", body: "body"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateSMTPMessage(tt.from, tt.to, tt.subject, tt.body); err == nil {
+				t.Fatal("validateSMTPMessage unexpectedly accepted unsafe or oversized message")
+			}
+		})
 	}
 }

@@ -5,19 +5,24 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/smtp"
+	"strings"
 	"time"
+)
+
+const (
+	maxSMTPHeaderBytes = 16 << 10
+	maxSMTPBodyBytes   = 1 << 20
 )
 
 // SMTPMailer sends the owner digest as plain text over a TLS-required SMTP connection.
 // It negotiates STARTTLS explicitly and fails closed if the server does not advertise STARTTLS
 // or if the TLS handshake fails — it never authenticates or sends in plaintext. Authentication
-// uses smtp.PlainAuth only after a successful STARTTLS upgrade. The request context is applied
-// as a connection deadline via net.DialTimeout; a fixed 30-second timeout caps the overall dial
-// timeout. Certificate verification requires a working CA trust store in the runtime
-// environment — see the Dockerfile's ca-certificates note (scratch has none by default).
+// uses smtp.PlainAuth only after a successful STARTTLS upgrade. Every SMTP operation is bounded
+// by the same hard deadline and canceled when the request context ends. Certificate verification
+// requires a working CA trust store in the runtime environment — see the Dockerfile's
+// ca-certificates note (scratch has none by default).
 type SMTPMailer struct {
 	Host, Port, Username, Password, From string
 	// tlsConfig, when non-nil, overrides the default TLS config used for STARTTLS.
@@ -27,14 +32,31 @@ type SMTPMailer struct {
 }
 
 func (m *SMTPMailer) Send(ctx context.Context, to, subject, body string) error {
+	if err := validateSMTPMessage(m.From, to, subject, body); err != nil {
+		return err
+	}
 	const timeout = 30 * time.Second
 	addr := net.JoinHostPort(m.Host, m.Port)
 
-	dialer := &net.Dialer{Timeout: timeout}
+	deadline := time.Now().Add(timeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	dialTimeout := time.Until(deadline)
+	if dialTimeout <= 0 {
+		return errors.New("smtp: deadline exceeded")
+	}
+	dialer := &net.Dialer{Timeout: dialTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("smtp dial %s: %w", addr, err)
 	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		conn.Close()
+		return errors.New("smtp: set connection deadline")
+	}
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopClose()
 
 	client, err := smtp.NewClient(conn, m.Host)
 	if err != nil {
@@ -86,17 +108,19 @@ func (m *SMTPMailer) Send(ctx context.Context, to, subject, body string) error {
 	return client.Quit()
 }
 
-// LogMailer is the degraded-but-not-fatal fallback used when no SMTP env vars are configured: it
-// logs the digest instead of sending it. Contract: Sweeper treats a LogMailer.Send call as a
-// successful delivery for high-water-mark purposes (see sweepDigest) — the same accounts won't be
-// re-logged on the next sweep. That means if SMTP was meant to be configured and simply isn't
-// (misconfiguration, not a deliberate choice), those sign-ups never reach a real inbox and only
-// ever appear in this log line. Operators relying on the digest for review must either configure
-// SMTP or watch these log lines directly.
-type LogMailer struct{}
-
-func (LogMailer) Send(ctx context.Context, to, subject, body string) error {
-	slog.Info("janitor: SMTP not configured, logging digest instead of sending",
-		"to", to, "subject", subject, "body", body)
+func validateSMTPMessage(from, to, subject, body string) error {
+	if from == "" || to == "" || subject == "" {
+		return errors.New("smtp: message headers must be non-empty")
+	}
+	if strings.ContainsAny(from, "\r\n") || strings.ContainsAny(to, "\r\n") || strings.ContainsAny(subject, "\r\n") {
+		return errors.New("smtp: message headers contain line breaks")
+	}
+	if len(body) > maxSMTPBodyBytes {
+		return errors.New("smtp: message body exceeds limit")
+	}
+	header := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n", from, to, subject)
+	if len(header) > maxSMTPHeaderBytes {
+		return errors.New("smtp: message headers exceed limit")
+	}
 	return nil
 }

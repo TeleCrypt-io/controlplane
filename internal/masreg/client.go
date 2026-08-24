@@ -39,12 +39,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
+
+	"github.com/TeleCrypt-io/controlplane/internal/jsonbody"
 )
 
 // Client drives the registration flow against one MAS deployment. Safe for concurrent use: each
@@ -56,9 +61,91 @@ type Client struct {
 	baseURL string
 }
 
-// NewClient targets the given MAS base URL (e.g. http://mas:8080, no /auth prefix).
+var (
+	errMASPublicRedirect     = errors.New("MAS public OAuth redirects are disabled")
+	errMASRedirectNoSource   = errors.New("MAS registration redirect had no source response")
+	errMASRedirectLimit      = errors.New("MAS registration exceeded redirect limit")
+	errMASBodyReplayRedirect = errors.New("MAS registration rejected a body-preserving redirect")
+	errMASRedirectStatus     = errors.New("MAS registration requires a 303 redirect to GET")
+	errMASRedirectOrigin     = errors.New("MAS redirected outside its configured origin")
+	errMASRedirectUnsafeURL  = errors.New("MAS registration redirected to an unsafe URL")
+	errMASRedirectUnexpected = errors.New("MAS registration redirected outside the expected flow")
+)
+
+var boundedMASRequestErrors = [...]error{
+	errMASPublicRedirect,
+	errMASRedirectNoSource,
+	errMASRedirectLimit,
+	errMASBodyReplayRedirect,
+	errMASRedirectStatus,
+	errMASRedirectOrigin,
+	errMASRedirectUnsafeURL,
+	errMASRedirectUnexpected,
+}
+
+const (
+	// MAS-rendered forms and JSON responses are small by contract. Bound every upstream body so
+	// a broken or hostile endpoint cannot turn one registration attempt into an unbounded memory
+	// allocation.
+	maxMASHTMLBodyBytes       = 1 << 20
+	maxMASJSONBodyBytes       = 1 << 20
+	maxMASOAuthFieldBytes     = 8 << 10
+	maxMASDeviceLifetime      = 15 * time.Minute
+	maxMASDeviceInterval      = 5 * time.Minute
+	maxMASAccessLifetime      = 24 * time.Hour
+	maxMatrixIdentityBytes    = 255
+	maxMASResponseHeaderBytes = 64 << 10
+)
+
+// NewClient targets the exact public MAS origin (for example,
+// https://backend.stage.telecrypt.io/auth); registration binds all browser and OAuth calls to it.
 func NewClient(baseURL string) *Client {
 	return &Client{baseURL: strings.TrimRight(baseURL, "/")}
+}
+
+func validateSameOrigin(baseRaw, targetRaw string) error {
+	base, err := parseOriginURL(baseRaw, false)
+	if err != nil {
+		return fmt.Errorf("invalid MAS base URL")
+	}
+	target, err := parseOriginURL(targetRaw, true)
+	if err != nil {
+		return fmt.Errorf("invalid backend URL")
+	}
+	if !strings.EqualFold(base.Scheme, target.Scheme) ||
+		!strings.EqualFold(base.Hostname(), target.Hostname()) ||
+		effectiveOriginPort(base) != effectiveOriginPort(target) {
+		return fmt.Errorf("backend URL must have the same origin as MAS")
+	}
+	return nil
+}
+
+func parseOriginURL(raw string, target bool) (*url.URL, error) {
+	if raw == "" || len(raw) > maxMASOAuthFieldBytes {
+		return nil, errors.New("origin URL is empty or too large")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" || u.Hostname() == "" || u.User != nil || u.Opaque != "" ||
+		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" {
+		return nil, errors.New("unsafe origin URL")
+	}
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return nil, errors.New("unsupported origin URL scheme")
+	}
+	if target && u.Path != "" && u.Path != "/" {
+		return nil, errors.New("backend URL must not contain a path")
+	}
+	return u, nil
+}
+
+func effectiveOriginPort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return "443"
+	}
+	return "80"
 }
 
 // session is the HTTP state of one RegisterAndAuthorizeDevice call: one cookie jar, one client,
@@ -101,6 +188,13 @@ func extractCSRF(body []byte) string {
 func (c *Client) RegisterAndAuthorizeDevice(
 	ctx context.Context, username, password, deviceID, clientURI string,
 ) (*DeviceTokens, error) {
+	if !validRegistrationUsername(username) || !validMASField(password, maxMASOAuthFieldBytes) ||
+		!validMatrixDeviceID(deviceID) {
+		return nil, fmt.Errorf("registration identity or credential is invalid")
+	}
+	if err := validateSameOrigin(c.baseURL, clientURI); err != nil {
+		return nil, err
+	}
 	s, err := c.registerSession(ctx, username, password)
 	if err != nil {
 		return nil, err
@@ -141,21 +235,12 @@ func (c *Client) registerSession(ctx context.Context, username, password string)
 	if err != nil {
 		return nil, fmt.Errorf("parse MAS base URL: %w", err)
 	}
-	s := &session{
-		baseURL: c.baseURL,
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-			Jar:     jar,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) >= 10 {
-					return errors.New("MAS registration exceeded redirect limit")
-				}
-				if req.URL.Scheme != base.Scheme || req.URL.Host != base.Host {
-					return errors.New("MAS redirected outside its configured origin")
-				}
-				return nil
-			},
-		},
+	s := &session{baseURL: c.baseURL}
+	s.httpClient = &http.Client{
+		Timeout:       30 * time.Second,
+		Transport:     noProxyTransport(),
+		Jar:           jar,
+		CheckRedirect: registrationRedirectPolicy(base),
 	}
 	if err := s.register(ctx, username, password); err != nil {
 		return nil, err
@@ -167,12 +252,159 @@ func (s *session) publicClient() *http.Client {
 	if s.publicHTTPClient != nil {
 		return s.publicHTTPClient
 	}
+	s.publicHTTPClient = newPublicHTTPClient()
+	return s.publicHTTPClient
+}
+
+func newPublicHTTPClient() *http.Client {
 	return &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout:   30 * time.Second,
+		Transport: noProxyTransport(),
 		// Public OAuth endpoints must never redirect: a 307/308 could otherwise replay a device
 		// code or bearer token to an attacker-controlled origin.
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errMASPublicRedirect
+		},
 	}
+}
+
+func registrationRedirectPolicy(base *url.URL) func(*http.Request, []*http.Request) error {
+	return func(next *http.Request, via []*http.Request) error {
+		// net/http attaches the redirect response to the upcoming request passed as
+		// next.Response. Requests in via are the already-sent requests and normally
+		// have no Response field, so reading via[len(via)-1].Response rejects every
+		// valid redirect before its method and origin can be checked.
+		if len(via) == 0 || next == nil || next.Response == nil {
+			return errMASRedirectNoSource
+		}
+		if len(via) >= 8 {
+			return errMASRedirectLimit
+		}
+		previous := via[len(via)-1]
+		status := next.Response.StatusCode
+		if status == http.StatusTemporaryRedirect || status == http.StatusPermanentRedirect {
+			return errMASBodyReplayRedirect
+		}
+		if status != http.StatusSeeOther || next.Method != http.MethodGet || next.Body != nil {
+			return errMASRedirectStatus
+		}
+		if !sameOriginURL(base, next.URL) {
+			return errMASRedirectOrigin
+		}
+		if next.URL.User != nil || next.URL.RawQuery != "" || next.URL.ForceQuery ||
+			next.URL.Fragment != "" || next.URL.RawPath != "" {
+			return errMASRedirectUnsafeURL
+		}
+		if !validRegistrationTransition(base, previous.Method, previous.URL, next.URL) {
+			return errMASRedirectUnexpected
+		}
+		return nil
+	}
+}
+
+func sameOriginURL(left, right *url.URL) bool {
+	return left != nil && right != nil &&
+		strings.EqualFold(left.Scheme, right.Scheme) &&
+		strings.EqualFold(left.Hostname(), right.Hostname()) &&
+		effectiveOriginPort(left) == effectiveOriginPort(right)
+}
+
+func validRegistrationTransition(base *url.URL, method string, from, to *url.URL) bool {
+	fromPath, fromOK := relativeMASPath(base, from)
+	toPath, toOK := relativeMASPath(base, to)
+	if !fromOK || !toOK {
+		return false
+	}
+	switch {
+	case method == http.MethodGet && fromPath == "/register":
+		return toPath == "/register/password"
+	case method == http.MethodPost && fromPath == "/register/password":
+		_, step, ok := registrationStep(toPath)
+		return ok && step == "finish"
+	case method == http.MethodGet:
+		fromID, fromStep, ok := registrationStep(fromPath)
+		if !ok || fromStep != "finish" {
+			return false
+		}
+		toID, toStep, isStep := registrationStep(toPath)
+		return (isStep && toID == fromID && toStep == "display-name") || isRegistrationCompletionPath(toPath)
+	case method == http.MethodPost:
+		fromID, fromStep, ok := registrationStep(fromPath)
+		if ok && fromStep == "display-name" {
+			toID, toStep, targetOK := registrationStep(toPath)
+			return targetOK && toID == fromID && toStep == "finish"
+		}
+		if isDeviceConsentRelativePath(fromPath) {
+			return toPath == "/device/complete"
+		}
+		return !ok && fromPath == "/link" && isDeviceConsentRelativePath(toPath)
+	default:
+		return false
+	}
+}
+
+func relativeMASPath(base, target *url.URL) (string, bool) {
+	if !sameOriginURL(base, target) {
+		return "", false
+	}
+	prefix := strings.TrimRight(base.Path, "/")
+	if prefix != "" {
+		if target.Path == prefix {
+			return "/", true
+		}
+		if !strings.HasPrefix(target.Path, prefix+"/") {
+			return "", false
+		}
+		return strings.TrimPrefix(target.Path, prefix), true
+	}
+	if !strings.HasPrefix(target.Path, "/") {
+		return "", false
+	}
+	return target.Path, true
+}
+
+func registrationStep(path string) (id, step string, ok bool) {
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	if len(parts) != 4 || parts[0] != "register" || parts[1] != "steps" ||
+		!validFlowPathSegment(parts[2]) || (parts[3] != "finish" && parts[3] != "display-name") {
+		return "", "", false
+	}
+	return parts[2], parts[3], true
+}
+
+func isDeviceConsentRelativePath(path string) bool {
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	return len(parts) == 2 && parts[0] == "device" && parts[1] != "complete" && validFlowPathSegment(parts[1])
+}
+
+func validFlowPathSegment(value string) bool {
+	if value == "" || len(value) > maxMatrixIdentityBytes {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= 'A' && r <= 'Z') && !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && r != '-' && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func isRegistrationCompletionPath(path string) bool {
+	// These are the only completion locations exercised by Controlplane's current MAS 1.23
+	// fixture. They are intentionally not a claim that MAS documents a broader redirect
+	// contract: the disposable exact-image integration test is the release gate for this list.
+	return path == "/" || path == "/welcome"
+}
+
+func noProxyTransport() http.RoundTripper {
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Transport{}
+	}
+	transport = transport.Clone()
+	transport.Proxy = nil
+	transport.MaxResponseHeaderBytes = maxMASResponseHeaderBytes
+	return transport
 }
 
 func (c *session) register(ctx context.Context, username, password string) error {
@@ -182,11 +414,10 @@ func (c *session) register(ctx context.Context, username, password string) error
 		return fmt.Errorf("masreg: load register form: %w", err)
 	}
 	if !c.isRegistrationPath(formURL.Path) || !strings.HasSuffix(formURL.Path, "/register/password") {
-		return fmt.Errorf("masreg: expected to land on /register/password, got %q — "+
-			"is an upstream OAuth provider configured alongside password registration?", formURL.Path)
+		return errors.New("masreg: expected the password-registration form; is an upstream OAuth provider configured?")
 	}
-	if csrf == "" {
-		return fmt.Errorf("masreg: no csrf token found on the password registration page: %s", sniffError(body))
+	if !validMASField(csrf, maxMASOAuthFieldBytes) {
+		return fmt.Errorf("masreg: no valid csrf token found on the password registration page: %s", sniffError(body))
 	}
 
 	// Step 2: POST /register/password. Field names from password.html / password.rs's
@@ -204,11 +435,10 @@ func (c *session) register(ctx context.Context, username, password string) error
 		return fmt.Errorf("masreg: submit password form: %w", err)
 	}
 	if !c.isRegistrationPath(formURL.Path) || !strings.Contains(formURL.Path, "/register/steps/") || !strings.HasSuffix(formURL.Path, "/display-name") {
-		return fmt.Errorf("masreg: expected to land on the display-name step, got %q: %s",
-			formURL.Path, sniffError(body))
+		return fmt.Errorf("masreg: password registration did not reach the expected display-name step: %s", sniffError(body))
 	}
-	if csrf == "" {
-		return fmt.Errorf("masreg: no csrf token found on the display-name step page: %s", sniffError(body))
+	if !validMASField(csrf, maxMASOAuthFieldBytes) {
+		return fmt.Errorf("masreg: no valid csrf token found on the display-name step page: %s", sniffError(body))
 	}
 
 	// Step 3: POST .../display-name with action=skip (display_name.rs: skip defaults the
@@ -222,9 +452,9 @@ func (c *session) register(ctx context.Context, username, password string) error
 	if err != nil {
 		return fmt.Errorf("masreg: submit display-name step: %w", err)
 	}
-	if c.isRegistrationPath(formURL.Path) {
-		return fmt.Errorf("masreg: registration did not complete, still on %q: %s",
-			formURL.Path, sniffError(body))
+	relativePath, completionOK := relativeMASPath(mustParseURL(c.baseURL), formURL)
+	if c.isRegistrationPath(formURL.Path) || !completionOK || !isRegistrationCompletionPath(relativePath) {
+		return fmt.Errorf("masreg: registration did not complete at the expected landing page: %s", sniffError(body))
 	}
 
 	return nil
@@ -250,6 +480,9 @@ type deviceAuthorization struct {
 }
 
 func (s *session) registerPublicNativeClient(ctx context.Context, clientURI string) (string, error) {
+	if !validMASField(clientURI, maxMASOAuthFieldBytes) {
+		return "", fmt.Errorf("client_uri is invalid or too large")
+	}
 	payload := struct {
 		ClientName              string   `json:"client_name"`
 		ClientURI               string   `json:"client_uri"`
@@ -259,7 +492,7 @@ func (s *session) registerPublicNativeClient(ctx context.Context, clientURI stri
 		GrantTypes              []string `json:"grant_types"`
 		ResponseTypes           []string `json:"response_types"`
 	}{
-		ClientName:              "TeleCrypt Redpill agent",
+		ClientName:              "TeleCrypt Registration agent",
 		ClientURI:               clientURI,
 		RedirectURIs:            []string{clientURI},
 		ApplicationType:         "native",
@@ -284,7 +517,7 @@ func (s *session) registerPublicNativeClient(ctx context.Context, clientURI stri
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.publicClient().Do(req)
 	if err != nil {
-		return "", err
+		return "", boundedMASRequestError(ctx, "register public OAuth client", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
@@ -293,16 +526,19 @@ func (s *session) registerPublicNativeClient(ctx context.Context, clientURI stri
 	var out struct {
 		ClientID string `json:"client_id"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
+	if err := jsonbody.Decode(resp.Body, maxMASJSONBodyBytes, &out); err != nil {
+		return "", fmt.Errorf("decode OAuth client response failed")
 	}
-	if out.ClientID == "" {
+	if !validMASField(out.ClientID, maxMASOAuthFieldBytes) {
 		return "", fmt.Errorf("response has no client_id")
 	}
 	return out.ClientID, nil
 }
 
 func (s *session) startDeviceAuthorization(ctx context.Context, clientID, deviceID string) (*deviceAuthorization, error) {
+	if !validMASField(clientID, maxMASOAuthFieldBytes) || !validMASField(deviceID, maxMatrixIdentityBytes) {
+		return nil, fmt.Errorf("device authorization identity is invalid")
+	}
 	form := url.Values{
 		"client_id": {clientID},
 		"scope":     {"openid urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:" + deviceID},
@@ -314,21 +550,24 @@ func (s *session) startDeviceAuthorization(ctx context.Context, clientID, device
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := s.publicClient().Do(req)
 	if err != nil {
-		return nil, err
+		return nil, boundedMASRequestError(ctx, "start device authorization", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return nil, unexpectedStatus(resp)
 	}
 	var out deviceAuthorization
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+	if err := jsonbody.Decode(resp.Body, maxMASJSONBodyBytes, &out); err != nil {
+		return nil, fmt.Errorf("decode device authorization response failed")
 	}
-	if out.DeviceCode == "" || out.UserCode == "" || out.ExpiresIn <= 0 {
+	if !validMASField(out.DeviceCode, maxMASOAuthFieldBytes) || !validMASField(out.UserCode, maxMASOAuthFieldBytes) || out.ExpiresIn <= 0 || out.ExpiresIn > int(maxMASDeviceLifetime/time.Second) {
 		return nil, fmt.Errorf("response is missing device authorization fields")
 	}
 	if out.Interval <= 0 {
 		out.Interval = 5
+	}
+	if out.Interval > int(maxMASDeviceInterval/time.Second) {
+		return nil, fmt.Errorf("response has an invalid polling interval")
 	}
 	return &out, nil
 }
@@ -348,14 +587,10 @@ func (s *session) approveDeviceAuthorization(ctx context.Context, userCode strin
 		return fmt.Errorf("load device link: %w", err)
 	}
 	if formURL == nil || formURL.Path != linkURL.Path {
-		path := "<nil>"
-		if formURL != nil {
-			path = formURL.Path
-		}
-		return fmt.Errorf("device link form landed at %q: %s", path, sniffError(body))
+		return fmt.Errorf("device link form landed outside the expected path: %s", sniffError(body))
 	}
-	if csrf == "" {
-		return fmt.Errorf("no csrf token found on device link form: %s", sniffError(body))
+	if !validMASField(csrf, maxMASOAuthFieldBytes) {
+		return fmt.Errorf("no valid csrf token found on device link form: %s", sniffError(body))
 	}
 	csrf, consentURL, body, err := s.postForm(ctx, formURL.String(), url.Values{
 		"csrf": {csrf},
@@ -365,16 +600,12 @@ func (s *session) approveDeviceAuthorization(ctx context.Context, userCode strin
 		return fmt.Errorf("submit device code: %w", err)
 	}
 	if consentURL == nil || !s.isDeviceConsentPath(consentURL.Path) {
-		path := "<nil>"
-		if consentURL != nil {
-			path = consentURL.Path
-		}
-		return fmt.Errorf("device link did not redirect to consent: %q: %s", path, sniffError(body))
+		return fmt.Errorf("device link did not redirect to the expected consent path: %s", sniffError(body))
 	}
-	if csrf == "" {
-		return fmt.Errorf("no csrf token found on device consent page: %s", sniffError(body))
+	if !validMASField(csrf, maxMASOAuthFieldBytes) {
+		return fmt.Errorf("no valid csrf token found on device consent page: %s", sniffError(body))
 	}
-	_, _, _, err = s.postForm(ctx, consentURL.String(), url.Values{
+	_, completionURL, body, err := s.postForm(ctx, consentURL.String(), url.Values{
 		"csrf":           {csrf},
 		"confirm_device": {"on"},
 		"action":         {"consent"},
@@ -382,7 +613,18 @@ func (s *session) approveDeviceAuthorization(ctx context.Context, userCode strin
 	if err != nil {
 		return fmt.Errorf("submit device consent: %w", err)
 	}
+	relativePath, completionOK := relativeMASPath(mustParseURL(s.baseURL), completionURL)
+	// /device/complete is the sole completion location in the current MAS 1.23 fixture. Keep
+	// this fail-closed until the required disposable exact-image release test observes a change.
+	if !completionOK || relativePath != "/device/complete" {
+		return fmt.Errorf("device consent did not complete at the expected landing page: %s", sniffError(body))
+	}
 	return nil
+}
+
+func mustParseURL(raw string) *url.URL {
+	u, _ := url.Parse(raw)
+	return u
 }
 
 func (s *session) isDeviceConsentPath(path string) bool {
@@ -390,11 +632,16 @@ func (s *session) isDeviceConsentPath(path string) bool {
 	if err != nil {
 		return false
 	}
-	prefix := strings.TrimRight(base.Path, "/") + "/device/"
-	return strings.HasPrefix(path, prefix) && len(path) > len(prefix)
+	target := *base
+	target.Path = path
+	relative, ok := relativeMASPath(base, &target)
+	return ok && isDeviceConsentRelativePath(relative)
 }
 
 func (s *session) pollDeviceToken(ctx context.Context, clientID string, device *deviceAuthorization) (*DeviceTokens, error) {
+	if device == nil || !validMASField(clientID, maxMASOAuthFieldBytes) || !validMASField(device.DeviceCode, maxMASOAuthFieldBytes) || !validMASField(device.UserCode, maxMASOAuthFieldBytes) || device.ExpiresIn <= 0 || device.ExpiresIn > int(maxMASDeviceLifetime/time.Second) || device.Interval <= 0 || device.Interval > int(maxMASDeviceInterval/time.Second) {
+		return nil, fmt.Errorf("invalid device authorization state")
+	}
 	deadline := time.Now().Add(time.Duration(device.ExpiresIn) * time.Second)
 	interval := time.Duration(device.Interval) * time.Second
 	for {
@@ -419,7 +666,7 @@ func (s *session) pollDeviceToken(ctx context.Context, clientID string, device *
 			continue
 		}
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError {
-			io.Copy(io.Discard, resp.Body)
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxMASJSONBodyBytes))
 			resp.Body.Close()
 			if err := waitForRetry(ctx, interval, deadline); err != nil {
 				return nil, err
@@ -432,13 +679,13 @@ func (s *session) pollDeviceToken(ctx context.Context, clientID string, device *
 			ExpiresIn    int    `json:"expires_in"`
 			Error        string `json:"error"`
 		}
-		decodeErr := json.NewDecoder(resp.Body).Decode(&out)
+		decodeErr := jsonbody.Decode(resp.Body, maxMASJSONBodyBytes, &out)
 		resp.Body.Close()
 		if decodeErr != nil {
-			return nil, fmt.Errorf("decode response: %w", decodeErr)
+			return nil, fmt.Errorf("decode token response failed")
 		}
 		if resp.StatusCode == http.StatusOK {
-			if out.AccessToken == "" || out.RefreshToken == "" || out.ExpiresIn <= 0 {
+			if !validMASField(out.AccessToken, maxMASOAuthFieldBytes) || !validMASField(out.RefreshToken, maxMASOAuthFieldBytes) || out.ExpiresIn <= 0 || out.ExpiresIn > int(maxMASAccessLifetime/time.Second) {
 				return nil, fmt.Errorf("token response is missing access_token, refresh_token, or expires_in")
 			}
 			return &DeviceTokens{AccessToken: out.AccessToken, RefreshToken: out.RefreshToken, ExpiresIn: out.ExpiresIn}, nil
@@ -447,6 +694,9 @@ func (s *session) pollDeviceToken(ctx context.Context, clientID string, device *
 			return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
 		}
 		if out.Error == "slow_down" {
+			if interval > maxMASDeviceInterval-5*time.Second {
+				return nil, fmt.Errorf("device authorization polling interval exceeded limit")
+			}
 			interval += 5 * time.Second
 		}
 		if err := waitForRetry(ctx, interval, deadline); err != nil {
@@ -470,6 +720,12 @@ func waitForRetry(ctx context.Context, interval time.Duration, deadline time.Tim
 }
 
 func (s *session) whoAmI(ctx context.Context, homeserver, accessToken string) (string, string, error) {
+	if !validMASField(accessToken, maxMASOAuthFieldBytes) {
+		return "", "", fmt.Errorf("invalid access token")
+	}
+	if err := validateSameOrigin(s.baseURL, homeserver); err != nil {
+		return "", "", err
+	}
 	u, err := url.Parse(homeserver)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return "", "", fmt.Errorf("invalid homeserver URL")
@@ -489,7 +745,7 @@ func (s *session) whoAmI(ctx context.Context, homeserver, accessToken string) (s
 				return "", "", ctx.Err()
 			}
 			if attempt == 5 {
-				return "", "", fmt.Errorf("identity transport failure after retries: %w", err)
+				return "", "", boundedMASRequestError(ctx, "identity transport after retries", err)
 			}
 			if err := waitForContext(ctx, delay); err != nil {
 				return "", "", err
@@ -502,12 +758,12 @@ func (s *session) whoAmI(ctx context.Context, homeserver, accessToken string) (s
 				UserID   string `json:"user_id"`
 				DeviceID string `json:"device_id"`
 			}
-			err := json.NewDecoder(resp.Body).Decode(&out)
+			err := jsonbody.Decode(resp.Body, maxMASJSONBodyBytes, &out)
 			resp.Body.Close()
 			if err != nil {
-				return "", "", fmt.Errorf("decode response: %w", err)
+				return "", "", fmt.Errorf("decode identity response failed")
 			}
-			if out.UserID == "" || out.DeviceID == "" {
+			if !validMatrixUserID(out.UserID) || !validMatrixDeviceID(out.DeviceID) {
 				return "", "", fmt.Errorf("response is missing user_id or device_id")
 			}
 			return out.UserID, out.DeviceID, nil
@@ -528,6 +784,117 @@ func (s *session) whoAmI(ctx context.Context, homeserver, accessToken string) (s
 	return "", "", fmt.Errorf("identity was not ready")
 }
 
+func validMASField(value string, maxBytes int) bool {
+	if value == "" || len(value) > maxBytes {
+		return false
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func validRegistrationUsername(value string) bool {
+	if !validMASField(value, maxMatrixIdentityBytes) {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && !strings.ContainsRune("._=-/+", r) {
+			return false
+		}
+	}
+	return true
+}
+
+func validMatrixUserID(value string) bool {
+	if !validMASField(value, maxMatrixIdentityBytes) || !strings.HasPrefix(value, "@") {
+		return false
+	}
+	colon := strings.IndexByte(value[1:], ':')
+	if colon < 1 {
+		return false
+	}
+	colon++
+	localpart, serverName := value[1:colon], value[colon+1:]
+	if len(localpart) == 0 || len(serverName) == 0 {
+		return false
+	}
+	for _, r := range localpart {
+		if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && !strings.ContainsRune("._=-/+", r) {
+			return false
+		}
+	}
+	return validMatrixServerName(serverName)
+}
+
+// validMatrixServerName accepts the Matrix server-name grammar without allowing URL syntax,
+// Unicode confusables, userinfo, or query/fragment delimiters into the identity returned by MAS.
+// Hostnames are deliberately lowercase because Controlplane's deployment identity is canonical.
+func validMatrixServerName(value string) bool {
+	if value == "" || len(value) > 255 {
+		return false
+	}
+	if strings.HasPrefix(value, "[") {
+		close := strings.IndexByte(value, ']')
+		if close < 0 || close == 1 || !strings.Contains(value[1:close], ":") {
+			return false
+		}
+		if net.ParseIP(value[1:close]) == nil {
+			return false
+		}
+		return validMatrixPort(value[close+1:])
+	}
+	host, port, hasPort := value, "", false
+	if strings.Count(value, ":") > 1 {
+		return false
+	}
+	if i := strings.LastIndexByte(value, ':'); i >= 0 {
+		host, port, hasPort = value[:i], value[i+1:], true
+	}
+	if net.ParseIP(host) != nil {
+		return !hasPort || validMatrixPort(":"+port)
+	}
+	if host == "" || len(host) > 253 || strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && r != '-' {
+				return false
+			}
+		}
+	}
+	return !hasPort || validMatrixPort(":"+port)
+}
+
+func validMatrixPort(value string) bool {
+	if value == "" {
+		return true
+	}
+	if !strings.HasPrefix(value, ":") || len(value) == 1 {
+		return false
+	}
+	port, err := strconv.ParseUint(value[1:], 10, 16)
+	return err == nil && port != 0
+}
+
+func validMatrixDeviceID(value string) bool {
+	if !validMASField(value, maxMatrixIdentityBytes) {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= 'A' && r <= 'Z') && !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && !strings.ContainsRune("._=-", r) {
+			return false
+		}
+	}
+	return true
+}
+
 func waitForContext(ctx context.Context, delay time.Duration) error {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
@@ -539,10 +906,34 @@ func waitForContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
+// boundedMASRequestError preserves only context cancellation and this package's fixed redirect
+// policy errors. Transport errors are otherwise opaque: implementations can include arbitrary
+// upstream text, URLs, or credentials in Error(), so they must not cross the package boundary.
+func boundedMASRequestError(ctx context.Context, operation string, err error) error {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	for _, known := range boundedMASRequestErrors {
+		if errors.Is(err, known) {
+			return fmt.Errorf("%s: %w", operation, known)
+		}
+	}
+	return fmt.Errorf("%s failed", operation)
+}
+
 func unexpectedStatus(resp *http.Response) error {
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxMASHTMLBodyBytes+1))
 	if err != nil {
-		return fmt.Errorf("read status response: %w", err)
+		return fmt.Errorf("read status response failed")
+	}
+	if len(body) > maxMASHTMLBodyBytes {
+		return fmt.Errorf("unexpected status %d: response body too large", resp.StatusCode)
 	}
 	return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, sniffError(body))
 }
@@ -569,31 +960,37 @@ func (c *session) postForm(ctx context.Context, target string, form url.Values) 
 func (c *session) do(req *http.Request) (csrf string, finalURL *url.URL, body []byte, err error) {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, boundedMASRequestError(req.Context(), "MAS form request", err)
 	}
 	defer resp.Body.Close()
 
-	body, err = io.ReadAll(resp.Body)
+	body, err = io.ReadAll(io.LimitReader(resp.Body, maxMASHTMLBodyBytes+1))
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, fmt.Errorf("read MAS form response failed")
+	}
+	if len(body) > maxMASHTMLBodyBytes {
+		return "", nil, nil, fmt.Errorf("MAS response body too large")
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", nil, nil, fmt.Errorf("unexpected status %d at %s: %s",
-			resp.StatusCode, resp.Request.URL, sniffError(body))
+		return "", nil, nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, sniffError(body))
+	}
+	if resp.Request == nil || resp.Request.URL == nil || !sameOriginURL(mustParseURL(c.baseURL), resp.Request.URL) ||
+		resp.Request.URL.User != nil || resp.Request.URL.RawQuery != "" || resp.Request.URL.ForceQuery ||
+		resp.Request.URL.Fragment != "" || resp.Request.URL.RawPath != "" {
+		return "", nil, nil, fmt.Errorf("MAS form landed at an unsafe URL")
 	}
 	return extractCSRF(body), resp.Request.URL, body, nil
 }
 
 var formErrorRe = regexp.MustCompile(`text-critical[^>]*>\s*([^<]+)`)
 
-// sniffError makes a best-effort attempt to pull a human-readable validation message out of a
-// MAS-rendered error page for diagnostics. Never includes the password — MAS's own error
-// rendering doesn't echo submitted field values back for password fields, and this function only
-// ever reads the response body, never the request.
+// sniffError classifies a MAS-rendered error page without returning upstream text. MAS's form
+// renderer normally places validation text in a text-critical element, but that text can include
+// user-controlled values or future sensitive fields. Keep the caller's error stable and bounded.
 func sniffError(body []byte) string {
 	m := formErrorRe.FindSubmatch(body)
 	if m == nil {
 		return "no error text found in response body"
 	}
-	return strings.TrimSpace(string(m[1]))
+	return "upstream validation error"
 }

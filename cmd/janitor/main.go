@@ -1,6 +1,6 @@
 // Command janitor is TeleCrypt.io's one-shot maintenance process holding a standing MAS admin
 // credential. Each invocation locks stale unclaimed agent accounts via MAS's admin API and emails
-// the owner a digest of new human sign-ups awaiting review. DRY_RUN=1 logs every action it would
+// the owner a digest of new human sign-ups awaiting review. JANITOR_DRY_RUN=1 logs every action it would
 // take without doing it.
 //
 // janitor opens NO listening network port of any kind: zero inbound attack surface. This is
@@ -14,8 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-
-	"github.com/jackc/pgx/v5/pgxpool"
+	"time"
 
 	"github.com/TeleCrypt-io/controlplane/internal/config"
 	"github.com/TeleCrypt-io/controlplane/internal/db"
@@ -24,64 +23,90 @@ import (
 )
 
 func main() {
-	cfg, err := config.LoadLocker()
+	if err := run(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	cfg, err := config.LoadJanitor()
 	if err != nil {
 		slog.Error("config", "error", err)
-		os.Exit(1)
+		return err
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	signalCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// One fixed budget covers the complete one-shot: database connection and lock acquisition,
+	// identity binding, migration, all MAS pages and per-user checks, SMTP delivery, and the
+	// invocation-lock cleanup. A bounded retry is safer than allowing a privileged single-flight
+	// lease to survive indefinitely; the next scheduled invocation can resume idempotent work.
+	ctx, cancel := context.WithTimeout(signalCtx, janitorInvocationTimeout)
+	defer cancel()
 
-	pool, err := pgxpool.New(ctx, cfg.JanitorDBURL)
+	pool, err := db.OpenJanitorPool(ctx, cfg.JanitorDBURL)
 	if err != nil {
 		slog.Error("db connect", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer pool.Close()
+	if err := db.ValidateJanitorRole(ctx, pool); err != nil {
+		slog.Error("db role", "error", err)
+		return err
+	}
+	invocationLock, err := db.AcquireJanitorInvocationLock(ctx, pool)
+	if err != nil {
+		slog.Error("janitor single-flight", "error", err)
+		return err
+	}
+	defer invocationLock.Release(ctx)
 
-	if err := db.Migrate(ctx, pool); err != nil {
-		slog.Error("migrate", "error", err)
-		os.Exit(1)
+	if err := db.ValidateJanitorSchemaACL(ctx, pool); err != nil {
+		slog.Error("db schema contract", "error", err)
+		return err
 	}
 	store := db.NewStore(pool)
-	if err := store.BindBillingEnvironment(ctx, cfg.BillingEnv, cfg.ServerName); err != nil {
-		slog.Error("billing environment guard", "error", err)
-		os.Exit(1)
+	if err := db.Migrate(ctx, pool); err != nil {
+		slog.Error("migrate", "error", err)
+		return err
+	}
+	if err := store.VerifyDeploymentIdentity(ctx, cfg.ServerName, cfg.BillingEnvironment); err != nil {
+		slog.Error("deployment identity", "error", err)
+		return err
+	}
+	if err := db.ValidateJanitorDatabaseContract(ctx, pool, cfg.CashierDBRole); err != nil {
+		slog.Error("db contract", "error", err)
+		return err
 	}
 
-	sweeper := build(cfg, pool)
+	sweeper := build(cfg, store)
 
 	if err := sweeper.Sweep(ctx); err != nil {
 		slog.Error("sweep", "error", err)
-		os.Exit(1)
+		return err
 	}
 	slog.Info("janitor sweep complete", "dry_run", cfg.DryRun)
+	return nil
 }
 
-func build(cfg *config.LockerConfig, pool *pgxpool.Pool) *janitor.Sweeper {
+func build(cfg *config.JanitorConfig, store *db.Store) *janitor.Sweeper {
 	masClient := masadmin.NewClient(cfg.MASAdminURL, cfg.MASAdminClientID, cfg.MASAdminClientSecret)
-	store := db.NewStore(pool)
-
-	var mailer janitor.Mailer
-	if cfg.SMTPHost != "" {
-		mailer = &janitor.SMTPMailer{
-			Host:     cfg.SMTPHost,
-			Port:     janitorSMTPPort,
-			Username: cfg.SMTPUsername,
-			Password: cfg.SMTPPassword,
-			From:     cfg.SMTPFrom,
-		}
-	} else {
-		mailer = janitor.LogMailer{}
+	mailer := &janitor.SMTPMailer{
+		Host:     cfg.SMTPHost,
+		Port:     janitorSMTPPort,
+		Username: cfg.SMTPUsername,
+		Password: cfg.SMTPPassword,
+		From:     cfg.SMTPFrom,
 	}
 
 	return janitor.NewSweeper(masClient, store, mailer, janitor.Config{
-		ServerName: cfg.ServerName,
-		DryRun:     cfg.DryRun,
-		OwnerEmail: cfg.OwnerEmail,
+		ServerName: cfg.ServerName, BillingEnvironment: cfg.BillingEnvironment,
+		DryRun: cfg.DryRun, OwnerEmail: cfg.OwnerEmail,
 	})
 }
 
-const janitorSMTPPort = "587"
+const (
+	janitorSMTPPort          = "587"
+	janitorInvocationTimeout = 15 * time.Minute
+)

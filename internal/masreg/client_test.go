@@ -1,16 +1,149 @@
 package masreg
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestSniffErrorDoesNotExposeUpstreamBody(t *testing.T) {
+	secret := "database-password=must-not-escape"
+	body := append([]byte("<div class=\"text-critical\">"+secret+"</div>"), bytes.Repeat([]byte("x"), maxMASHTMLBodyBytes)...)
+	if got := sniffError(body); got != "upstream validation error" {
+		t.Fatalf("sniffError = %q, want stable validation error", got)
+	}
+	if strings.Contains(sniffError(body), secret) {
+		t.Fatal("sniffError returned sensitive upstream body")
+	}
+}
+
+func TestValidateSameOrigin(t *testing.T) {
+	tests := []struct {
+		name   string
+		base   string
+		target string
+		want   bool
+	}{
+		{name: "same origin with MAS path", base: "https://backend.example/auth", target: "https://backend.example/", want: true},
+		{name: "default HTTPS port", base: "https://backend.example", target: "https://backend.example:443", want: true},
+		{name: "IPv6 and explicit port", base: "https://[2001:db8::1]:8448/auth", target: "https://[2001:db8::1]:8448", want: true},
+		{name: "IPv6 different port", base: "https://[2001:db8::1]:8448/auth", target: "https://[2001:db8::1]:443", want: false},
+		{name: "different host", base: "https://backend.example", target: "https://evil.example", want: false},
+		{name: "different scheme", base: "https://backend.example/auth", target: "http://backend.example", want: false},
+		{name: "empty host", base: "https://:443/auth", target: "https://:443", want: false},
+		{name: "backend path", base: "https://backend.example", target: "https://backend.example/auth", want: false},
+		{name: "backend query", base: "https://backend.example", target: "https://backend.example/?token=leak", want: false},
+		{name: "backend credentials", base: "https://backend.example", target: "https://user:password@backend.example", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validateSameOrigin(test.base, test.target) == nil; got != test.want {
+				t.Fatalf("validateSameOrigin(%q, %q) = %t, want %t", test.base, test.target, got, test.want)
+			}
+		})
+	}
+}
+
+func TestRegisterAndAuthorizeDeviceRejectsInvalidInputsBeforeHTTP(t *testing.T) {
+	client := NewClient("https://backend.example/auth")
+	for _, test := range []struct {
+		name, username, password, deviceID string
+	}{
+		{name: "username", username: "Alice", password: "generated-password", deviceID: "DEVICE-123"},
+		{name: "password", username: "alice", password: "bad\npassword", deviceID: "DEVICE-123"},
+		{name: "device", username: "alice", password: "generated-password", deviceID: "DEVICE/123"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := client.RegisterAndAuthorizeDevice(
+				context.Background(), test.username, test.password, test.deviceID, "https://backend.example",
+			)
+			if err == nil || !strings.Contains(err.Error(), "invalid") {
+				t.Fatalf("RegisterAndAuthorizeDevice error = %v, want input rejection", err)
+			}
+		})
+	}
+}
+
+func TestRegistrationRedirectPolicy(t *testing.T) {
+	base, err := url.Parse("https://[2001:db8::1]:8448/auth")
+	if err != nil {
+		t.Fatalf("parse base: %v", err)
+	}
+	policy := registrationRedirectPolicy(base)
+	request := func(method, target string) *http.Request {
+		t.Helper()
+		req, requestErr := http.NewRequest(method, target, nil)
+		if requestErr != nil {
+			t.Fatalf("new request: %v", requestErr)
+		}
+		return req
+	}
+	next := func(target string, status int) *http.Request {
+		t.Helper()
+		req, requestErr := http.NewRequest(http.MethodGet, target, nil)
+		if requestErr != nil {
+			t.Fatalf("new redirect request: %v", requestErr)
+		}
+		req.Response = &http.Response{StatusCode: status}
+		return req
+	}
+
+	valid := []struct{ method, from, to string }{
+		{http.MethodGet, "/register", "/register/password"},
+		{http.MethodPost, "/register/password", "/register/steps/01J00000000000000000000000/finish"},
+		{http.MethodGet, "/register/steps/01J00000000000000000000000/finish", "/register/steps/01J00000000000000000000000/display-name"},
+		{http.MethodPost, "/register/steps/01J00000000000000000000000/display-name", "/register/steps/01J00000000000000000000000/finish"},
+		{http.MethodGet, "/register/steps/01J00000000000000000000000/finish", "/welcome"},
+		{http.MethodPost, "/link", "/device/01J00000000000000000000000"},
+		{http.MethodPost, "/device/01J00000000000000000000000", "/device/complete"},
+	}
+	for _, test := range valid {
+		from := "https://[2001:db8::1]:8448/auth" + test.from
+		to := "https://[2001:db8::1]:8448/auth" + test.to
+		if err := policy(next(to, http.StatusSeeOther), []*http.Request{request(test.method, from)}); err != nil {
+			t.Errorf("valid %s %s -> %s rejected: %v", test.method, test.from, test.to, err)
+		}
+	}
+
+	invalid := []struct {
+		name      string
+		status    int
+		from, to  string
+		wantError string
+	}{
+		{name: "temporary redirect", status: http.StatusTemporaryRedirect, from: "/register/password", to: "/register/steps/id/finish", wantError: "body-preserving"},
+		{name: "permanent redirect", status: http.StatusPermanentRedirect, from: "/register/password", to: "/register/steps/id/finish", wantError: "body-preserving"},
+		{name: "found redirect", status: http.StatusFound, from: "/register/password", to: "/register/steps/id/finish", wantError: "requires a 303"},
+		{name: "wrong port", status: http.StatusSeeOther, from: "/register", to: "https://[2001:db8::1]:8449/auth/register/password", wantError: "outside"},
+		{name: "wrong scheme", status: http.StatusSeeOther, from: "/register", to: "http://[2001:db8::1]:8448/auth/register/password", wantError: "outside"},
+		{name: "encoded path", status: http.StatusSeeOther, from: "/register", to: "https://[2001:db8::1]:8448/auth/%72egister/password", wantError: "unsafe"},
+		{name: "query", status: http.StatusSeeOther, from: "/register", to: "https://[2001:db8::1]:8448/auth/register/password?next=secret", wantError: "unsafe"},
+		{name: "unexpected path", status: http.StatusSeeOther, from: "/register/password", to: "/oauth2/token", wantError: "expected flow"},
+	}
+	for _, test := range invalid {
+		t.Run(test.name, func(t *testing.T) {
+			from := "https://[2001:db8::1]:8448/auth" + test.from
+			to := test.to
+			if strings.HasPrefix(to, "/") {
+				to = "https://[2001:db8::1]:8448/auth" + to
+			}
+			err := policy(next(to, test.status), []*http.Request{request(http.MethodPost, from)})
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("policy error = %v, want %q", err, test.wantError)
+			}
+		})
+	}
+}
 
 func runRegistration(t *testing.T, baseURL string) error {
 	t.Helper()
@@ -22,6 +155,7 @@ func runRegistration(t *testing.T, baseURL string) error {
 
 func TestRegisterAndAuthorizeDeviceMAS123Contract(t *testing.T) {
 	var requests []string
+	displayNameSubmitted := false
 	var mas *httptest.Server
 	mas = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests = append(requests, r.Method+" "+r.URL.Path)
@@ -45,7 +179,13 @@ func TestRegisterAndAuthorizeDeviceMAS123Contract(t *testing.T) {
 					t.Errorf("password form %s = %q, want %q", field, got, want)
 				}
 			}
-			http.Redirect(w, r, "/register/steps/account/display-name", http.StatusSeeOther)
+			http.Redirect(w, r, "/register/steps/account/finish", http.StatusSeeOther)
+		case r.Method == http.MethodGet && r.URL.Path == "/register/steps/account/finish":
+			if displayNameSubmitted {
+				http.Redirect(w, r, "/welcome", http.StatusSeeOther)
+			} else {
+				http.Redirect(w, r, "/register/steps/account/display-name", http.StatusSeeOther)
+			}
 		case r.Method == http.MethodGet && r.URL.Path == "/register/steps/account/display-name":
 			_, _ = w.Write([]byte(`<input name="csrf" value="display-csrf">`))
 		case r.Method == http.MethodPost && r.URL.Path == "/register/steps/account/display-name":
@@ -58,9 +198,8 @@ func TestRegisterAndAuthorizeDeviceMAS123Contract(t *testing.T) {
 			if got, want := r.PostForm.Get("action"), "skip"; got != want {
 				t.Errorf("display-name action = %q, want %q", got, want)
 			}
+			displayNameSubmitted = true
 			http.Redirect(w, r, "/register/steps/account/finish", http.StatusSeeOther)
-		case r.Method == http.MethodGet && r.URL.Path == "/register/steps/account/finish":
-			http.Redirect(w, r, "/welcome", http.StatusSeeOther)
 		case r.Method == http.MethodGet && r.URL.Path == "/welcome":
 			_, _ = w.Write([]byte("registration complete"))
 		case r.Method == http.MethodPost && r.URL.Path == "/oauth2/registration":
@@ -202,6 +341,69 @@ func TestRegisterAndAuthorizeDeviceMAS123Contract(t *testing.T) {
 	}
 }
 
+func TestMatrixIdentityValidationAndDeviceFlowBounds(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		user string
+		dev  string
+		want bool
+	}{
+		{name: "valid", user: "@alice:telecrypt.io", dev: "DEVICE-123", want: true},
+		{name: "valid canonical localpart punctuation", user: "@alice/+_=-:telecrypt.io", dev: "DEVICE-123", want: true},
+		{name: "user missing sigil", user: "alice:telecrypt.io", dev: "DEVICE-123", want: false},
+		{name: "user whitespace", user: "@alice smith:telecrypt.io", dev: "DEVICE-123", want: false},
+		{name: "foreign URL syntax", user: "@alice:telecrypt.io?token=leak", dev: "DEVICE-123", want: false},
+		{name: "invalid server label", user: "@alice:telecrypt..io", dev: "DEVICE-123", want: false},
+		{name: "valid IPv6 server", user: "@alice:[2001:db8::1]:8448", dev: "DEVICE-123", want: true},
+		{name: "device punctuation", user: "@alice:telecrypt.io", dev: "DEVICE/123", want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validMatrixUserID(test.user) && validMatrixDeviceID(test.dev); got != test.want {
+				t.Fatalf("identity validation = %t, want %t", got, test.want)
+			}
+		})
+	}
+	state := &deviceAuthorization{DeviceCode: "device", UserCode: "user", ExpiresIn: int(maxMASDeviceLifetime/time.Second) + 1, Interval: 1}
+	s := &session{baseURL: "https://mas.example"}
+	if _, err := s.pollDeviceToken(context.Background(), "client", state); err == nil {
+		t.Fatal("pollDeviceToken accepted an overflowing device lifetime")
+	}
+}
+
+func TestPollDeviceTokenBoundsAccessTokenLifetimeSeparately(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		expiresIn int
+		wantError bool
+	}{
+		{name: "maximum", expiresIn: int(maxMASAccessLifetime / time.Second)},
+		{name: "over maximum", expiresIn: int(maxMASAccessLifetime/time.Second) + 1, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			transport := &flakyTransport{
+				calls: 1,
+				body: fmt.Sprintf(
+					`{"access_token":"access","refresh_token":"refresh","expires_in":%d}`,
+					test.expiresIn,
+				),
+			}
+			s := &session{
+				baseURL:          "https://mas.example",
+				publicHTTPClient: &http.Client{Transport: transport},
+			}
+			got, err := s.pollDeviceToken(context.Background(), "client", &deviceAuthorization{
+				DeviceCode: "code", UserCode: "user", ExpiresIn: 60, Interval: 1,
+			})
+			if (err != nil) != test.wantError {
+				t.Fatalf("pollDeviceToken error = %v, wantError %t", err, test.wantError)
+			}
+			if !test.wantError && (got == nil || got.ExpiresIn != test.expiresIn) {
+				t.Fatalf("pollDeviceToken result = %#v, want expires_in %d", got, test.expiresIn)
+			}
+		})
+	}
+}
+
 func TestApproveDeviceAuthorizationRejectsUnexpectedSameOriginLanding(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -217,10 +419,16 @@ func TestApproveDeviceAuthorizationRejectsUnexpectedSameOriginLanding(t *testing
 	}))
 	defer srv.Close()
 
-	s := &session{baseURL: srv.URL + "/auth", httpClient: &http.Client{}}
-	err := s.approveDeviceAuthorization(context.Background(), "user-123")
+	base, err := url.Parse(srv.URL + "/auth")
+	if err != nil {
+		t.Fatalf("parse test base: %v", err)
+	}
+	s := &session{baseURL: base.String(), httpClient: &http.Client{CheckRedirect: registrationRedirectPolicy(base)}}
+	err = s.approveDeviceAuthorization(context.Background(), "user-123")
 	if err == nil || !strings.Contains(err.Error(), "did not redirect to consent") {
-		t.Fatalf("approveDeviceAuthorization error = %v, want unexpected same-origin landing rejection", err)
+		if err == nil || !strings.Contains(err.Error(), "expected flow") {
+			t.Fatalf("approveDeviceAuthorization error = %v, want unexpected same-origin landing rejection", err)
+		}
 	}
 }
 
@@ -249,6 +457,34 @@ func TestRegisterAndAuthorizeDeviceRejectsOffOriginRedirect(t *testing.T) {
 	}
 }
 
+func TestRegisterAndAuthorizeDeviceRejectsOffOriginBackend(t *testing.T) {
+	var requests int
+	mas := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
+	defer mas.Close()
+
+	_, err := NewClient(mas.URL).RegisterAndAuthorizeDevice(
+		context.Background(), "alice", "generated-password", "DEVICE-12345", "https://backend.example",
+	)
+	if err == nil || !strings.Contains(err.Error(), "same origin") {
+		t.Fatalf("registration error = %v, want same-origin rejection", err)
+	}
+	if requests != 0 {
+		t.Fatalf("MAS received %d requests before off-origin backend rejection", requests)
+	}
+}
+
+func TestPublicOAuthClientDoesNotUseAmbientProxy(t *testing.T) {
+	s := &session{baseURL: "https://mas.example"}
+	client := s.publicClient()
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("public OAuth transport = %T, want *http.Transport", client.Transport)
+	}
+	if transport.Proxy != nil || transport.MaxResponseHeaderBytes != maxMASResponseHeaderBytes {
+		t.Fatalf("public OAuth transport proxy/response-header bound = %t/%d", transport.Proxy != nil, transport.MaxResponseHeaderBytes)
+	}
+}
+
 func TestRegisterAndAuthorizeDeviceRejectsProviderChoicePage(t *testing.T) {
 	var passwordPosts int
 	mas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -266,7 +502,7 @@ func TestRegisterAndAuthorizeDeviceRejectsProviderChoicePage(t *testing.T) {
 	defer mas.Close()
 
 	err := runRegistration(t, mas.URL)
-	if err == nil || !strings.Contains(err.Error(), "/register/password") {
+	if err == nil || !strings.Contains(err.Error(), "password-registration form") {
 		t.Fatalf("registration error = %v, want provider-choice rejection", err)
 	}
 	if passwordPosts != 0 {
@@ -276,6 +512,7 @@ func TestRegisterAndAuthorizeDeviceRejectsProviderChoicePage(t *testing.T) {
 
 func TestRegisterAndAuthorizeDeviceRejectsIncompleteRegistrationAtBasePath(t *testing.T) {
 	const prefix = "/auth"
+	displayNameSubmitted := false
 	mas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case prefix + "/register":
@@ -288,22 +525,29 @@ func TestRegisterAndAuthorizeDeviceRejectsIncompleteRegistrationAtBasePath(t *te
 				_, _ = w.Write([]byte(`<input name="csrf" value="csrf">`))
 				return
 			}
-			http.Redirect(w, r, prefix+"/register/steps/one/display-name", http.StatusSeeOther)
+			http.Redirect(w, r, prefix+"/register/steps/one/finish", http.StatusSeeOther)
 		case prefix + "/register/steps/one/display-name":
 			if r.Method == http.MethodGet {
 				_, _ = w.Write([]byte(`<input name="csrf" value="csrf">`))
 				return
 			}
+			displayNameSubmitted = true
 			http.Redirect(w, r, prefix+"/register/steps/one/finish", http.StatusSeeOther)
 		case prefix + "/register/steps/one/finish":
-			_, _ = w.Write([]byte("still incomplete"))
+			if displayNameSubmitted {
+				_, _ = w.Write([]byte("still incomplete"))
+			} else {
+				http.Redirect(w, r, prefix+"/register/steps/one/display-name", http.StatusSeeOther)
+			}
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer mas.Close()
 
-	err := runRegistration(t, mas.URL+prefix)
+	_, err := NewClient(mas.URL+prefix).RegisterAndAuthorizeDevice(
+		context.Background(), "alice", "generated-password", "DEVICE-12345", mas.URL,
+	)
 	if err == nil || !strings.Contains(err.Error(), "registration did not complete") {
 		t.Fatalf("registration error = %v, want incomplete registration rejection", err)
 	}
@@ -313,7 +557,7 @@ func TestOAuthRetriesHonorCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	s := &session{baseURL: "http://127.0.0.1:1"}
-	device := &deviceAuthorization{DeviceCode: "code", ExpiresIn: 60, Interval: 1}
+	device := &deviceAuthorization{DeviceCode: "code", UserCode: "user", ExpiresIn: 60, Interval: 1}
 	if _, err := s.pollDeviceToken(ctx, "client", device); !errors.Is(err, context.Canceled) {
 		t.Fatalf("poll error = %v, want context canceled", err)
 	}
@@ -326,6 +570,10 @@ type flakyTransport struct {
 	calls int
 	body  string
 }
+
+type errorTransport struct{ err error }
+
+func (t errorTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, t.err }
 
 func (t *flakyTransport) RoundTrip(*http.Request) (*http.Response, error) {
 	t.calls++
@@ -342,15 +590,40 @@ func (t *flakyTransport) RoundTrip(*http.Request) (*http.Response, error) {
 func TestOAuthRetriesTransientTransportErrors(t *testing.T) {
 	tokenTransport := &flakyTransport{body: `{"access_token":"access","refresh_token":"refresh","expires_in":60}`}
 	s := &session{baseURL: "https://mas.example", publicHTTPClient: &http.Client{Transport: tokenTransport}}
-	got, err := s.pollDeviceToken(context.Background(), "client", &deviceAuthorization{DeviceCode: "code", ExpiresIn: 60})
+	got, err := s.pollDeviceToken(context.Background(), "client", &deviceAuthorization{DeviceCode: "code", UserCode: "user", ExpiresIn: 60, Interval: 1})
 	if err != nil || got.AccessToken != "access" || tokenTransport.calls != 2 {
 		t.Fatalf("poll result = %#v, err = %v, calls = %d", got, err, tokenTransport.calls)
 	}
 
 	whoamiTransport := &flakyTransport{body: `{"user_id":"@agent:telecrypt.io","device_id":"DEVICE-12345"}`}
 	s.publicHTTPClient = &http.Client{Transport: whoamiTransport}
-	userID, deviceID, err := s.whoAmI(context.Background(), "https://backend.example", "access")
+	userID, deviceID, err := s.whoAmI(context.Background(), "https://mas.example", "access")
 	if err != nil || userID != "@agent:telecrypt.io" || deviceID != "DEVICE-12345" || whoamiTransport.calls != 2 {
 		t.Fatalf("whoami result = %q, %q, %v, calls = %d", userID, deviceID, err, whoamiTransport.calls)
+	}
+}
+
+func TestSessionReusesPublicHTTPClient(t *testing.T) {
+	s := &session{}
+	first := s.publicClient()
+	if first == nil {
+		t.Fatal("publicClient returned nil")
+	}
+	if got := s.publicClient(); got != first {
+		t.Fatal("publicClient allocated a new HTTP client for the same session")
+	}
+}
+
+func TestMASRequestErrorsDoNotExposeTransportText(t *testing.T) {
+	const secret = "proxy-password=must-not-escape"
+	s := &session{
+		baseURL: "https://mas.example",
+		publicHTTPClient: &http.Client{
+			Transport: errorTransport{err: errors.New(secret)},
+		},
+	}
+	_, err := s.registerPublicNativeClient(context.Background(), "https://mas.example")
+	if err == nil || strings.Contains(err.Error(), secret) {
+		t.Fatalf("registerPublicNativeClient error = %v, want bounded transport failure", err)
 	}
 }

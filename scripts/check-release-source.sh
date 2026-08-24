@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
+: "${RELEASE_TAG:?RELEASE_TAG is required}"
+: "${RELEASE_SHA:?RELEASE_SHA is required}"
+
+[[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+  echo 'GITHUB_REPOSITORY is not canonical' >&2
+  exit 2
+}
+[[ "$RELEASE_TAG" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+  echo 'release tag is not canonical X.Y.Z' >&2
+  exit 2
+}
+[[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+  echo 'RELEASE_SHA is not a canonical commit ID' >&2
+  exit 2
+}
+
+readonly repo_url="https://github.com/${GITHUB_REPOSITORY}.git"
+readonly tag_ref="refs/tags/$RELEASE_TAG"
+readonly remote_tag_ref='refs/remotes/origin/release-tag'
+readonly remote_main_ref='refs/remotes/origin/main'
+readonly max_output_bytes=$((64 * 1024))
+readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/controlplane-git.XXXXXX")"
+cleanup() { rm -rf -- "$temporary_root"; }
+trap cleanup EXIT
+trap 'cleanup; exit 143' HUP INT TERM
+
+# Keep Git independent of runner configuration and credentials.  The command uses the
+# canonical HTTPS URL below, so local remotes cannot redirect the source fetch.
+git=(
+  /usr/bin/env -i PATH=/usr/bin:/bin
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+  GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1
+  /usr/bin/git
+  -c credential.helper=
+  -c 'credential.https://github.com.helper='
+  -c http.proxy= -c 'http.https://github.com.proxy='
+  -c http.extraHeader= -c 'http.https://github.com/.extraheader='
+  -c core.sshCommand=false
+)
+
+bounded_git() {
+  local stdout_file stderr_file status
+  stdout_file="$(mktemp "$temporary_root/stdout.XXXXXX")"
+  stderr_file="$(mktemp "$temporary_root/stderr.XXXXXX")"
+  set +e
+  /usr/bin/python3 "$script_dir/bounded-command.py" \
+    --stdout-limit "$max_output_bytes" --stderr-limit "$max_output_bytes" \
+    --stdout-path "$stdout_file" --stderr-path "$stderr_file" --timeout 30 -- \
+    "${git[@]}" "$@"
+  status=$?
+  set -e
+  if (( status != 0 )); then
+    rm -f -- "$stdout_file" "$stderr_file"
+    return 1
+  fi
+  cat -- "$stdout_file"
+  cat -- "$stderr_file" >&2
+  rm -f -- "$stdout_file" "$stderr_file"
+}
+
+die() { echo "$1" >&2; exit 1; }
+
+remote_url="$(bounded_git remote get-url origin)" || die 'could not read the origin remote'
+[[ "$remote_url" == "$repo_url" ]] || die 'origin is not the canonical HTTPS repository'
+
+checkout_tag_type="$(bounded_git cat-file -t "$tag_ref")" || die 'checked-out release tag cannot be read'
+[[ "$checkout_tag_type" == tag ]] || die 'release tag is not annotated'
+checkout_tag_sha="$(bounded_git rev-parse --verify --end-of-options "$tag_ref")" || die 'checked-out tag object cannot be read'
+checkout_commit="$(bounded_git rev-parse --verify --end-of-options HEAD)" || die 'checked-out commit cannot be read'
+checkout_peeled="$(bounded_git rev-parse --verify --end-of-options "$tag_ref^{}")" || die 'checked-out tag target cannot be read'
+[[ "$checkout_tag_sha" =~ ^[0-9a-f]{40}$ && "$checkout_peeled" == "$RELEASE_SHA" && "$checkout_commit" == "$RELEASE_SHA" ]] ||
+  die 'checked-out tag, peeled commit, HEAD, and RELEASE_SHA do not match'
+
+fetch_output="$(bounded_git fetch --quiet --force --no-tags "$repo_url" \
+  "refs/tags/$RELEASE_TAG:$remote_tag_ref" refs/heads/main:"$remote_main_ref")" ||
+  die 'release source fetch failed or exceeded its output bound'
+[[ -z "$fetch_output" ]] || die 'release source fetch emitted unexpected output'
+
+remote_tag_type="$(bounded_git cat-file -t "$remote_tag_ref")" || die 'fetched release tag cannot be read'
+remote_tag_sha="$(bounded_git rev-parse --verify --end-of-options "$remote_tag_ref")" || die 'fetched tag object cannot be read'
+remote_peeled="$(bounded_git rev-parse --verify --end-of-options "$remote_tag_ref^{}")" || die 'fetched tag target cannot be read'
+[[ "$remote_tag_type" == tag && "$remote_tag_sha" == "$checkout_tag_sha" && "$remote_peeled" == "$RELEASE_SHA" ]] ||
+  die 'remote tag object or peeled commit does not match the checked-out source'
+
+bounded_git merge-base --is-ancestor "$RELEASE_SHA" "$remote_main_ref" >/dev/null ||
+  die 'release commit is not contained in refreshed main'
+
+if [[ -n "${GITHUB_ENV:-}" ]]; then
+  printf 'ANNOTATED_TAG_SHA=%s\n' "$checkout_tag_sha" >>"$GITHUB_ENV"
+fi

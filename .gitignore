@@ -1,4 +1,6 @@
-/redpill
+/registration
+/janitor
+/plan
 *.test
 __pycache__/
 *.py[cod]

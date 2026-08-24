@@ -1,15 +1,17 @@
 # tier_controller
 
-`tier_controller` is a pure-Python Synapse module owned and released by the control plane. Each
-Controlplane release publishes the matching, versioned
-`telecrypt_tier_controller-<release>-py3-none-any.whl` and its `.sha256` file as GitHub Release
-assets. The standalone `telecrypt-synapse` image builder installs that exact wheel; server
-deployment configuration only selects the resulting exact image release and loads
-`tier_controller.TierController`.
+`tier_controller` is a pure-Python Synapse module. The Controlplane release workflow publishes an
+exactly versioned `telecrypt_tier_controller-<release>-py3-none-any.whl` and one canonical
+`controlplane-<release>.digest.json` binding asset as GitHub Release assets. The standalone
+`telecrypt-synapse` repository must update its pinned manifest to that exact coordinate before its
+image builder can use a new wheel; this repository does not change that manifest. Server deployment
+configuration selects the resulting exact image release and loads `tier_controller.TierController`.
 
 Controlplane does not build or publish a Synapse-module container image. Compatibility is verified
-in GitHub Actions against the exact Synapse version, while `telecrypt-synapse` installs the released
-wheel into its own exact derived Synapse image.
+in GitHub Actions by installing the wheel without dependencies into the official exact
+`ghcr.io/element-hq/synapse:v1.159.0` runtime. After its manifest is updated, the separate
+`telecrypt-synapse` repository can install the released wheel into its own exact derived Synapse
+image.
 
 ## Model
 
@@ -44,7 +46,8 @@ modules:
 
 ## Tests
 
-The GitHub workflow builds the wheel, installs it with Synapse `1.159.0` into a clean virtual
-environment, and runs the fake-`module_api` unit suite. A tag build fails unless the wheel version
-exactly equals the Controlplane release tag, then publishes the wheel and checksum together on that
-GitHub Release.
+The GitHub workflow installs its build tooling from the hash-locked `requirements-test.txt`, then
+installs the wheel without dependencies into the exact Synapse `1.159.0` runtime and runs the
+stdlib fake-`module_api` unit suite. A tag build fails unless the wheel version exactly equals the
+Controlplane release tag, then publishes the wheel and digest binding together on that GitHub
+Release.

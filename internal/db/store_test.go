@@ -2,66 +2,61 @@ package db
 
 import (
 	"context"
-	"os"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/google/uuid"
 )
 
-func testStore(t *testing.T) (*Store, context.Context) {
-	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set, skipping real-Postgres test")
-	}
-	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("pgxpool.New: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	if _, err := pool.Exec(ctx, `DROP SCHEMA IF EXISTS cashier CASCADE; DROP TABLE IF EXISTS locker_state, schema_migrations`); err != nil {
-		t.Fatalf("reset database: %v", err)
-	}
-	if err := Migrate(ctx, pool); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `CREATE SCHEMA cashier; CREATE TABLE cashier.billing_environment_guard (singleton BOOLEAN PRIMARY KEY, billing_env TEXT NOT NULL, server_name TEXT NOT NULL); CREATE TABLE cashier.billing_verification_grants (mxid TEXT PRIMARY KEY)`); err != nil {
-		t.Fatalf("create private cashier test schema: %v", err)
-	}
-	return NewStore(pool), ctx
-}
-
-func TestStoreReadsButDoesNotCreatePrivateCashierState(t *testing.T) {
-	store, ctx := testStore(t)
-	if err := store.BindBillingEnvironment(ctx, "test", "telecrypt.io"); err == nil {
-		t.Fatal("accepted missing private Cashier billing guard")
-	}
-	pool := store.pool
-	if _, err := pool.Exec(ctx, `INSERT INTO cashier.billing_environment_guard (singleton, billing_env, server_name) VALUES (TRUE, 'test', 'telecrypt.io')`); err != nil {
-		t.Fatalf("insert guard: %v", err)
-	}
-	if err := store.BindBillingEnvironment(ctx, "test", "telecrypt.io"); err != nil {
-		t.Fatalf("verify guard: %v", err)
-	}
-	if err := store.BindBillingEnvironment(ctx, "production", "telecrypt.io"); err == nil {
-		t.Fatal("accepted mismatched billing guard")
+func TestValidateDeploymentProfile(t *testing.T) {
+	for _, tc := range []struct {
+		server, billing string
+		valid           bool
+	}{
+		{"telecrypt.io", "test", true}, {"stage.telecrypt.io", "test", true}, {"telecrypt.io", "live", true},
+		{"stage.telecrypt.io", "live", false}, {"preview.telecrypt.io", "test", false}, {"telecrypt.io", "production", false},
+	} {
+		t.Run(tc.server+"/"+tc.billing, func(t *testing.T) {
+			if (ValidateDeploymentProfile(tc.server, tc.billing) == nil) != tc.valid {
+				t.Fatalf("profile validity mismatch")
+			}
+		})
 	}
 }
 
-func TestStoreReadsPrivateCashierVerificationGrants(t *testing.T) {
-	store, ctx := testStore(t)
-	if _, err := store.pool.Exec(ctx, `INSERT INTO cashier.billing_verification_grants (mxid) VALUES ('@billing:telecrypt.io')`); err != nil {
-		t.Fatalf("insert billing grant: %v", err)
+func TestValidateRunEventStatesAndLabels(t *testing.T) {
+	base := RunEvent{EventID: uuid.New(), RunID: uuid.New(), ServerName: "stage.telecrypt.io", BillingEnvironment: "test", DryRun: true, NotificationStatus: "not_attempted"}
+	if err := validateRunEvent(RunEvent{EventID: base.EventID, RunID: base.RunID, EventKind: "started", Status: "started", Outcome: "pending", Reason: "pending", ServerName: base.ServerName, BillingEnvironment: base.BillingEnvironment, DryRun: true, NotificationStatus: "not_attempted"}); err != nil {
+		t.Fatalf("valid started event: %v", err)
 	}
-	verified, err := store.VerifiedMXIDs(ctx)
-	if err != nil {
-		t.Fatalf("VerifiedMXIDs: %v", err)
+	base.EventKind, base.Status, base.Outcome, base.Reason = "finished", "succeeded", "dry_run", "would_disable"
+	base.LockedOrWouldLock = 1
+	base.Labels = []string{"lock", "audit_finished"}
+	if err := validateRunEvent(base); err != nil {
+		t.Fatalf("valid finished event: %v", err)
 	}
-	if len(verified) != 1 || !verified["@billing:telecrypt.io"] {
-		t.Fatalf("missing expected grants: %#v", verified)
+	base.Labels = []string{"not-allowlisted"}
+	if err := validateRunEvent(base); err == nil || !strings.Contains(err.Error(), "allowlisted") {
+		t.Fatalf("invalid label accepted: %v", err)
 	}
-	if got, err := store.IsVerified(ctx, "@billing:telecrypt.io"); err != nil || !got {
-		t.Fatalf("IsVerified billing grant = %v, %v", got, err)
+	base.Labels = make([]string, 17)
+	if err := validateRunEvent(base); err == nil || !strings.Contains(err.Error(), "sixteen") {
+		t.Fatalf("oversized labels accepted: %v", err)
+	}
+}
+
+func TestDigestCursorValidationAndOrdering(t *testing.T) {
+	valid := DigestCursor{CreatedAt: time.Now(), EmailID: "01J00000000000000000000000"}
+	if !valid.Valid() {
+		t.Fatal("valid cursor rejected")
+	}
+	for _, cursor := range []DigestCursor{{CreatedAt: time.Now(), EmailID: "not-ulid"}, {EmailID: valid.EmailID}} {
+		if cursor.Valid() {
+			t.Fatalf("invalid cursor accepted: %#v", cursor)
+		}
+	}
+	if err := (&Store{}).SetJanitorDigestCursor(context.Background(), DigestCursor{CreatedAt: time.Now(), EmailID: "not-ulid"}); err == nil {
+		t.Fatal("invalid cursor reached database")
 	}
 }

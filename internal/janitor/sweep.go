@@ -1,72 +1,53 @@
-// Package janitor implements janitor's one sweep: lock stale unclaimed agent accounts via MAS's
-// admin API, and email the owner a digest of new human sign-ups awaiting review. See cmd/janitor
-// for wiring and internal/masadmin for the MAS admin client this is built on.
+// Package janitor implements Janitor's one-shot maintenance process. Cashier owns entitlement;
+// Janitor consumes only Cashier's two narrow views and the MAS admin API.
 package janitor
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log/slog"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/TeleCrypt-io/controlplane/internal/db"
 	"github.com/TeleCrypt-io/controlplane/internal/masadmin"
+	"github.com/google/uuid"
 )
 
-// digestHighWaterKey is the internal/db locker_state row this package reads/advances.
-const digestHighWaterKey = "digest_high_water"
+const (
+	lockAfter           = 48 * time.Hour
+	maxDigestCandidates = 10_000
+	maxDigestBodyBytes  = 1 << 20
+)
 
-// MAS applies a lock synchronously before returning the HTTP response. Its client timeout is 30s,
-// so a locked_at more than one minute after a durable intent cannot have been produced by that
-// call (for example, the process crashed after writing intent but before sending the request).
-const pendingLockMaxCommitDelay = time.Minute
-
-const lockAfter = 48 * time.Hour
-
-// Config holds the Janitor inputs that remain environment-specific.
 type Config struct {
-	// ServerName is the Matrix server name used to turn a MAS username into an MXID
-	// (@username:ServerName).
-	ServerName string
-	// DryRun logs every action this sweep would take (lock or send) without doing it. In dry-run,
-	// the digest high-water mark is not advanced either — nothing was actually delivered.
-	DryRun bool
-	// OwnerEmail is the digest's recipient. If empty, the digest half of the sweep is skipped
-	// entirely (logged as a warning) — the lock half still runs.
-	OwnerEmail string
+	ServerName         string
+	BillingEnvironment string
+	DryRun             bool
+	OwnerEmail         string
 }
 
-// masAdminClient is the subset of *masadmin.Client that Sweeper needs. Defined here (not in
-// package masadmin) so tests can supply a fake without necessarily driving a real MAS instance —
-// though this package's own tests do exercise the real *masadmin.Client against an httptest fake
-// server, per the task's test requirements.
 type masAdminClient interface {
-	ListUsers(ctx context.Context) ([]masadmin.User, error)
-	ListUserEmails(ctx context.Context) ([]masadmin.UserEmail, error)
-	LockUser(ctx context.Context, userID string) (time.Time, error)
-	UnlockUser(ctx context.Context, userID string) error
+	ListUsers(context.Context) ([]masadmin.User, error)
+	ListUserEmails(context.Context) ([]masadmin.UserEmail, error)
+	GetUser(context.Context, string) (masadmin.User, error)
+	HasUserEmail(context.Context, string) (bool, error)
+	LockUser(context.Context, string) error
 }
 
-// store is the subset of *db.Store that Sweeper needs.
 type store interface {
-	VerifiedMXIDs(ctx context.Context) (map[string]bool, error)
-	IsVerified(ctx context.Context, mxid string) (bool, error)
-	JanitorLockState(ctx context.Context) (confirmed, pending map[string]time.Time, err error)
-	BeginJanitorLock(ctx context.Context, userID string) (time.Time, error)
-	ConfirmJanitorLock(ctx context.Context, userID string, lockedAt time.Time) error
-	DeleteJanitorLock(ctx context.Context, userID string) error
-	LockerHighWaterMark(ctx context.Context, key string) (time.Time, bool, error)
-	SetLockerHighWaterMark(ctx context.Context, key string, value time.Time) error
+	VerifyDeploymentIdentity(context.Context, string, string) error
+	LockExclusions(context.Context) (map[string]struct{}, error)
+	JanitorDigestCursor(context.Context) (db.DigestCursor, bool, error)
+	SetJanitorDigestCursor(context.Context, db.DigestCursor) error
+	InsertRunEvent(context.Context, db.RunEvent) error
 }
 
-// Mailer is the subset of email-sending behavior Sweeper needs — see SMTPMailer (real SMTP) and
-// LogMailer (degraded fallback when SMTP isn't configured) in mailer.go.
 type Mailer interface {
-	Send(ctx context.Context, to, subject, body string) error
+	Send(context.Context, string, string, string) error
 }
 
-// Sweeper runs janitor's sweep against one MAS deployment and one controlplane database.
 type Sweeper struct {
 	mas    masAdminClient
 	store  store
@@ -78,368 +59,371 @@ func NewSweeper(mas masAdminClient, store store, mailer Mailer, cfg Config) *Swe
 	return &Sweeper{mas: mas, store: store, mailer: mailer, cfg: cfg}
 }
 
-// Sweep runs one full pass: lock stale unclaimed agent accounts, then — independently, a digest
-// failure never undoes or blocks the lock half above it — email the owner a digest of new human
-// sign-ups awaiting review.
-//
-// Only returns an error for failures in the shared setup both halves depend on (listing MAS users
-// / emails, reading the verified set and lock provenance): without those, no lock or skip decision
-// can be made safely, so the sweep fails closed rather than guessing. Per-account lock/unlock
-// failures and digest failures are logged, not returned — see sweepLocks and sweepDigest.
+type sweepState struct {
+	runID         uuid.UUID
+	considered    int64
+	skipped       int64
+	locked        int64
+	failures      int64
+	notification  string
+	failureReason string
+	labels        []string
+	labelSet      map[string]struct{}
+}
+
+type operationError struct {
+	reason string
+	err    error
+}
+
+func (e *operationError) Error() string { return e.err.Error() }
+func (e *operationError) Unwrap() error { return e.err }
+
+func (s *sweepState) addLabel(label string) {
+	if s.labelSet == nil {
+		s.labelSet = make(map[string]struct{})
+	}
+	if _, exists := s.labelSet[label]; exists {
+		return
+	}
+	s.labelSet[label] = struct{}{}
+	s.labels = append(s.labels, label)
+}
+
+func (s *sweepState) fail(reason, label string) {
+	s.failures++
+	if s.failureReason == "" {
+		s.failureReason = reason
+	}
+	if label != "" {
+		s.addLabel(label)
+	}
+}
+
+func (s *Sweeper) startedEvent(runID uuid.UUID) db.RunEvent {
+	return db.RunEvent{
+		EventID: uuid.New(), RunID: runID, EventKind: "started", Status: "started", Outcome: "pending", Reason: "pending",
+		ServerName: s.cfg.ServerName, BillingEnvironment: s.cfg.BillingEnvironment, DryRun: s.cfg.DryRun,
+		NotificationStatus: "not_attempted", Labels: []string{"audit_started"},
+	}
+}
+
+func (s *Sweeper) finishedEvent(state *sweepState, status, outcome, reason string) db.RunEvent {
+	labels := append([]string(nil), state.labels...)
+	labels = append(labels, "audit_finished")
+	seen := make(map[string]struct{}, len(labels))
+	unique := labels[:0]
+	for _, label := range labels {
+		if _, exists := seen[label]; exists {
+			continue
+		}
+		seen[label] = struct{}{}
+		unique = append(unique, label)
+	}
+	return db.RunEvent{
+		EventID: uuid.New(), RunID: state.runID, EventKind: "finished", Status: status, Outcome: outcome, Reason: reason,
+		ServerName: s.cfg.ServerName, BillingEnvironment: s.cfg.BillingEnvironment, DryRun: s.cfg.DryRun,
+		Considered: state.considered, Skipped: state.skipped, LockedOrWouldLock: state.locked,
+		Failures: state.failures, NotificationStatus: state.notification, Labels: unique,
+	}
+}
+
+// Sweep performs one complete run and always attempts the required finished event after a
+// started event. Identity failure occurs before a run is authorized, so it intentionally emits no
+// audit row. Failure to write either required row is itself a non-success result.
 func (s *Sweeper) Sweep(ctx context.Context) error {
+	if err := db.ValidateDeploymentProfile(s.cfg.ServerName, s.cfg.BillingEnvironment); err != nil {
+		return err
+	}
+	if (s.cfg.BillingEnvironment == "test") != s.cfg.DryRun {
+		return fmt.Errorf("Janitor dry-run mode does not match billing environment")
+	}
+	if err := s.store.VerifyDeploymentIdentity(ctx, s.cfg.ServerName, s.cfg.BillingEnvironment); err != nil {
+		return fmt.Errorf("janitor: deployment identity validation failed")
+	}
+	runID := uuid.New()
+	state := &sweepState{runID: runID, notification: "not_attempted"}
+	if err := s.store.InsertRunEvent(ctx, s.startedEvent(runID)); err != nil {
+		return fmt.Errorf("janitor: started audit event failed")
+	}
+
+	finish := func(baseErr error) error {
+		if baseErr == nil && state.failures == 0 {
+			reason := "no_eligible_accounts"
+			if state.locked > 0 {
+				if s.cfg.DryRun {
+					reason = "would_disable"
+				} else {
+					reason = "disabled"
+				}
+			}
+			outcome := "success"
+			if s.cfg.DryRun {
+				outcome = "dry_run"
+			}
+			if err := s.store.InsertRunEvent(ctx, s.finishedEvent(state, "succeeded", outcome, reason)); err != nil {
+				return fmt.Errorf("janitor: finished audit event failed")
+			}
+			return nil
+		}
+		reason := state.failureReason
+		if reason == "" {
+			reason = "audit"
+		}
+		if err := s.store.InsertRunEvent(ctx, s.finishedEvent(state, "failed", "operational_failure", reason)); err != nil {
+			if baseErr != nil {
+				return fmt.Errorf("%v; janitor: finished audit event failed", baseErr)
+			}
+			return fmt.Errorf("janitor: finished audit event failed")
+		}
+		return baseErr
+	}
+
+	exclusions, err := s.store.LockExclusions(ctx)
+	if err != nil {
+		state.fail("entitlement_view", "entitlement_view")
+		return finish(fmt.Errorf("janitor: entitlement view failed"))
+	}
+	state.addLabel("entitlement_view")
 	users, err := s.mas.ListUsers(ctx)
 	if err != nil {
-		return fmt.Errorf("janitor: list users: %w", err)
+		state.fail("mas", "mas_users")
+		return finish(fmt.Errorf("janitor: list users failed"))
 	}
+	state.considered = int64(len(users))
+	state.addLabel("mas_users")
 	emails, err := s.mas.ListUserEmails(ctx)
 	if err != nil {
-		return fmt.Errorf("janitor: list user emails: %w", err)
+		state.fail("mas", "mas_emails")
+		return finish(fmt.Errorf("janitor: list user emails failed"))
 	}
-	hasEmail := make(map[string]bool, len(emails))
-	for _, e := range emails {
-		hasEmail[e.UserID] = true
+	state.addLabel("mas_emails")
+	if err := s.sweepLocks(ctx, users, exclusions, state); err != nil {
+		return finish(err)
 	}
+	if ctx.Err() != nil {
+		state.fail("cancelled", "cancelled")
+		return finish(fmt.Errorf("janitor: sweep canceled"))
+	}
+	if err := s.sweepDigest(ctx, users, emails, state); err != nil {
+		reason, label := "notification", "notification"
+		var operation *operationError
+		if errors.As(err, &operation) {
+			reason = operation.reason
+			label = failureLabel(operation.reason)
+		}
+		state.fail(reason, label)
+		return finish(fmt.Errorf("janitor: digest failed"))
+	}
+	return finish(nil)
+}
 
-	verified, err := s.store.VerifiedMXIDs(ctx)
-	if err != nil {
-		return fmt.Errorf("janitor: load verified mxids: %w", err)
+func failureLabel(reason string) string {
+	switch reason {
+	case "mas":
+		return "mas_users"
+	case "entitlement_view":
+		return "entitlement_view"
+	case "database", "notification", "audit", "cancelled", "lock", "lock_readback":
+		return reason
+	default:
+		return "audit"
 	}
-	janitorLocked, pendingLocks, err := s.store.JanitorLockState(ctx)
-	if err != nil {
-		return fmt.Errorf("janitor: load lock state: %w", err)
-	}
-
-	s.sweepLocks(ctx, users, hasEmail, verified, janitorLocked, pendingLocks)
-
-	if err := s.sweepDigest(ctx, users, hasEmail); err != nil {
-		slog.Error("janitor: digest failed", "error", err)
-	}
-
-	return nil
 }
 
 func (s *Sweeper) mxid(username string) string {
+	if !masadmin.ValidMXID(username, s.cfg.ServerName) {
+		return ""
+	}
 	return fmt.Sprintf("@%s:%s", username, s.cfg.ServerName)
 }
 
-// sweepLocks locks every account that is stale, unclaimed, and email-less, and repairs a verified
-// account only when persisted provenance proves janitor created its current lock. The full
-// verified set is an efficient first-pass snapshot, but a candidate is checked again immediately
-// around the external MAS mutation. That closes the ordinary snapshot race and makes a race that
-// lands during LockUser convergent via compensation. Errors acting on one account are logged and
-// don't stop the rest of the sweep.
-func (s *Sweeper) sweepLocks(
-	ctx context.Context,
-	users []masadmin.User,
-	hasEmail, verified map[string]bool,
-	janitorLocked, pendingLocks map[string]time.Time,
-) {
+func (s *Sweeper) sweepLocks(ctx context.Context, users []masadmin.User, exclusions map[string]struct{}, state *sweepState) error {
 	cutoff := time.Now().Add(-lockAfter)
-	locked, unlocked, skipped := 0, 0, 0
-
-	for _, u := range users {
-		mxid := s.mxid(u.Username)
-		log := slog.With("mxid", mxid, "user_id", u.ID)
-		confirmedAt, confirmed := janitorLocked[u.ID]
-		pendingAt, pending := pendingLocks[u.ID]
-
-		// Deactivation is an independent operator/security state. Never erase its accompanying
-		// lock. Relinquish janitor provenance so a later operator reactivation cannot make that
-		// same lock eligible for automatic entitlement repair.
-		if u.DeactivatedAt != nil {
-			if confirmed || pending {
-				if s.cfg.DryRun {
-					log.Info("would relinquish janitor lock state for deactivated account (dry run)")
-				} else if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
-					log.Error("failed to relinquish janitor lock state for deactivated account", "error", err)
-				} else {
-					delete(janitorLocked, u.ID)
-					delete(pendingLocks, u.ID)
-				}
-			}
-			log.Debug("skip lock", "reason", "deactivated")
-			skipped++
+	for _, snapshot := range users {
+		if ctx.Err() != nil {
+			state.fail("cancelled", "cancelled")
+			return fmt.Errorf("janitor: sweep canceled")
+		}
+		mxid := s.mxid(snapshot.Username)
+		if mxid == "" {
+			state.skipped++
+			state.fail("mas", "candidate_recheck")
 			continue
 		}
-
-		if u.LockedAt != nil {
-			// A pending intent cannot prove who created a later lock: the janitor request may have
-			// failed before commit and an operator may have locked the account afterwards. Never
-			// turn ambiguous state into unlock authority.
-			if pending {
-				if s.cfg.DryRun {
-					log.Info("would relinquish ambiguous pending lock intent (dry run)")
-				} else if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
-					log.Error("failed to relinquish ambiguous pending lock intent", "error", err)
-				} else {
-					delete(pendingLocks, u.ID)
-				}
-				log.Warn("leaving ambiguous lock unchanged; operator/manual review may be required",
-					"locked_at", u.LockedAt, "intent_at", pendingAt)
-				skipped++
-				continue
-			}
-
-			if !confirmed || !u.LockedAt.Equal(confirmedAt) {
-				// A differing locked_at proves an unlock/relock cycle created a new external lock.
-				// Clear stale janitor state but never unlock the current security/operator lock.
-				if confirmed {
-					if s.cfg.DryRun {
-						log.Info("would clear stale janitor provenance for newer external lock (dry run)")
-					} else if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
-						log.Error("failed to clear stale janitor provenance", "error", err)
-					} else {
-						delete(janitorLocked, u.ID)
-						delete(pendingLocks, u.ID)
-					}
-				}
-				log.Debug("skip lock", "reason", "already locked outside janitor")
-				skipped++
-				continue
-			}
-			isVerified, err := s.store.IsVerified(ctx, mxid)
-			if err != nil {
-				log.Error("verification recheck failed; leaving existing lock unchanged", "error", err)
-				skipped++
-				continue
-			}
-			if !isVerified {
-				log.Debug("skip lock", "reason", "already locked")
-				skipped++
-				continue
-			}
-			if s.cfg.DryRun {
-				log.Info("would unlock verified account (dry run)")
-				unlocked++
-				continue
-			}
-			if err := s.mas.UnlockUser(ctx, u.ID); err != nil {
-				log.Error("verified-account unlock failed", "error", err)
-				continue
-			}
-			if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
-				log.Error("unlocked verified account but failed to clear lock provenance", "error", err)
-			} else {
-				delete(janitorLocked, u.ID)
-			}
-			log.Info("unlocked verified account")
-			unlocked++
+		if snapshot.LockedAt != nil || snapshot.DeactivatedAt != nil || !snapshot.CreatedAt.Before(cutoff) || mxid == "@cashier_admin:"+s.cfg.ServerName {
+			state.skipped++
 			continue
 		}
-
-		if confirmed || pending {
-			if s.cfg.DryRun {
-				log.Info("would clear stale janitor lock state (dry run)")
-			} else {
-				if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
-					log.Error("failed to clear stale lock state; refusing further action", "error", err)
-					skipped++
-					continue
-				}
-				log.Info("cleared stale janitor lock state from unlocked account")
-			}
-			// Update only the in-memory sweep snapshot in dry-run so later classification
-			// accurately models the action without mutating persisted state.
-			delete(janitorLocked, u.ID)
-			delete(pendingLocks, u.ID)
-		}
-
-		reason := skipReason(u, cutoff, mxid, hasEmail, verified, s.cfg.ServerName)
-		if reason != "" {
-			log.Debug("skip lock", "reason", reason)
-			skipped++
+		if _, excluded := exclusions[mxid]; excluded {
+			state.skipped++
 			continue
 		}
-
-		isVerified, err := s.store.IsVerified(ctx, mxid)
+		state.addLabel("candidate_recheck")
+		current, err := s.mas.GetUser(ctx, snapshot.ID)
 		if err != nil {
-			log.Error("verification recheck failed; refusing to lock", "error", err)
-			skipped++
+			state.skipped++
+			state.fail("mas", "candidate_recheck")
 			continue
 		}
-		if isVerified {
-			log.Debug("skip lock", "reason", "verified on pre-lock recheck")
-			skipped++
+		currentMXID := s.mxid(current.Username)
+		if current.ID != snapshot.ID || currentMXID == "" || current.CreatedAt.IsZero() || current.LockedAt != nil || current.DeactivatedAt != nil || !current.CreatedAt.Before(cutoff) {
+			state.skipped++
+			state.fail("lock_readback", "candidate_recheck")
 			continue
 		}
-
+		if _, excluded := exclusions[currentMXID]; excluded {
+			state.skipped++
+			continue
+		}
+		hasEmail, err := s.mas.HasUserEmail(ctx, current.ID)
+		if err != nil {
+			state.skipped++
+			state.fail("mas", "candidate_recheck")
+			continue
+		}
+		if hasEmail {
+			state.skipped++
+			continue
+		}
 		if s.cfg.DryRun {
-			log.Info("would lock (dry run)", "reason", "stale, unclaimed, no email", "created_at", u.CreatedAt)
-			locked++
+			state.locked++
 			continue
 		}
-
-		intentAt, err := s.store.BeginJanitorLock(ctx, u.ID)
-		if err != nil {
-			log.Error("failed to persist pre-lock intent; refusing to lock", "error", err)
+		if err := s.store.VerifyDeploymentIdentity(ctx, s.cfg.ServerName, s.cfg.BillingEnvironment); err != nil {
+			state.fail("database", "database")
 			continue
 		}
-		pendingLocks[u.ID] = intentAt
-
-		lockedAt, err := s.mas.LockUser(ctx, u.ID)
-		if err != nil {
-			// Keep the durable intent: the HTTP result is ambiguous, and the next sweep will
-			// either clear it if MAS stayed unlocked or confirm the exact observed locked_at.
-			log.Error("lock failed", "error", err)
+		if err := s.mas.LockUser(ctx, current.ID); err != nil {
+			state.fail("lock", "lock")
 			continue
 		}
-		if !lockMatchesIntent(lockedAt, intentAt) {
-			// MAS lock is idempotent. A timestamp outside the causal request window proves this
-			// response describes an external lock, not a new lock created by this call.
-			log.Warn("external lock won pre-call race; refusing janitor ownership",
-				"locked_at", lockedAt, "intent_at", intentAt)
-			if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
-				log.Error("failed to clear intent after external lock race", "error", err)
-			} else {
-				delete(pendingLocks, u.ID)
-			}
-			skipped++
+		locked, err := s.mas.GetUser(ctx, current.ID)
+		if err != nil || locked.ID != current.ID || locked.Username != current.Username || !locked.CreatedAt.Equal(current.CreatedAt) || locked.LockedAt == nil {
+			state.fail("lock_readback", "lock_readback")
 			continue
 		}
-		log.Info("locked stale unclaimed account", "reason", "stale, unclaimed, no email", "created_at", u.CreatedAt)
-		if err := s.store.ConfirmJanitorLock(ctx, u.ID, lockedAt); err != nil {
-			// Without confirmed exact timestamp provenance, a future sweep must never assume it
-			// owns this lock. Restore the pre-call unlocked state immediately.
-			log.Error("failed to confirm lock provenance; compensating unlock", "error", err)
-			if err := s.mas.UnlockUser(ctx, u.ID); err != nil {
-				log.Error("unlock after confirmation failure failed; manual repair required", "error", err)
-			} else {
-				if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
-					log.Error("confirmation compensation succeeded but intent cleanup failed", "error", err)
-				} else {
-					delete(pendingLocks, u.ID)
-				}
-				unlocked++
-			}
-			continue
-		} else {
-			janitorLocked[u.ID] = lockedAt
-			delete(pendingLocks, u.ID)
-		}
-
-		// A grant may have committed after the pre-lock read but during the external MAS call.
-		// Restore the pre-sweep unlocked state unless a post-lock read proves the account remains
-		// unverified. A failed read also compensates: janitor cleanup must not leave a possibly
-		// entitled account newly locked just because its own database became unavailable.
-		isVerified, err = s.store.IsVerified(ctx, mxid)
-		if err == nil && !isVerified {
-			locked++
+		postEmail, err := s.mas.HasUserEmail(ctx, current.ID)
+		if err != nil || postEmail {
+			state.fail("lock_readback", "lock_readback")
 			continue
 		}
-		if err != nil {
-			log.Error("post-lock verification failed; compensating unlock", "error", err)
-		} else {
-			log.Info("verification appeared during lock; compensating unlock")
-		}
-		if err := s.mas.UnlockUser(ctx, u.ID); err != nil {
-			log.Error("compensating unlock failed", "error", err)
-			continue
-		}
-		if err := s.store.DeleteJanitorLock(ctx, u.ID); err != nil {
-			log.Error("compensating unlock succeeded but lock state cleanup failed", "error", err)
-		} else {
-			delete(janitorLocked, u.ID)
-			delete(pendingLocks, u.ID)
-		}
-		unlocked++
+		state.locked++
+		state.addLabel("lock")
 	}
-
-	slog.Info("janitor: lock sweep complete",
-		"locked", locked, "unlocked", unlocked, "skipped", skipped,
-		"considered", len(users), "dry_run", s.cfg.DryRun)
+	return nil
 }
 
-func lockMatchesIntent(lockedAt, intentAt time.Time) bool {
-	delay := lockedAt.Sub(intentAt)
-	return delay >= 0 && delay <= pendingLockMaxCommitDelay
-}
-
-// skipReason returns why u should NOT be locked, or "" if it should be.
-func skipReason(u masadmin.User, cutoff time.Time, mxid string, hasEmail, verified map[string]bool, serverName string) string {
-	switch {
-	case u.DeactivatedAt != nil:
-		return "deactivated"
-	case !u.CreatedAt.Before(cutoff):
-		return "not stale yet"
-	case hasEmail[u.ID]:
-		return "has email (human awaiting review)"
-	case verified[mxid]:
-		return "verified"
-	case mxid == "@cashier_admin:"+serverName:
-		return "Cashier admin account"
-	default:
-		return ""
-	}
-}
-
-// sweepDigest emails (or, in degraded/dry-run mode, logs) new human sign-ups — accounts with an
-// email attached, created after the last successful digest's high-water mark. The mark only
-// advances after a confirmed send (SMTPMailer) or a confirmed log-in-lieu-of-send (LogMailer) —
-// never on a dry run and never on a real send error — so a crashed run can duplicate a window at
-// worst, never silently drop one.
-func (s *Sweeper) sweepDigest(ctx context.Context, users []masadmin.User, hasEmail map[string]bool) error {
-	if s.cfg.OwnerEmail == "" {
-		slog.Warn("janitor: OWNER_EMAIL not set, skipping digest")
+func (s *Sweeper) sweepDigest(ctx context.Context, users []masadmin.User, emails []masadmin.UserEmail, state *sweepState) error {
+	if s.cfg.DryRun {
 		return nil
 	}
-
-	highWater, found, err := s.store.LockerHighWaterMark(ctx, digestHighWaterKey)
+	if s.cfg.OwnerEmail == "" {
+		return &operationError{reason: "notification", err: fmt.Errorf("owner notification is not configured")}
+	}
+	cursor, found, err := s.store.JanitorDigestCursor(ctx)
 	if err != nil {
-		return fmt.Errorf("read high-water mark: %w", err)
+		return &operationError{reason: "database", err: fmt.Errorf("digest cursor read failed")}
 	}
 	if !found {
-		highWater = time.Unix(0, 0).UTC()
+		cursor = db.DigestCursor{CreatedAt: time.Unix(0, 0).UTC()}
+	} else if !cursor.Valid() {
+		return &operationError{reason: "database", err: fmt.Errorf("digest cursor is invalid")}
 	}
-
+	usersByID := make(map[string]masadmin.User, len(users))
+	for _, user := range users {
+		if !validEventID(user.ID) || user.Username == "" || user.CreatedAt.IsZero() {
+			return &operationError{reason: "mas", err: fmt.Errorf("digest user snapshot is invalid")}
+		}
+		usersByID[user.ID] = user
+	}
+	after := func(at time.Time, id string) bool {
+		return at.After(cursor.CreatedAt) || (at.Equal(cursor.CreatedAt) && id > cursor.EmailID)
+	}
+	before := func(a, b masadmin.UserEmail) bool {
+		return a.CreatedAt.Before(b.CreatedAt) || (a.CreatedAt.Equal(b.CreatedAt) && a.ID < b.ID)
+	}
+	first := make(map[string]masadmin.UserEmail)
+	var high masadmin.UserEmail
+	for _, email := range emails {
+		if !validEventID(email.ID) || !validEventID(email.UserID) || email.CreatedAt.IsZero() {
+			return &operationError{reason: "mas", err: fmt.Errorf("digest email snapshot is invalid")}
+		}
+		if after(email.CreatedAt, email.ID) {
+			if _, ok := usersByID[email.UserID]; !ok {
+				return &operationError{reason: "mas", err: fmt.Errorf("digest snapshots disagree")}
+			}
+			if high.ID == "" || before(high, email) {
+				high = email
+			}
+		}
+		if old, ok := first[email.UserID]; !ok || before(email, old) {
+			first[email.UserID] = email
+		}
+	}
 	type candidate struct {
-		mxid      string
-		createdAt time.Time
+		mxid          string
+		userCreatedAt time.Time
+		email         masadmin.UserEmail
 	}
-	var candidates []candidate
-	newMark := highWater
-	for _, u := range users {
-		if !hasEmail[u.ID] {
+	candidates := make([]candidate, 0)
+	for userID, email := range first {
+		if !after(email.CreatedAt, email.ID) {
 			continue
 		}
-		if !u.CreatedAt.After(highWater) {
-			continue
+		user, ok := usersByID[userID]
+		if !ok {
+			return &operationError{reason: "mas", err: fmt.Errorf("digest snapshots disagree")}
 		}
-		candidates = append(candidates, candidate{mxid: s.mxid(u.Username), createdAt: u.CreatedAt})
-		if u.CreatedAt.After(newMark) {
-			newMark = u.CreatedAt
+		mxid := s.mxid(user.Username)
+		if mxid == "" {
+			return &operationError{reason: "mas", err: fmt.Errorf("digest user identity is invalid")}
 		}
+		candidates = append(candidates, candidate{mxid: mxid, userCreatedAt: user.CreatedAt, email: email})
 	}
-
+	if len(candidates) > maxDigestCandidates {
+		return &operationError{reason: "mas", err: fmt.Errorf("digest candidate count exceeds limit")}
+	}
 	if len(candidates) == 0 {
-		slog.Info("janitor: digest: no new human sign-ups since last digest")
+		if high.ID != "" {
+			if err := s.store.SetJanitorDigestCursor(ctx, db.DigestCursor{CreatedAt: high.CreatedAt, EmailID: high.ID}); err != nil {
+				return &operationError{reason: "database", err: fmt.Errorf("digest cursor advance failed")}
+			}
+		}
 		return nil
 	}
-
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].createdAt.Before(candidates[j].createdAt) })
-
-	// CRLF throughout: net/smtp writes this body verbatim over DATA (no newline normalization),
-	// and RFC 5322 requires CRLF line endings — bare LF is technically non-conformant and some
-	// servers mangle or reject it.
+	sort.Slice(candidates, func(i, j int) bool { return before(candidates[i].email, candidates[j].email) })
 	var body strings.Builder
 	fmt.Fprintf(&body, "%d new human sign-up(s) awaiting review:\r\n\r\n", len(candidates))
-	for _, c := range candidates {
-		fmt.Fprintf(&body, "%s  created %s\r\n", c.mxid, c.createdAt.Format(time.RFC3339))
+	for _, candidate := range candidates {
+		fmt.Fprintf(&body, "%s  created %s\r\n", candidate.mxid, candidate.userCreatedAt.Format(time.RFC3339))
+		if body.Len() > maxDigestBodyBytes {
+			return &operationError{reason: "notification", err: fmt.Errorf("digest body exceeds limit")}
+		}
 	}
-
-	if s.cfg.DryRun {
-		slog.Info("janitor: digest: would send (dry run)", "count", len(candidates))
-		return nil
+	if err := s.mailer.Send(ctx, s.cfg.OwnerEmail, fmt.Sprintf("TeleCrypt.io: %d new sign-up(s) awaiting review", len(candidates)), body.String()); err != nil {
+		state.notification = "failed"
+		return &operationError{reason: "notification", err: fmt.Errorf("notification delivery failed")}
 	}
-
-	subject := fmt.Sprintf("TeleCrypt.io: %d new sign-up(s) awaiting review", len(candidates))
-	if err := s.mailer.Send(ctx, s.cfg.OwnerEmail, subject, body.String()); err != nil {
-		return fmt.Errorf("send digest: %w", err)
+	state.notification = "succeeded"
+	state.addLabel("notification")
+	if high.ID != "" {
+		if err := s.store.SetJanitorDigestCursor(ctx, db.DigestCursor{CreatedAt: high.CreatedAt, EmailID: high.ID}); err != nil {
+			return &operationError{reason: "database", err: fmt.Errorf("digest cursor advance failed")}
+		}
 	}
-
-	if err := s.store.SetLockerHighWaterMark(ctx, digestHighWaterKey, newMark); err != nil {
-		return fmt.Errorf("advance high-water mark: %w", err)
-	}
-
-	slog.Info("janitor: digest sent", "count", len(candidates), "new_high_water", newMark)
 	return nil
+}
+
+func validEventID(value string) bool {
+	if len(value) != 26 || value[0] > '7' {
+		return false
+	}
+	const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+	for _, r := range value {
+		if !strings.ContainsRune(alphabet, r) {
+			return false
+		}
+	}
+	return true
 }

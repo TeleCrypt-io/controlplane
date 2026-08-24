@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>TeleCrypt Plan</title>
+    <link rel="stylesheet" href="/plan/assets/product.css">
+    <link rel="stylesheet" href="/plan/assets/plan.css">
+    <script defer src="/plan/assets/plan.js"></script>
+  </head>
+  <body>
+    <div class="plan-app">
+      <header class="topbar">
+        <a class="brand" href="/plan" aria-label="TeleCrypt Plan home">
+          <img src="/plan/assets/logo-mark.png" alt="" width="32" height="32">
+          <span>TeleCrypt<span class="brand-tld">.io</span></span>
+          <span class="brand-section">Plan</span>
+        </a>
+        {{if .LoggedIn}}<span class="user" title="Signed in as {{.MXID}}">{{.MXID}}</span>{{end}}
+      </header>
+
+      {{if .TestMode}}
+      <aside class="sandbox-banner" role="status">
+        <strong>TEST / SANDBOX — no real charges</strong>
+      </aside>
+      {{end}}
+
+      <main class="plan-main">
+        {{if not .LoggedIn}}
+        <section class="auth-card" aria-labelledby="plan-title">
+          <p class="eyebrow">PLAN &amp; BILLING</p>
+          <h1 id="plan-title">Manage your TeleCrypt Plan</h1>
+          <p class="intro">Registration is free and does not require a card.</p>
+          <div class="actions">
+            <a class="btn btn-primary" href="{{.RegisterURL}}">Create a TeleCrypt account</a>
+            <a class="btn" href="/plan/login">Log in</a>
+          </div>
+          <p class="session-note">Sign-in is handled by your TeleCrypt account.</p>
+        </section>
+        {{else}}
+        {{if .Plan}}
+        <section class="page-heading" aria-labelledby="plan-title">
+          <div>
+            <p class="eyebrow">PLAN &amp; BILLING</p>
+            <h1 id="plan-title">Your Plan</h1>
+          </div>
+        </section>
+
+        <div class="plan-grid">
+          <section class="card plan-overview" aria-labelledby="subscription-title">
+            <div class="card-heading">
+              <div>
+                <p class="eyebrow">SUBSCRIPTION</p>
+                <h2 id="subscription-title">Plan status</h2>
+              </div>
+              <span class="status-pill">{{.Plan.SubscriptionStatus}}</span>
+            </div>
+            <dl class="metrics">
+              <div><dt>Paid seats</dt><dd>{{.Plan.PaidSeats}}</dd></div>
+              {{if .Plan.PendingPaidSeats}}<div><dt>Pending seats</dt><dd>{{.Plan.PendingPaidSeats}}</dd></div>{{end}}
+            </dl>
+            {{if .CheckoutActive}}<p class="notice">Checkout is in progress. Your plan updates after payment is confirmed.</p>{{end}}
+            <div class="card-actions">
+              {{if .CanCheckout}}
+              <form id="checkout" class="quantity-action">
+                <label>Seats ({{.SeatPrice}}) <input name="quantity" type="number" min="1" max="1000" value="1" required></label>
+                <button class="btn btn-primary">Start {{if $.TestMode}}sandbox {{end}}checkout</button>
+              </form>
+              {{else if .CanChangeSeats}}
+              <form id="seat-count" class="quantity-action">
+                <label>Paid seats ({{.SeatPrice}}) <input name="quantity" type="number" min="1" max="1000" value="{{.Plan.PaidSeats}}" required></label>
+                <button class="btn">Update paid seats</button>
+              </form>
+              {{end}}
+              {{if .Plan.HasBillingAccount}}<button id="open-portal" class="btn" type="button">Manage subscription, card, invoices, or cancellation</button>{{end}}
+            </div>
+          </section>
+
+          <section class="card seats-card" aria-labelledby="seats-title">
+            <div class="card-heading">
+              <div>
+                <p class="eyebrow">ACCESS</p>
+                <h2 id="seats-title">Seats</h2>
+              </div>
+              <span class="seat-count">{{len .Seats}} attached</span>
+            </div>
+            <ul class="seat-list">
+              {{range .Seats}}
+              <li>
+                <span>{{.MXID}}</span>
+                <button class="btn btn-danger btn-small" type="button" data-remove-seat data-mxid="{{.MXID}}">Remove</button>
+              </li>
+              {{else}}
+              <li class="empty-state">No seats attached yet.</li>
+              {{end}}
+            </ul>
+            <form id="add-seat" class="add-seat">
+              <label for="seat-mxid">Add a Matrix ID</label>
+              <div>
+                <input id="seat-mxid" name="mxid" placeholder="@name:server" required>
+                <button class="btn" type="submit">Attach seat</button>
+              </div>
+            </form>
+          </section>
+        </div>
+        {{else}}
+          <section class="card empty-plan" aria-labelledby="plan-setup-title">
+            <p class="eyebrow">PLAN &amp; BILLING</p>
+            <h2 id="plan-setup-title">Set up your plan</h2>
+            <p>Add the Matrix accounts you want covered, then choose your paid seats.</p>
+            <button id="create-plan" class="btn btn-primary" type="button">Set up plan</button>
+        </section>
+        {{end}}
+        {{end}}
+      </main>
+    </div>
+  </body>
+</html>

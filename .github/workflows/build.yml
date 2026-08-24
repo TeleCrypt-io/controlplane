@@ -3,178 +3,433 @@ name: build
 on:
   push:
     branches: [main]
-    tags: ["*.*.*"]
+    tags: ["[0-9]*.[0-9]*.[0-9]*"]
   pull_request:
 
 permissions:
   contents: read
 
+env:
+  GO_VERSION: "1.26.4"
+  PYTHON_VERSION: "3.12.14"
+  SYNAPSE_VERSION: "1.159.0"
+  SYNAPSE_IMAGE: "ghcr.io/element-hq/synapse:v1.159.0"
+
 jobs:
   validate:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     services:
       postgres:
-        image: postgres:17.6-bookworm
+        image: postgres:17.11-bookworm
         env:
           POSTGRES_USER: telecrypt_test
           POSTGRES_PASSWORD: telecrypt_test
           POSTGRES_DB: telecrypt_test
           POSTGRES_INITDB_ARGS: --auth-local=scram-sha-256 --auth-host=scram-sha-256
-        ports:
-          - 5432:5432
+        ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U telecrypt_test -d telecrypt_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
+          --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       TEST_DATABASE_URL: postgres://telecrypt_test:telecrypt_test@127.0.0.1:5432/telecrypt_test?sslmode=disable
+      PIP_ROOT_USER_ACTION: ignore
     steps:
       - uses: actions/checkout@v7.0.1
-
-      - name: Set up Go
-        uses: actions/setup-go@v7.0.0
+        timeout-minutes: 5
         with:
-          go-version: "1.26.4"
-
-      - name: Test
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify release workflow contract
+        run: |
+          set -euo pipefail
+          bash -n scripts/check-release-source.sh scripts/check-release-source_test.sh scripts/release-helpers.sh
+          scripts/check-release-source_test.sh
+          test "$(grep -Fc 'source scripts/release-helpers.sh' .github/workflows/build.yml)" -ge 1
+          grep -Fq -- '--draft' .github/workflows/build.yml
+          grep -Fq 'gh release edit' .github/workflows/build.yml
+          grep -Fq 'bounded_capture_deadline' .github/workflows/build.yml
+          if grep -Eq 'bounded_capture\(\)' .github/workflows/build.yml; then
+            echo 'release workflow contains a duplicate capture implementation' >&2
+            exit 1
+          fi
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Require exact Go and component versions
+        run: |
+          set -euo pipefail
+          [[ "$(awk '$1 == "go" { print $2; exit }' go.mod)" == "$GO_VERSION" ]]
+          [[ "$(sed -n 's/^FROM \(golang:[^ ]*\) AS controlplane-build$/\1/p' Dockerfile)" == "golang:${GO_VERSION}-alpine" ]]
+          [[ "$PYTHON_VERSION" == 3.12.14 ]]
+          [[ "$SYNAPSE_IMAGE" == "ghcr.io/element-hq/synapse:v${SYNAPSE_VERSION}" ]]
+          [[ "$(sed -n 's/^requires = \["\([^"]*\)"\]$/\1/p' synapse/tier_controller/pyproject.toml)" == setuptools==84.0.0 ]]
+      - name: Test Go services
         run: go test ./...
-
-      - name: Vet
+      - name: Vet Go services
         run: go vet ./...
-
-      - name: Set up Python for the Synapse policy module
-        uses: actions/setup-python@v6.0.0
+      - uses: actions/setup-python@v7.0.0
         with:
-          python-version: "3.12"
-
+          python-version: ${{ env.PYTHON_VERSION }}
       - name: Build and test tier-controller wheel
         run: |
-          python -m pip install --disable-pip-version-check build==1.3.0 pytest==9.0.2 pytest-asyncio==1.4.0
-          python -m build --wheel --outdir dist/tier-controller synapse/tier_controller
+          set -euo pipefail
+          source scripts/release-helpers.sh
+          docker_bounded() { timeout --signal=TERM --kill-after=5s 120s docker "$@"; }
+          test_wheelhouse=/tmp/tier-controller-test-wheelhouse
+          rm -rf -- "$test_wheelhouse"; mkdir -p "$test_wheelhouse"
+          python -m pip download --disable-pip-version-check --only-binary=:all: --no-deps --require-hashes \
+            --dest "$test_wheelhouse" -r synapse/tier_controller/requirements-test.txt
           python -m venv /tmp/tier-controller-venv
-          /tmp/tier-controller-venv/bin/python -m pip install --disable-pip-version-check matrix-synapse==1.159.0 pytest==9.0.2 pytest-asyncio==1.4.0 dist/tier-controller/*.whl
-          /tmp/tier-controller-venv/bin/python -m pytest -q synapse/tier_controller/test_tier_controller.py
+          python_bin=/tmp/tier-controller-venv/bin/python
+          "$python_bin" -m pip install --disable-pip-version-check --no-index \
+            --find-links="$test_wheelhouse" --require-hashes -r synapse/tier_controller/requirements-test.txt
+          "$python_bin" -c 'import setuptools; assert setuptools.__version__ == "84.0.0"'
+          "$python_bin" -m build --no-isolation --wheel --outdir dist/tier-controller synapse/tier_controller
+          image_pull_output="$(mktemp)"; image_test_output="$(mktemp)"
+          trap 'rm -f -- "$image_pull_output" "$image_pull_output.stderr" "$image_test_output" "$image_test_output.stderr"' EXIT
+          bounded_capture 65536 "$image_pull_output" docker_bounded pull "$SYNAPSE_IMAGE"
+          bounded_capture 65536 "$image_test_output" docker_bounded run --rm --user 0:0 \
+            --env PIP_ROOT_USER_ACTION=ignore \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/dist/tier-controller,dst=/wheel,readonly" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/synapse/tier_controller/test_tier_controller.py,dst=/work/test_tier_controller.py,readonly" \
+            --entrypoint python "$SYNAPSE_IMAGE" - <<'PY'
+          import pathlib, site, subprocess, sys
+          wheel = next(pathlib.Path('/wheel').glob('*.whl'))
+          subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-index', '--no-deps', '--target', site.getsitepackages()[0], str(wheel)], check=True)
+          subprocess.run([sys.executable, '/work/test_tier_controller.py'], check=True)
+          PY
+      - name: Create tested tier-controller wheel checksum
+        run: |
+          set -euo pipefail
+          shopt -s nullglob; wheels=(dist/tier-controller/*.whl)
+          [[ "${#wheels[@]}" -eq 1 ]]; wheel="${wheels[0]##*/}"
+          (cd dist/tier-controller && sha256sum "$wheel" >"$wheel.sha256" && sha256sum --strict --check "$wheel.sha256")
+          files=(dist/tier-controller/*); [[ "${#files[@]}" -eq 2 ]]
+          [[ "$(wc -c <"${wheels[0]}")" -le 67108864 ]]
+      - name: Recheck release source before wheel publication
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: scripts/check-release-source.sh
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: controlplane-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: |
+            dist/tier-controller/*.whl
+            dist/tier-controller/*.whl.sha256
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: false
 
   release:
     if: startsWith(github.ref, 'refs/tags/')
     needs: validate
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     concurrency:
       group: controlplane-release-${{ github.ref }}
       cancel-in-progress: false
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_SHA: ${{ github.sha }}
+      IMAGE: ghcr.io/telecrypt-io/controlplane
+      IMAGE_BUILD_REF: ghcr.io/telecrypt-io/controlplane:controlplane-build-${{ github.run_id }}-${{ github.run_attempt }}
+      RELEASE_WHEEL: telecrypt_tier_controller-${{ github.ref_name }}-py3-none-any.whl
+      RELEASE_BINDING: controlplane-${{ github.ref_name }}.digest.json
+      RELEASE_METADATA_DIR: ${{ runner.temp }}/controlplane-release-assets
     permissions:
       contents: write
+      actions: read
       packages: write
+      attestations: write
       id-token: write
     steps:
       - uses: actions/checkout@v7.0.1
+        timeout-minutes: 5
         with:
           fetch-depth: 0
-
-      - name: Require an annotated immutable release tag
+          persist-credentials: false
+      - name: Require an exact numeric release tag and source
         run: |
-          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag
-
-      - name: Refuse to replace an immutable release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE: ${{ github.ref_name }}
-        run: |
-          set +e
-          inspection="$(gh api --include "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE" 2>&1)"
-          status=$?
-          set -e
-          if [ "$status" -eq 0 ]; then
-            echo "GitHub Release $RELEASE already exists; refusing to replace release artifacts" >&2
-            exit 1
-          elif printf '%s\n' "$inspection" | grep -Eq '^HTTP/[0-9.]+ 404([[:space:]]|$)'; then
-            echo "confirmed immutable GitHub Release is unused: $RELEASE"
-          else
-            echo "cannot prove whether GitHub Release exists: $RELEASE" >&2
-            exit 1
-          fi
-
-      - name: Set up Python for the tier-controller wheel
-        uses: actions/setup-python@v6.0.0
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/tags/$RELEASE_TAG" ]]
+          [[ "$RELEASE_TAG" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          scripts/check-release-source.sh
+      - uses: actions/setup-python@v7.0.0
         with:
-          python-version: "3.12"
-
-      - name: Build the exact release wheel
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: controlplane-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: dist/tier-controller
+      - name: Require the exact tested wheel
         run: |
-          python -m pip install --disable-pip-version-check build==1.3.0
-          python -m build --wheel --outdir dist/tier-controller synapse/tier_controller
-
-      - name: Require the wheel version to equal the release tag
-        env:
-          EXPECTED_RELEASE: ${{ github.ref_name }}
-        run: |
-          actual="$(python -c 'import tomllib; print(tomllib.load(open("synapse/tier_controller/pyproject.toml", "rb"))["project"]["version"])')"
-          test "$actual" = "$EXPECTED_RELEASE" || {
-            echo "tier-controller wheel version $actual does not equal release $EXPECTED_RELEASE" >&2
-            exit 1
-          }
-
-      - name: Create tier-controller wheel checksum
-        run: |
-          shopt -s nullglob
-          wheels=(dist/tier-controller/*.whl)
-          if [ "${#wheels[@]}" -ne 1 ]; then
-            echo "expected exactly one tier-controller wheel, found ${#wheels[@]}" >&2
-            exit 1
-          fi
-          wheel="${wheels[0]##*/}"
-          (cd dist/tier-controller && sha256sum "$wheel" > "$wheel.sha256")
-
+          set -euo pipefail
+          source_version="$(python -c 'import tomllib; print(tomllib.load(open("synapse/tier_controller/pyproject.toml", "rb"))["project"]["version"])')"
+          [[ "$source_version" == "$RELEASE_TAG" ]]
+          shopt -s nullglob; wheels=(dist/tier-controller/*.whl)
+          [[ "${#wheels[@]}" -eq 1 ]]; wheel="${wheels[0]##*/}"
+          [[ "$wheel" == "$RELEASE_WHEEL" ]]
+          (cd dist/tier-controller && sha256sum --strict --check "$wheel.sha256")
+          python - "${wheels[0]}" <<'PY'
+          import email, sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as archive:
+              names = set(archive.namelist())
+              metadata_name = next(n for n in names if n.endswith('.dist-info/METADATA'))
+              metadata = email.message_from_bytes(archive.read(metadata_name))
+              assert metadata['Name'] == 'telecrypt-tier-controller'
+              assert not metadata.get_all('Requires-Dist')
+              assert any(n.endswith('.dist-info/licenses/LICENSE') for n in names)
+              assert any(n.endswith('.dist-info/licenses/NOTICE') for n in names)
+              assert metadata['Version'] == sys.argv[1].split('-')[1]
+          PY
+          for notice in LICENSE NOTICE; do test -s "$notice"; done
       - name: Log in to GHCR
-        uses: docker/login-action@v4.5.2
+        uses: docker/login-action@v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Refuse to replace an existing image tag
+      - uses: docker/setup-buildx-action@v4.3.0
+      - name: Reuse and verify an exact immutable Release
         env:
-          IMAGE: ghcr.io/telecrypt-io/controlplane:${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if inspection="$(docker manifest inspect "$IMAGE" 2>&1)"; then
-            echo "refusing to replace existing immutable image tag $IMAGE" >&2
-            exit 1
-          elif printf '%s\n' "$inspection" | grep -Eqi 'manifest unknown|no such manifest|not found'; then
-            echo "confirmed immutable image tag is unused: $IMAGE"
-          else
-            echo "cannot prove whether immutable image tag exists: $IMAGE" >&2
-            exit 1
+          set -euo pipefail
+          source scripts/release-helpers.sh
+          docker_bounded() { timeout --signal=TERM --kill-after=5s 120s docker "$@"; }
+          mkdir -p "$RELEASE_METADATA_DIR"
+          release_json="$(mktemp)"; page_json="$(mktemp)"; download_dir="$(mktemp -d)"
+          cleanup() { rm -f -- "$release_json" "$page_json"; rm -rf -- "$download_dir"; }; trap cleanup EXIT
+          found=false
+          for page in $(seq 1 10); do
+            bounded_capture_deadline 1048576 "$page_json" 120 gh api --hostname github.com -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100&page=$page"
+            jq -e 'type == "array" and length <= 100' "$page_json" >/dev/null
+            matches="$(jq --arg tag "$RELEASE_TAG" '[.[] | select(.tag_name == $tag)]' "$page_json")"
+            [[ "$(jq length <<<"$matches")" -le 1 ]]
+            if [[ "$(jq length <<<"$matches")" -eq 1 ]]; then
+              [[ "$found" != true ]] || { echo 'release tag appeared twice' >&2; exit 1; }
+              jq -e '.[0]' <<<"$matches" >"$release_json"; found=true
+            fi
+            [[ "$(jq length "$page_json")" -lt 100 ]] && break
+            [[ "$page" -lt 10 ]] || { echo 'release list reached its bound' >&2; exit 1; }
+          done
+          if [[ "$found" != true ]]; then
+            printf 'RELEASE_EXISTS=false\nRELEASE_REUSE=false\n' >>"$GITHUB_ENV"; exit 0
           fi
-
-      - name: Set up buildx
-        uses: docker/setup-buildx-action@v4.3.0
-
-      - name: Build and push
+          release_id="$(jq -er '.id | select(type == "number" and . > 0 and . == floor)' "$release_json")"
+          jq -e --arg tag "$RELEASE_TAG" \
+            '.tag_name == $tag and .name == $tag and .prerelease == false and ((.draft == false and .immutable == true) or (.draft == true and .immutable == false))' "$release_json" >/dev/null
+          count="$(jq -er '.assets | type == "array" and length' "$release_json")"
+          [[ "$count" -eq 2 ]] || { echo 'immutable Release must contain exactly two assets' >&2; exit 1; }
+          jq -e 'all(.assets[]; (.id | type) == "number" and .id > 0 and .id == floor and
+            (.size | type) == "number" and .size > 0 and .size <= 67108864 and
+            (.digest | type) == "string" and (.digest | test("^sha256:[0-9a-f]{64}$")))' "$release_json" >/dev/null
+          printf 'RELEASE_EXISTS=true\nRELEASE_ID=%s\n' "$release_id" >>"$GITHUB_ENV"
+          if [[ "$(jq -er '.draft' "$release_json")" == true ]]; then
+            printf 'RELEASE_DRAFT_ID=%s\n' "$release_id" >>"$GITHUB_ENV"
+          fi
+          expected_assets="$(printf '%s\n' "$RELEASE_BINDING" "$RELEASE_WHEEL" | sort)"
+          actual_assets="$(jq -r '.assets[].name' "$release_json" | sort)"; [[ "$actual_assets" == "$expected_assets" ]]
+          tag_object="$ANNOTATED_TAG_SHA"
+          for asset in "$RELEASE_BINDING" "$RELEASE_WHEEL"; do
+            asset_id="$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .id' "$release_json")"
+            asset_size="$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .size' "$release_json")"
+            asset_digest="$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .digest | select(test("^sha256:[0-9a-f]{64}$"))' "$release_json")"
+            bounded_capture_deadline $((67108864 + 1)) "$download_dir/$asset" 120 gh api --hostname github.com -H 'Accept: application/octet-stream' -H 'X-GitHub-Api-Version: 2026-03-10' "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+            test "$(wc -c <"$download_dir/$asset")" -eq "$asset_size"
+            test "sha256:$(sha256sum "$download_dir/$asset" | awk '{print $1}')" = "$asset_digest"
+          done
+          cmp -- "dist/tier-controller/$RELEASE_WHEEL" "$download_dir/$RELEASE_WHEEL"
+          jq -e --arg image "$IMAGE" --arg tag "$RELEASE_TAG" --arg source "$RELEASE_SHA" --arg tag_object "$tag_object" \
+            --arg digest "$(jq -er --arg name "$RELEASE_BINDING" '.assets[] | select(.name == $name) | .digest' "$release_json")" \
+            'type == "object" and (keys | sort) == ["annotated_tag_sha", "digest", "image", "schema_version", "source_commit", "tag"] and .schema_version == 1 and .image == $image and .tag == $tag and .source_commit == $source and .annotated_tag_sha == $tag_object and (.digest == $digest)' "$download_dir/$RELEASE_BINDING" >/dev/null
+          digest="$(jq -er '.digest' "$download_dir/$RELEASE_BINDING")"
+          test "$(docker_bounded buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --format '{{.Manifest.Digest}}')" = "$digest"
+          cp -- "$download_dir/$RELEASE_BINDING" "$RELEASE_METADATA_DIR/$RELEASE_BINDING"
+          printf 'RELEASE_REUSE=true\nRELEASE_IMAGE_DIGEST=%s\n' "$digest" >>"$GITHUB_ENV"
+      - name: Recheck release source before image build
+        if: env.RELEASE_REUSE != 'true'
+        run: scripts/check-release-source.sh
+      - name: Build exact single-platform image and tested archive
         id: build-image
-        uses: docker/build-push-action@v7.2.0
+        if: env.RELEASE_REUSE != 'true'
+        uses: docker/build-push-action@v7.3.0
         with:
           context: .
           platforms: linux/amd64
-          provenance: true
-          push: true
+          provenance: false
           target: controlplane
-          tags: ghcr.io/telecrypt-io/controlplane:${{ github.ref_name }}
-
-      - uses: sigstore/cosign-installer@v3.10.1
-
-      - name: Sign image with cosign keyless
+          tags: ${{ env.IMAGE_BUILD_REF }}
+          outputs: |
+            type=docker,dest=${{ runner.temp }}/controlplane-image.tar
+            type=registry,name=${{ env.IMAGE_BUILD_REF }},push=true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.RELEASE_SHA }}
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+            org.opencontainers.image.licenses=BUSL-1.1
+            org.opencontainers.image.title=TeleCrypt Controlplane
+            org.opencontainers.image.description=TeleCrypt Registration, Janitor, and Plan services
+            org.opencontainers.image.vendor=TeleCrypt.io
+            io.telecrypt.config-contract=1
+            org.telecrypt.controlplane.release=${{ env.RELEASE_TAG }}
+            org.telecrypt.tier-controller.release=${{ env.RELEASE_TAG }}
+      - name: Smoke-test exact image and license inventory
+        id: smoke-image
+        if: env.RELEASE_REUSE != 'true'
         env:
-          IMAGE: ghcr.io/telecrypt-io/controlplane
-          DIGEST: ${{ steps.build-image.outputs.digest }}
+          IMAGE_REF: ${{ env.IMAGE_BUILD_REF }}
         run: |
           set -euo pipefail
-          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          cosign sign --yes "${IMAGE}@${DIGEST}"
-
-      - name: Create immutable tier-controller wheel release
+          source scripts/release-helpers.sh
+          docker_bounded() { timeout --signal=TERM --kill-after=5s 120s docker "$@"; }
+          image_id_file="$(mktemp)"; trap 'rm -f -- "$image_id_file" "$image_id_file.stderr"' EXIT
+          bounded_capture 65536 "$image_id_file" docker_bounded load --input "$RUNNER_TEMP/controlplane-image.tar"
+          IMAGE_REF="$IMAGE_REF" RELEASE_TAG="$RELEASE_TAG" RELEASE_SHA="$RELEASE_SHA" GITHUB_REPOSITORY="$GITHUB_REPOSITORY" bash scripts/validate-image-contract.sh
+          registration_name=controlplane-registration-smoke; plan_name=controlplane-plan-smoke
+          cleanup() { timeout --signal=TERM --kill-after=5s 30s docker rm -f "$registration_name" "$plan_name" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker_bounded run --detach --rm --name "$registration_name" --publish 127.0.0.1:19009:9009 --env SERVER_NAME=stage.telecrypt.io "$IMAGE_REF" /registration
+          docker_bounded run --detach --rm --name "$plan_name" --publish 127.0.0.1:19012:9012 --env SERVER_NAME=stage.telecrypt.io --env MAS_OIDC_CLIENT_ID=01J00000000000000000000 --env MAS_OIDC_CLIENT_SECRET=smoke-secret --env PLAN_SESSION_KEY=ssssssssssssssssssssssssssssssss --env PLAN_ASSERTION_PRIVATE_KEY=AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyB5tVYuj-ZU-UB4sRLoqYunkB-FOuaVvtfg45ELrQSWZA "$IMAGE_REF" /plan
+          registration_status=""; for _ in $(seq 1 30); do registration_status="$(curl --silent --show-error --connect-timeout 1 --max-time 3 --request HEAD --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19009/agents || true)"; [[ "$registration_status" == 405 ]] && break; sleep 1; done
+          [[ "$registration_status" == 405 ]]
+          plan_status=""; for _ in $(seq 1 30); do plan_status="$(curl --silent --show-error --connect-timeout 1 --max-time 3 --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19012/plan || true)"; [[ "$plan_status" == 200 ]] && break; sleep 1; done
+          [[ "$plan_status" == 200 ]]
+          echo "image-id=$(docker_bounded image inspect "$IMAGE_REF" --format '{{.Id}}')" >>"$GITHUB_OUTPUT"
+      - name: Refuse a pre-existing exact version tag
+        if: env.RELEASE_REUSE != 'true'
+        env:
+          BUILD_DIGEST: ${{ steps.build-image.outputs.digest }}
+          SMOKE_IMAGE_ID: ${{ steps.smoke-image.outputs.image-id }}
+        run: |
+          set -euo pipefail
+          scripts/check-release-source.sh
+          source scripts/release-helpers.sh
+          docker_bounded() { timeout --signal=TERM --kill-after=5s 120s docker "$@"; }
+          [[ "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$(docker_bounded image inspect "$IMAGE_BUILD_REF" --format '{{.Id}}')" == "$SMOKE_IMAGE_ID" ]]
+          staging_digest="$(docker_bounded buildx imagetools inspect "$IMAGE_BUILD_REF" --format '{{.Manifest.Digest}}')"
+          [[ "$staging_digest" == "$BUILD_DIGEST" ]]
+          set +e
+          inspection="$(docker_bounded buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --format '{{.Manifest.Digest}}' 2>&1)"
+          status=$?
+          set -e
+          if [[ "$status" -eq 0 ]]; then
+            echo "refusing to replace existing immutable image tag $IMAGE:$RELEASE_TAG" >&2
+            exit 1
+          elif printf '%s\n' "$inspection" | grep -Eqi 'manifest unknown|no such manifest'; then
+            echo "confirmed immutable image tag is unused: $IMAGE:$RELEASE_TAG"
+          else
+            echo "cannot prove whether immutable image tag exists: $IMAGE:$RELEASE_TAG" >&2
+            exit 1
+          fi
+          docker_bounded buildx imagetools create --prefer-index=false --tag "$IMAGE:$RELEASE_TAG" "$IMAGE@$BUILD_DIGEST"
+          final_digest="$(docker_bounded buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --format '{{.Manifest.Digest}}')"
+          [[ "$final_digest" == "$BUILD_DIGEST" ]]
+          printf 'RELEASE_IMAGE_DIGEST=%s\n' "$final_digest" >>"$GITHUB_ENV"
+      - name: Write the exact image digest asset
+        if: env.RELEASE_REUSE != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RELEASE_METADATA_DIR"
+          tag_object="$ANNOTATED_TAG_SHA"
+          jq -cS -n --arg image "$IMAGE" --arg tag "$RELEASE_TAG" --arg source_commit "$RELEASE_SHA" --arg annotated_tag_sha "$tag_object" --arg digest "$RELEASE_IMAGE_DIGEST" \
+            '{schema_version: 1, image: $image, tag: $tag, source_commit: $source_commit, annotated_tag_sha: $annotated_tag_sha, digest: $digest}' >"$RELEASE_METADATA_DIR/$RELEASE_BINDING"
+      - name: Recheck image digest and source before attestation
+        if: env.RELEASE_REUSE != 'true'
+        run: |
+          set -euo pipefail
+          source scripts/release-helpers.sh
+          docker_bounded() { timeout --signal=TERM --kill-after=5s 120s docker "$@"; }
+          test "$(docker_bounded buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --format '{{.Manifest.Digest}}')" = "$RELEASE_IMAGE_DIGEST"
+          scripts/check-release-source.sh
+      - uses: actions/attest-build-provenance@v4.2.2
+        if: env.RELEASE_REUSE != 'true'
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ env.RELEASE_IMAGE_DIGEST }}
+          push-to-registry: true
+      - name: Create the exact immutable Release
+        if: env.RELEASE_REUSE != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE: ${{ github.ref_name }}
         run: |
-          gh release create "$RELEASE" --verify-tag --title "tier-controller $RELEASE" --generate-notes dist/tier-controller/*.whl dist/tier-controller/*.whl.sha256
+          set -euo pipefail
+          scripts/check-release-source.sh
+          shopt -s nullglob; wheels=(dist/tier-controller/*.whl); [[ "${#wheels[@]}" -eq 1 ]]
+          assets=("${wheels[0]}" "$RELEASE_METADATA_DIR/$RELEASE_BINDING")
+          draft_output="$(mktemp)"; trap 'rm -f -- "$draft_output" "$draft_output.stderr"' EXIT
+          bounded_capture_deadline 65536 "$draft_output" 120 gh release create "$RELEASE_TAG" "${assets[@]}" --repo "github.com/$GITHUB_REPOSITORY" --verify-tag --draft --title "$RELEASE_TAG" --notes "Exact Controlplane release $RELEASE_TAG."
+          printf 'RELEASE_DRAFT_ID=%s\n' "$RELEASE_TAG" >>"$GITHUB_ENV"
+
+      - name: Verify exact draft before publishing
+        if: env.RELEASE_DRAFT_ID != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source scripts/release-helpers.sh
+          draft_json="$(mktemp)"; download_dir="$(mktemp -d)"
+          cleanup() { rm -f -- "$draft_json" "$draft_json.stderr"; rm -rf -- "$download_dir"; }; trap cleanup EXIT
+          bounded_capture_deadline 1048576 "$draft_json" 120 gh api --hostname github.com -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"
+          jq -e --arg tag "$RELEASE_TAG" --arg wheel "$RELEASE_WHEEL" --arg binding "$RELEASE_BINDING" \
+            '.tag_name == $tag and .name == $tag and .draft == true and .prerelease == false and (.assets | type == "array" and length == 2 and ([.[].name] | sort) == ([$wheel, $binding] | sort) and all(.[]; (.size | type) == "number" and .size > 0 and .size <= 67108864 and (.digest | type) == "string" and (.digest | test("^sha256:[0-9a-f]{64}$"))))' "$draft_json" >/dev/null
+          for asset in "$RELEASE_WHEEL" "$RELEASE_BINDING"; do
+            asset_id="$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .id' "$draft_json")"
+            asset_size="$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .size' "$draft_json")"
+            asset_digest="$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .digest' "$draft_json")"
+            bounded_capture_deadline $((67108864 + 1)) "$download_dir/$asset" 120 gh api --hostname github.com -H 'Accept: application/octet-stream' -H 'X-GitHub-Api-Version: 2026-03-10' "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+            test "$(wc -c <"$download_dir/$asset")" -eq "$asset_size"
+            test "sha256:$(sha256sum "$download_dir/$asset" | awk '{print $1}')" = "$asset_digest"
+          done
+          cmp -- "dist/tier-controller/$RELEASE_WHEEL" "$download_dir/$RELEASE_WHEEL"
+          cmp -- "$RELEASE_METADATA_DIR/$RELEASE_BINDING" "$download_dir/$RELEASE_BINDING"
+
+      - name: Publish verified draft as immutable Release
+        if: env.RELEASE_DRAFT_ID != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source scripts/release-helpers.sh
+          scripts/check-release-source.sh
+          publish_output="$(mktemp)"; trap 'rm -f -- "$publish_output" "$publish_output.stderr"' EXIT
+          bounded_capture_deadline 65536 "$publish_output" 120 gh release edit "$RELEASE_TAG" --repo "github.com/$GITHUB_REPOSITORY" --draft=false
+      - name: Verify the final immutable Release, exact assets, and source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source scripts/release-helpers.sh
+          docker_bounded() { timeout --signal=TERM --kill-after=5s 120s docker "$@"; }
+          final_json="$(mktemp)"; download_dir="$(mktemp -d)"
+          cleanup() { rm -f -- "$final_json"; rm -rf -- "$download_dir"; }; trap cleanup EXIT
+          bounded_capture_deadline 1048576 "$final_json" 120 gh api --hostname github.com -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"
+          jq -e --arg tag "$RELEASE_TAG" --arg wheel "$RELEASE_WHEEL" --arg binding "$RELEASE_BINDING" \
+            '.tag_name == $tag and .name == $tag and .draft == false and .prerelease == false and .immutable == true and
+             (.assets | type == "array" and length == 2 and ([.[].name] | sort) == ([$wheel, $binding] | sort) and
+              all(.[]; (.id | type) == "number" and .id > 0 and .id == floor and (.size | type) == "number" and .size > 0 and .size <= 67108864 and (.digest | type) == "string" and (.digest | test("^sha256:[0-9a-f]{64}$"))))' "$final_json" >/dev/null
+          final_id="$(jq -er '.id' "$final_json")"; if [[ "${RELEASE_EXISTS:-false}" == true ]]; then [[ "$final_id" == "$RELEASE_ID" ]]; fi
+          expected_digest="$RELEASE_IMAGE_DIGEST"
+          for asset in "$RELEASE_WHEEL" "$RELEASE_BINDING"; do
+            asset_id="$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .id' "$final_json")"
+            asset_size="$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .size' "$final_json")"
+            asset_digest="$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .digest' "$final_json")"
+            bounded_capture_deadline $((67108864 + 1)) "$download_dir/$asset" 120 gh api --hostname github.com -H 'Accept: application/octet-stream' -H 'X-GitHub-Api-Version: 2026-03-10' "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+            test "$(wc -c <"$download_dir/$asset")" -eq "$asset_size"
+            test "sha256:$(sha256sum "$download_dir/$asset" | awk '{print $1}')" = "$asset_digest"
+          done
+          cmp -- "dist/tier-controller/$RELEASE_WHEEL" "$download_dir/$RELEASE_WHEEL"
+          tag_object="$ANNOTATED_TAG_SHA"
+          jq -e --arg image "$IMAGE" --arg tag "$RELEASE_TAG" --arg source "$RELEASE_SHA" --arg tag_object "$tag_object" --arg digest "$(jq -er --arg name "$RELEASE_BINDING" '.assets[] | select(.name == $name) | .digest' "$final_json")" \
+            'type == "object" and (keys | sort) == ["annotated_tag_sha", "digest", "image", "schema_version", "source_commit", "tag"] and .schema_version == 1 and .image == $image and .tag == $tag and .source_commit == $source and .annotated_tag_sha == $tag_object and .digest == $digest' "$download_dir/$RELEASE_BINDING" >/dev/null
+          expected_digest="$(jq -er '.digest' "$download_dir/$RELEASE_BINDING")"
+          [[ "$expected_digest" == "$RELEASE_IMAGE_DIGEST" ]]
+          [[ "$(docker_bounded buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --format '{{.Manifest.Digest}}')" == "$expected_digest" ]]
+          scripts/check-release-source.sh

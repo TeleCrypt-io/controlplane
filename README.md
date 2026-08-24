@@ -2,35 +2,51 @@
 
 Public source for the non-payment control-plane components of a TeleCrypt Matrix deployment:
 
-- `redpill` provisions Matrix agent accounts without holding a database connection.
-- `janitor` locks stale accounts and sends owner digests. It reads Cashier-owned billing grants but cannot modify them.
-- `steward` is the browser-facing account and plan-management UI at the stable `/plan` URL. It uses MAS OIDC and a narrow signed private Cashier API.
+- `registration` provisions Matrix agent accounts without holding a database connection.
+- `janitor` runs a single-flight sweep that locks stale accounts and sends owner digests. It never unlocks accounts and reads Cashier-owned billing grants but cannot modify them.
+- `plan` is the browser-facing account and plan-management UI at the stable `/plan` URL. It uses MAS OIDC and a narrow signed private Cashier API.
 - `synapse/tier_controller` is the fail-closed Synapse capability-policy module.
 
 Cashier, Dodo integration, subscription records, payment-provider credentials, and database migrations for billing are private to the `cashier` repository. This public image contains no Cashier binary or payment-provider SDK.
 
 ## Release contract
 
-Every source version is an immutable exact tag. GitHub Actions tests the source and, only for a new
-tag, publishes two distinct artifact types:
+Every source version uses an exact annotated tag. GitHub Actions tests the source and, only for a
+new tag, publishes two distinct artifact types. The tag is the deployment coordinate; immutable
+GitHub Release asset evidence binds the published release contents.
 
 - The Go services are released only as `ghcr.io/telecrypt-io/controlplane:<release>`. The image
-  contains Redpill, Janitor, and Steward; no executable archives are attached to GitHub Releases.
-- The GitHub Release, titled `tier-controller <release>`, contains only
-  `telecrypt_tier_controller-<release>-py3-none-any.whl` and its checksum. This is the public
-  distribution channel for the Synapse module.
+  contains Registration, Janitor, and Plan; no executable archives are attached to GitHub Releases.
+- The GitHub Release, titled exactly `<release>`, contains exactly the
+  `telecrypt_tier_controller-<release>-py3-none-any.whl` and the canonical
+  `controlplane-<release>.digest.json` image-binding asset. License and notice files remain
+  inside the tested wheel; they are not separate release assets. This is the public distribution
+  channel for the Synapse module and its provenance record.
+
+The image carries the project `LICENSE` and `NOTICE`. The wheel carries the project license and
+notice in its metadata; it has no runtime third-party Python dependencies.
 
 The wheel version must equal the source/image tag. The standalone `telecrypt-synapse` repository
-consumes that exact wheel to build its own exact Synapse image. The shared tag is the exact
-cross-repository release coordinate, not a claim that the GitHub Release distributes the Go
-services. Deployment
+must update its manifest to consume that exact wheel before building its corresponding exact
+Synapse image. The shared tag is the exact cross-repository release coordinate, not a claim that
+the GitHub Release distributes the Go services. Deployment
 configuration, credentials, operating procedures, and production acceptance material remain
 private in Harness.
+
+The Go image builder resolves the exact modules recorded in `go.mod` and `go.sum`. One BuildKit
+graph exports both the tested local archive and a run-scoped GHCR staging reference; the archive is
+loaded and smoke-tested before the version tag is created from the exact verified full-manifest digest.
+The release workflow records that digest, source commit, and annotated tag object in the canonical
+JSON asset. It separately attaches one build-provenance attestation to the exact GHCR image digest
+before publishing the Release. GitHub's immutable-release feature supplies a distinct release
+attestation covering the published tag and its two release assets. The workflow proves that a
+version tag is absent before creating it and refuses every pre-existing exact version tag; an
+existing exact immutable Release is reused only as a complete, independently verified release.
 
 ## Repository layout
 
 - `cmd/` contains the minimal `main` packages for the three independently deployed processes:
-  Redpill, Janitor, and Steward.
+  Registration, Janitor, and Plan.
 - `internal/` contains their shared Go implementation. Go deliberately prevents packages below
   `internal/` from being imported by unrelated repositories.
 - `synapse/tier_controller/` contains the public Python package released as the exact wheel for
@@ -38,21 +54,46 @@ private in Harness.
 
 ## Browser service boundary
 
-Steward owns the public `/plan` URL, MAS PKCE/OIDC, browser cookies, Origin protection, local MXID
+Plan owns the public `/plan` URL, MAS PKCE/OIDC, browser cookies, Origin protection, local MXID
 validation, and the plan UI. It has no Dodo, Synapse-admin, or Postgres credentials. Commands are
 signed to the private Cashier service, which alone handles checkout, payment webhooks, entitlement
 mutation, and Dodo customer portal links.
 
-`BILLING_ENV` is explicit. A test configuration visibly renders `TEST / SANDBOX — no real charges` on every Steward page. Payment card data is entered only on the Dodo-hosted checkout or customer-portal page, never at TeleCrypt.
+One-label preproduction configurations visibly render `TEST / SANDBOX — no real charges` on every Plan page. Payment card data is entered only on the Dodo-hosted checkout or customer-portal page, never at TeleCrypt.
 
-Janitor runs one sweep per invocation and reads Cashier-owned billing grants through
+`SERVER_NAME` is the sole public-host topology input for Registration, Plan, and Janitor. The exact production name `telecrypt.io`
+selects `https://backend.telecrypt.io`; one-label preproduction names such as
+`stage.telecrypt.io` select `https://backend.stage.telecrypt.io`. Other hostname shapes are
+rejected. The public MAS, Registration, and Plan URLs are derived as `/auth`, `/agents`, and
+`/plan` on that backend origin. The exact `telecrypt.io` identity is production; every one-label
+preproduction name is an isolated test deployment. Registration, Plan, and Janitor all derive their
+environment identity from `SERVER_NAME` alone.
+
+Janitor runs one single-flight sweep per invocation and reads Cashier-owned billing grants through
 `JANITOR_DB_URL`, using a separate database credential from Cashier's `CASHIER_DB_URL`. The
-Janitor role is read-only on the private `cashier` schema and may write only its own `locker_state`
-maintenance table.
+URL must use the exact environment database and Janitor role: production uses
+`telecrypt_billing` with `telecrypt_janitor_user`, while `<label>.telecrypt.io` uses
+`telecrypt_billing_<label>` with `telecrypt_janitor_<label>_user` (hyphens in a label become
+underscores in database identifiers). The Janitor role is owner-precreated for the private
+`janitor` schema, is read-only on Cashier's private `cashier` schema, and has schema-owner DDL
+authority (including CREATE, ALTER, and DROP) only within that private `janitor` schema so the
+one-shot can apply its exact migration. The application writes only its own
+`janitor_digest_cursor` and `schema_migrations` tables; PUBLIC and other roles must have no ACL on
+the Janitor schema. Cashier's billing migration history remains private to the Cashier repository.
+Cashier grants it usage of `cashier` and read access to only the
+deployment-identity and verification-grant tables.
+The private schema and both read-side tables must remain owned by the exact environment Cashier
+role (`telecrypt_cashier_user` in production or `telecrypt_cashier_<label>_user` in preproduction);
+Cashier durably binds both `SERVER_NAME` and its derived billing environment (`live` or `test`) in
+that identity row. Janitor rejects any server or billing-environment drift before it can sweep.
 
-## Redpill credential contract
+These migrations intentionally accept only the final schema and exact migration digests. An older
+or incompatible disposable database must be reset and recreated by the operator; no backward
+migration path is provided.
 
-`POST /redpill` is the public, rate-limited component for creating an agent account. It
+## Registration credential contract
+
+`POST /agents` is the public, rate-limited component for creating an agent account. It
 uses only MAS's public password-registration forms, dynamic registration of a public native OAuth
 client (`token_endpoint_auth_method: none`), and MAS's device-authorization pages through the
 new account's short-lived cookie session. It never receives a MAS/Synapse admin credential, a
@@ -61,10 +102,11 @@ personal access token, or a static OAuth client secret, and it never uses Matrix
 
 The one response contains the MXID, generated MAS password, access/refresh tokens, expiry,
 device ID, homeserver, and `issuer`/`client_id`/`token_endpoint` needed to refresh directly with
-MAS. The password is a recovery credential; agents should use the refresh token. Redpill stores
+MAS. The password is a recovery credential; agents should use the refresh token. Registration stores
 none of those values, logs no credential-exchange details, and sends `Cache-Control: no-store`.
-The fixed in-process limiter allows 5 requests per source and 60 total requests per 60 seconds.
-Trusted client-IP extraction remains enforced at the Redpill boundary.
+The fixed in-process limiter allows 60 registration attempts per 60-second window per instance. It
+is a global backstop; client-facing fairness and any per-client controls belong at the
+Caddy/network boundary.
 
 ## Development
 

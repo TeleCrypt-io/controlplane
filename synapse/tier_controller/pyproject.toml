@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=78"]
+requires = ["setuptools==84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "telecrypt-tier-controller"
-version = "0.4.0"
+version = "0.5.0"
 description = "TeleCrypt fail-closed Synapse capability-policy module"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,11 +20,4 @@ classifiers = [
 [tool.setuptools]
 packages = ["tier_controller"]
 package-dir = { tier_controller = "." }
-
-[tool.pytest.ini_options]
-filterwarnings = [
-  "error",
-  'ignore::DeprecationWarning:^twisted\.web\.static$',
-  'ignore::DeprecationWarning:^synapse\.api\.filtering$',
-  'ignore::DeprecationWarning:^synapse\.http\.connectproxyclient$',
-]
+license-files = ["../../LICENSE", "../../NOTICE"]

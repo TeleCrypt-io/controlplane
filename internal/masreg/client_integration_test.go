@@ -7,7 +7,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -19,7 +18,9 @@ const disposableConfirmation = "YES"
 
 // TestRegisterAndAuthorizeDeviceDisposableMAS is deliberately excluded from the default test
 // suite. It creates a real account, a dynamic OAuth client, and a Matrix device, so it must only
-// run against a disposable MAS/Synapse deployment explicitly named by the operator.
+// run against a disposable MAS/Synapse deployment explicitly named by the operator. Release
+// acceptance must run it against the exact prebuilt MAS 1.23 image: the strict completion-path
+// allowlist in client.go is fixture-observed, not independently documented by upstream MAS.
 func TestRegisterAndAuthorizeDeviceDisposableMAS(t *testing.T) {
 	masBase := requiredIntegrationEnv(t, "MASREG_INTEGRATION_MAS_BASE_URL")
 	matrixOrigin := requiredIntegrationEnv(t, "MASREG_INTEGRATION_MATRIX_ORIGIN")
@@ -54,7 +55,7 @@ func TestRegisterAndAuthorizeDeviceDisposableMAS(t *testing.T) {
 
 	// RegisterAndAuthorizeDevice validates this internally; repeat the public whoami assertion
 	// here so this integration test records the device metadata bound to the returned token too.
-	userID, returnedDeviceID, err := (&session{publicHTTPClient: &http.Client{Timeout: 30 * time.Second}}).whoAmI(ctx, matrixOrigin, tokens.AccessToken)
+	userID, returnedDeviceID, err := (&session{baseURL: strings.TrimRight(masBase, "/"), publicHTTPClient: newPublicHTTPClient()}).whoAmI(ctx, matrixOrigin, tokens.AccessToken)
 	if err != nil {
 		t.Fatalf("validate disposable-MAS token with Matrix whoami: %v", err)
 	}

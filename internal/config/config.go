@@ -2,13 +2,19 @@
 package config
 
 import (
+	"bytes"
+	"crypto/ed25519"
+	"encoding/base64"
 	"fmt"
+	"net/mail"
 	"net/url"
 	"os"
 	"strings"
+
+	"github.com/TeleCrypt-io/controlplane/internal/db"
 )
 
-// Config is redpill configuration.
+// Config is registration configuration.
 type Config struct {
 	BackendPublicURL string
 	MASPublicURL     string
@@ -17,34 +23,34 @@ type Config struct {
 }
 
 func Load() (*Config, error) {
-	backend, err := deriveBackendEndpoints(os.Getenv("BACKEND_PUBLIC_URL"))
+	serverName, endpoints, err := loadServerIdentity()
 	if err != nil {
 		return nil, err
 	}
 	return &Config{
-		BackendPublicURL: backend.origin,
-		MASPublicURL:     backend.mas,
-		PlanPublicURL:    backend.plan,
-		ServerName:       os.Getenv("SERVER_NAME"),
+		BackendPublicURL: endpoints.origin,
+		MASPublicURL:     endpoints.mas,
+		PlanPublicURL:    endpoints.plan,
+		ServerName:       serverName,
 	}, nil
 }
 
-// ValidateRedpill rejects a configuration that would weaken Redpill's public OAuth boundary or
-// make the in-process backstop unavailable. Redpill has no internal MAS credential, so its MAS,
+// ValidateRegistration rejects a configuration that would weaken Registration's public OAuth boundary or
+// make the in-process backstop unavailable. Registration has no internal MAS credential, so its MAS,
 // homeserver, and Plan URLs must all be browser-visible HTTPS endpoints.
-func (c *Config) ValidateRedpill() error {
-	backend, err := deriveBackendEndpoints(c.BackendPublicURL)
+func (c *Config) ValidateRegistration() error {
+	endpoints, err := deriveBackendEndpoints(c.ServerName)
 	if err != nil {
 		return err
 	}
-	if c.MASPublicURL != backend.mas || c.PlanPublicURL != backend.plan {
-		return fmt.Errorf("public MAS and Plan URLs must be derived from BACKEND_PUBLIC_URL")
+	if c.BackendPublicURL != endpoints.origin || c.MASPublicURL != endpoints.mas || c.PlanPublicURL != endpoints.plan {
+		return fmt.Errorf("public endpoints must be derived from SERVER_NAME")
 	}
 	for _, endpoint := range []struct {
 		name string
 		url  string
 	}{
-		{"BACKEND_PUBLIC_URL", c.BackendPublicURL},
+		{"derived backend URL", c.BackendPublicURL},
 		{"derived MAS /auth URL", c.MASPublicURL},
 		{"derived Plan /plan URL", c.PlanPublicURL},
 	} {
@@ -52,23 +58,34 @@ func (c *Config) ValidateRedpill() error {
 			return err
 		}
 	}
-	if strings.TrimSpace(c.ServerName) == "" {
-		return fmt.Errorf("SERVER_NAME must not be empty")
-	}
 	return nil
 }
 
-func getenvBool(key string) bool { return os.Getenv(key) == "1" }
+func loadDryRun() (bool, error) {
+	value, present := os.LookupEnv("JANITOR_DRY_RUN")
+	if !present || value == "" {
+		return false, fmt.Errorf("JANITOR_DRY_RUN must be explicitly set to exactly 0 or 1")
+	}
+	switch value {
+	case "0":
+		return false, nil
+	case "1":
+		return true, nil
+	default:
+		return false, fmt.Errorf("JANITOR_DRY_RUN must be exactly 0 or 1")
+	}
+}
 
-// LockerConfig is Janitor configuration. Cashier alone writes payment state; Janitor verifies
-// its explicit environment guard before it reads the Cashier-owned entitlement grants.
-type LockerConfig struct {
-	BillingEnv           string
+// JanitorConfig is Janitor configuration. Cashier alone writes payment state; Janitor verifies
+// its deployment identity before it reads the Cashier-owned entitlement grants.
+type JanitorConfig struct {
+	BillingEnvironment   string
 	DryRun               bool
 	MASAdminURL          string
 	MASAdminClientID     string
 	MASAdminClientSecret string
 	JanitorDBURL         string
+	CashierDBRole        string
 	ServerName           string
 	OwnerEmail           string
 	SMTPHost             string
@@ -77,103 +94,142 @@ type LockerConfig struct {
 	SMTPFrom             string
 }
 
-func LoadLocker() (*LockerConfig, error) {
-	c := &LockerConfig{
-		BillingEnv:           os.Getenv("BILLING_ENV"),
-		DryRun:               getenvBool("DRY_RUN"),
+func LoadJanitor() (*JanitorConfig, error) {
+	serverName, billingEnvironment, _, err := loadBillingIdentity()
+	if err != nil {
+		return nil, err
+	}
+	dryRun, err := loadDryRun()
+	if err != nil {
+		return nil, err
+	}
+	if (billingEnvironment == "test") != dryRun {
+		return nil, fmt.Errorf("JANITOR_DRY_RUN must be 1 for BILLING_ENVIRONMENT=test and 0 for BILLING_ENVIRONMENT=live")
+	}
+	cashierDBRole, err := expectedCashierDatabaseRole(serverName)
+	if err != nil {
+		return nil, err
+	}
+	c := &JanitorConfig{
+		BillingEnvironment:   billingEnvironment,
+		DryRun:               dryRun,
 		MASAdminURL:          masAdminURL,
 		MASAdminClientID:     os.Getenv("MAS_ADMIN_CLIENT_ID"),
 		MASAdminClientSecret: os.Getenv("MAS_ADMIN_CLIENT_SECRET"),
 		JanitorDBURL:         os.Getenv("JANITOR_DB_URL"),
-		ServerName:           os.Getenv("SERVER_NAME"),
+		CashierDBRole:        cashierDBRole,
+		ServerName:           serverName,
 		OwnerEmail:           os.Getenv("OWNER_EMAIL"),
 		SMTPHost:             os.Getenv("SMTP_HOST"),
 		SMTPUsername:         os.Getenv("SMTP_USERNAME"),
 		SMTPPassword:         os.Getenv("SMTP_PASSWORD"),
 		SMTPFrom:             os.Getenv("SMTP_FROM"),
 	}
-	var missing []string
-	for _, req := range []struct{ name, value string }{
-		{"BILLING_ENV", c.BillingEnv}, {"MAS_ADMIN_CLIENT_ID", c.MASAdminClientID},
+	required := []envValue{
+		{"MAS_ADMIN_CLIENT_ID", c.MASAdminClientID},
 		{"MAS_ADMIN_CLIENT_SECRET", c.MASAdminClientSecret}, {"JANITOR_DB_URL", c.JanitorDBURL},
 		{"SERVER_NAME", c.ServerName},
-	} {
-		if req.value == "" {
-			missing = append(missing, req.name)
+	}
+	if err := requireEnvValues(required, "missing required env vars"); err != nil {
+		return nil, err
+	}
+	if !validMASClientID(c.MASAdminClientID) {
+		return nil, fmt.Errorf("MAS_ADMIN_CLIENT_ID must be a canonical 26-character MAS ULID")
+	}
+	optional := []envValue{
+		{"OWNER_EMAIL", c.OwnerEmail}, {"SMTP_HOST", c.SMTPHost},
+		{"SMTP_USERNAME", c.SMTPUsername}, {"SMTP_PASSWORD", c.SMTPPassword},
+		{"SMTP_FROM", c.SMTPFrom},
+	}
+	if err := rejectSurroundingWhitespace(optional); err != nil {
+		return nil, err
+	}
+	if c.DryRun {
+		for _, value := range optional {
+			if value.value != "" {
+				return nil, fmt.Errorf("%s must be empty when BILLING_ENVIRONMENT=test", value.name)
+			}
+		}
+	} else {
+		if err := requireEnvValues([]envValue{
+			{"OWNER_EMAIL", c.OwnerEmail}, {"SMTP_HOST", c.SMTPHost},
+			{"SMTP_USERNAME", c.SMTPUsername}, {"SMTP_PASSWORD", c.SMTPPassword},
+			{"SMTP_FROM", c.SMTPFrom},
+		}, "missing required Janitor mail env vars"); err != nil {
+			return nil, err
+		}
+		if c.OwnerEmail, err = parseMailbox("OWNER_EMAIL", c.OwnerEmail); err != nil {
+			return nil, err
+		}
+		if c.SMTPFrom, err = parseMailbox("SMTP_FROM", c.SMTPFrom); err != nil {
+			return nil, err
 		}
 	}
-	if c.SMTPHost != "" && c.SMTPFrom == "" {
-		missing = append(missing, "SMTP_FROM (required once SMTP_HOST is set)")
-	}
-	if len(missing) != 0 {
-		return nil, fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
-	}
-	if c.BillingEnv != "test" && c.BillingEnv != "production" {
-		return nil, fmt.Errorf("BILLING_ENV must be exactly test or production")
-	}
-	dbURL, err := url.Parse(c.JanitorDBURL)
-	if err != nil || (dbURL.Scheme != "postgres" && dbURL.Scheme != "postgresql") || dbURL.Host == "" {
-		return nil, fmt.Errorf("JANITOR_DB_URL must be an explicit Postgres URL")
+	if err := validateJanitorDBURL(c.JanitorDBURL, c.ServerName); err != nil {
+		return nil, err
 	}
 	return c, nil
 }
 
-// StewardConfig contains the browser-facing service configuration. It has no payment,
+// PlanConfig contains the browser-facing service configuration. It has no payment,
 // Synapse-admin, or database credentials.
-type StewardConfig struct {
-	BillingEnv                 string
-	ServerName                 string
-	BackendPublicURL           string
-	MASInternalURL             string
-	PlanPublicURL              string
-	CashierInternalURL         string // fixed Compose-local endpoint
-	MASClientID                string
-	MASClientSecret            string
-	SessionKey                 string
-	StewardAssertionPrivateKey string
+type PlanConfig struct {
+	BillingEnvironment      string
+	ServerName              string
+	BackendPublicURL        string
+	MASInternalURL          string
+	PlanPublicURL           string
+	CashierInternalURL      string // fixed Compose-local endpoint
+	MASClientID             string
+	MASClientSecret         string
+	PlanSessionKey          string
+	PlanAssertionPrivateKey string
 }
 
-func LoadSteward() (*StewardConfig, error) {
-	c := &StewardConfig{
-		BillingEnv:                 os.Getenv("BILLING_ENV"),
-		ServerName:                 os.Getenv("SERVER_NAME"),
-		BackendPublicURL:           os.Getenv("BACKEND_PUBLIC_URL"),
-		MASInternalURL:             masInternalURL,
-		CashierInternalURL:         cashierInternalURL,
-		MASClientID:                os.Getenv("MAS_OIDC_CLIENT_ID"),
-		MASClientSecret:            os.Getenv("MAS_OIDC_CLIENT_SECRET"),
-		SessionKey:                 os.Getenv("SESSION_KEY"),
-		StewardAssertionPrivateKey: os.Getenv("STEWARD_ASSERTION_PRIVATE_KEY"),
-	}
-	for _, req := range []struct{ name, value string }{
-		{"SERVER_NAME", c.ServerName}, {"BILLING_ENV", c.BillingEnv}, {"BACKEND_PUBLIC_URL", c.BackendPublicURL},
-		{"MAS_OIDC_CLIENT_ID", c.MASClientID}, {"MAS_OIDC_CLIENT_SECRET", c.MASClientSecret},
-		{"SESSION_KEY", c.SessionKey}, {"STEWARD_ASSERTION_PRIVATE_KEY", c.StewardAssertionPrivateKey},
-	} {
-		if req.value == "" {
-			return nil, fmt.Errorf("missing required env var: %s", req.name)
-		}
-	}
-	if c.BillingEnv != "test" && c.BillingEnv != "production" {
-		return nil, fmt.Errorf("BILLING_ENV must be exactly test or production")
-	}
-	if len(c.SessionKey) < 32 {
-		return nil, fmt.Errorf("SESSION_KEY must contain at least 32 bytes")
-	}
-	backend, err := deriveBackendEndpoints(c.BackendPublicURL)
+func LoadPlan() (*PlanConfig, error) {
+	serverName, billingEnvironment, endpoints, err := loadBillingIdentity()
 	if err != nil {
 		return nil, err
 	}
-	c.BackendPublicURL = backend.origin
-	c.PlanPublicURL = backend.plan
-	if err := validatePublicHTTPSURL(c.BackendPublicURL, "BACKEND_PUBLIC_URL"); err != nil {
+	c := &PlanConfig{
+		BillingEnvironment:      billingEnvironment,
+		ServerName:              serverName,
+		BackendPublicURL:        endpoints.origin,
+		MASInternalURL:          masInternalURL,
+		CashierInternalURL:      cashierInternalURL,
+		MASClientID:             os.Getenv("MAS_OIDC_CLIENT_ID"),
+		MASClientSecret:         os.Getenv("MAS_OIDC_CLIENT_SECRET"),
+		PlanSessionKey:          os.Getenv("PLAN_SESSION_KEY"),
+		PlanAssertionPrivateKey: os.Getenv("PLAN_ASSERTION_PRIVATE_KEY"),
+	}
+	if _, present := os.LookupEnv("SESSION_KEY"); present {
+		return nil, fmt.Errorf("SESSION_KEY must be unset; use PLAN_SESSION_KEY")
+	}
+	required := []envValue{
+		{"MAS_OIDC_CLIENT_ID", c.MASClientID}, {"MAS_OIDC_CLIENT_SECRET", c.MASClientSecret},
+		{"PLAN_SESSION_KEY", c.PlanSessionKey}, {"PLAN_ASSERTION_PRIVATE_KEY", c.PlanAssertionPrivateKey},
+	}
+	if err := requireEnvValues(required, "missing required env var"); err != nil {
+		return nil, err
+	}
+	if !validMASClientID(c.MASClientID) {
+		return nil, fmt.Errorf("MAS_OIDC_CLIENT_ID must be a canonical 26-character MAS ULID")
+	}
+	if len(c.PlanSessionKey) < 32 {
+		return nil, fmt.Errorf("PLAN_SESSION_KEY must contain at least 32 bytes")
+	}
+	if err := validatePlanAssertionPrivateKey(c.PlanAssertionPrivateKey); err != nil {
+		return nil, err
+	}
+	c.PlanPublicURL = endpoints.plan
+	if err := validatePublicHTTPSURL(c.BackendPublicURL, "derived backend URL"); err != nil {
 		return nil, err
 	}
 	return c, nil
 }
 
 const (
-	masAdminURL        = "http://mas:8081"
+	masAdminURL        = "http://mas-admin:8081"
 	masInternalURL     = "http://mas:8080"
 	cashierInternalURL = "http://cashier:9011"
 )
@@ -184,14 +240,229 @@ type backendEndpoints struct {
 	plan   string
 }
 
-func deriveBackendEndpoints(raw string) (backendEndpoints, error) {
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.Hostname() == "" || (u.Path != "" && u.Path != "/") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return backendEndpoints{}, fmt.Errorf("BACKEND_PUBLIC_URL must be an HTTPS origin")
+type envValue struct {
+	name  string
+	value string
+}
+
+func validMASClientID(value string) bool {
+	if len(value) != 26 || value[0] > '7' {
+		return false
 	}
-	u.Path, u.RawPath = "", ""
-	origin := strings.TrimRight(u.String(), "/")
-	return backendEndpoints{origin: origin, mas: origin + "/auth", plan: origin + "/plan"}, nil
+	const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+	for i := range value {
+		if !strings.ContainsRune(alphabet, rune(value[i])) {
+			return false
+		}
+	}
+	return true
+}
+
+func requireEnvValues(values []envValue, missingPrefix string) error {
+	var missing []string
+	for _, value := range values {
+		if value.value == "" {
+			missing = append(missing, value.name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%s: %s", missingPrefix, strings.Join(missing, ", "))
+	}
+	return rejectSurroundingWhitespace(values)
+}
+
+func rejectSurroundingWhitespace(values []envValue) error {
+	for _, value := range values {
+		if value.value != "" {
+			if err := requireNonEmptyNoSurroundingWhitespace(value.name, value.value); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func loadServerName() (string, error) {
+	serverName := os.Getenv("SERVER_NAME")
+	if serverName == "" {
+		return "", fmt.Errorf("missing required env var: SERVER_NAME")
+	}
+	if err := requireNonEmptyNoSurroundingWhitespace("SERVER_NAME", serverName); err != nil {
+		return "", err
+	}
+	return serverName, nil
+}
+
+func loadServerIdentity() (string, backendEndpoints, error) {
+	serverName, err := loadServerName()
+	if err != nil {
+		return "", backendEndpoints{}, err
+	}
+	endpoints, err := deriveBackendEndpoints(serverName)
+	if err != nil {
+		return "", backendEndpoints{}, err
+	}
+	return serverName, endpoints, nil
+}
+
+// loadBillingIdentity is used only by Plan and Janitor. Registration and other public
+// topology-only consumers may accept a syntactically valid future hostname, but these two
+// services hold billing-sensitive behavior and therefore require one of the three frozen
+// server/billing profiles. The nonsecret billing value is never inferred from credentials or
+// hostname.
+func loadBillingIdentity() (string, string, backendEndpoints, error) {
+	serverName, endpoints, err := loadServerIdentity()
+	if err != nil {
+		return "", "", backendEndpoints{}, err
+	}
+	billingEnvironment, present := os.LookupEnv("BILLING_ENVIRONMENT")
+	if !present || billingEnvironment == "" {
+		return "", "", backendEndpoints{}, fmt.Errorf("missing required env var: BILLING_ENVIRONMENT")
+	}
+	if err := requireNonEmptyNoSurroundingWhitespace("BILLING_ENVIRONMENT", billingEnvironment); err != nil {
+		return "", "", backendEndpoints{}, err
+	}
+	if err := db.ValidateDeploymentProfile(serverName, billingEnvironment); err != nil {
+		return "", "", backendEndpoints{}, err
+	}
+	if _, present := os.LookupEnv("BILLING_ENV"); present {
+		return "", "", backendEndpoints{}, fmt.Errorf("BILLING_ENV must be unset")
+	}
+	for _, key := range []string{"DODO_ENVIRONMENT", "DODO_BASE_URL", "DODO_API_URL", "DODO_API_BASE_URL", "DODO_CHECKOUT_URL", "DODO_PORTAL_URL"} {
+		if _, present := os.LookupEnv(key); present {
+			return "", "", backendEndpoints{}, fmt.Errorf("%s must be unset", key)
+		}
+	}
+	return serverName, billingEnvironment, endpoints, nil
+}
+
+func isProductionServerName(serverName string) bool { return serverName == "telecrypt.io" }
+
+func deriveBackendEndpoints(serverName string) (backendEndpoints, error) {
+	_, err := parseServerTopology(serverName)
+	if err != nil {
+		return backendEndpoints{}, err
+	}
+	backendHost := "backend." + serverName
+	origin := "https://" + backendHost
+	return backendEndpoints{
+		origin: origin,
+		mas:    origin + "/auth",
+		plan:   origin + "/plan",
+	}, nil
+}
+
+func validServerLabel(label string) bool {
+	if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for _, r := range label {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+const maxDerivedServerLabelBytes = 40
+
+func validateDerivedServerLabel(label string) error {
+	if !validServerLabel(label) {
+		return fmt.Errorf("SERVER_NAME must be exactly telecrypt.io or one <label>.telecrypt.io hostname")
+	}
+	if len(label) > maxDerivedServerLabelBytes {
+		return fmt.Errorf("SERVER_NAME label must be at most %d bytes for derived identities", maxDerivedServerLabelBytes)
+	}
+	return nil
+}
+
+type serverTopology struct {
+	production      bool
+	label           string
+	normalizedLabel string
+}
+
+func parseServerTopology(serverName string) (serverTopology, error) {
+	if serverName == "telecrypt.io" {
+		return serverTopology{production: true}, nil
+	}
+	const suffix = ".telecrypt.io"
+	if !strings.HasSuffix(serverName, suffix) {
+		return serverTopology{}, fmt.Errorf("SERVER_NAME must be exactly telecrypt.io or one <label>.telecrypt.io hostname")
+	}
+	label := strings.TrimSuffix(serverName, suffix)
+	if err := validateDerivedServerLabel(label); err != nil {
+		return serverTopology{}, err
+	}
+	return serverTopology{label: label, normalizedLabel: strings.ReplaceAll(label, "-", "_")}, nil
+}
+
+func requireNonEmptyNoSurroundingWhitespace(name, value string) error {
+	if value == "" || strings.TrimSpace(value) != value {
+		return fmt.Errorf("%s must be non-empty and must not have surrounding whitespace", name)
+	}
+	return nil
+}
+
+func parseMailbox(name, value string) (string, error) {
+	address, err := mail.ParseAddress(value)
+	if err != nil || address.Address == "" {
+		return "", fmt.Errorf("%s must be a valid email address", name)
+	}
+	return address.Address, nil
+}
+
+func validatePlanAssertionPrivateKey(value string) error {
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(value)
+	if err != nil || len(decoded) != ed25519.PrivateKeySize ||
+		base64.RawURLEncoding.EncodeToString(decoded) != value {
+		return fmt.Errorf("PLAN_ASSERTION_PRIVATE_KEY must be a raw URL-safe base64 Ed25519 private key")
+	}
+	expected := ed25519.NewKeyFromSeed(decoded[:ed25519.SeedSize])
+	if !bytes.Equal(decoded, expected) {
+		return fmt.Errorf("PLAN_ASSERTION_PRIVATE_KEY must contain a seed-matching Ed25519 private key")
+	}
+	return nil
+}
+
+func validateJanitorDBURL(raw, serverName string) error {
+	database, username, err := expectedJanitorDatabaseIdentity(serverName)
+	if err != nil {
+		return err
+	}
+	if err := db.ValidateJanitorDatabaseURL(raw); err != nil {
+		return err
+	}
+	dbURL, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("JANITOR_DB_URL must be an explicit Postgres URL")
+	}
+	if dbURL.Path != "/"+database || dbURL.User.Username() != username {
+		return fmt.Errorf("JANITOR_DB_URL must use database %q and user %q for SERVER_NAME %q", database, username, serverName)
+	}
+	return nil
+}
+
+func expectedJanitorDatabaseIdentity(serverName string) (string, string, error) {
+	topology, err := parseServerTopology(serverName)
+	if err != nil {
+		return "", "", err
+	}
+	if topology.production {
+		return "telecrypt_billing", "telecrypt_janitor_user", nil
+	}
+	return "telecrypt_billing_" + topology.normalizedLabel, "telecrypt_janitor_" + topology.normalizedLabel + "_user", nil
+}
+
+func expectedCashierDatabaseRole(serverName string) (string, error) {
+	topology, err := parseServerTopology(serverName)
+	if err != nil {
+		return "", err
+	}
+	if topology.production {
+		return "telecrypt_cashier_user", nil
+	}
+	return "telecrypt_cashier_" + topology.normalizedLabel + "_user", nil
 }
 
 func validatePublicHTTPSURL(raw, name string) error {

@@ -1,7 +1,8 @@
 # tier_controller — fail-closed capability restrictions for unverified users.
 #
-# Baked into the controlplane-owned Synapse module image at /modules/tier_controller and loaded by
-# the server's `modules:` configuration. Inverted tier model: everyone is RESTRICTED (no uploads,
+# Installed by the standalone telecrypt-synapse image from the exact wheel release and loaded by
+# Synapse's `modules:` configuration. It is not copied into the Controlplane image. Inverted tier
+# model: everyone is RESTRICTED (no uploads,
 # a capped number of created rooms, no m.room.encryption) unless user_type == 'verified'.
 # NULL/absent user_type (the default for a freshly registered account, agent or human) is
 # restricted; only an explicit 'verified' user_type lifts the restriction. There is no second
@@ -41,7 +42,7 @@ class TierControllerConfig:
 class TierController:
     def __init__(self, config: TierControllerConfig, api: ModuleApi) -> None:
         self.config = config
-        self.api = api
+        self._run_db_interaction = api.run_db_interaction
 
         api.register_media_repository_callbacks(
             is_user_allowed_to_upload_media_of_size=self.is_user_allowed_to_upload_media_of_size,
@@ -57,6 +58,8 @@ class TierController:
             restricted_room_cap = int(config.get("restricted_room_cap", 3))
         except (TypeError, ValueError) as e:
             raise ConfigError("restricted_room_cap must be an integer") from e
+        if restricted_room_cap < 0:
+            raise ConfigError("restricted_room_cap must not be negative")
         return TierControllerConfig(restricted_room_cap)
 
     async def _get_user_type(self, user_id: str) -> str | None:
@@ -66,7 +69,7 @@ class TierController:
             return row[0] if row else None
 
         try:
-            user_type = await self.api.run_db_interaction(
+            user_type = await self._run_db_interaction(
                 "tier_controller_get_user_type", txn
             )
         except Exception:
@@ -87,7 +90,7 @@ class TierController:
             return int(row[0]) if row else 0
 
         try:
-            return await self.api.run_db_interaction(
+            return await self._run_db_interaction(
                 "tier_controller_count_created_rooms", txn
             )
         except Exception:

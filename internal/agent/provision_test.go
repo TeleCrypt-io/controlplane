@@ -65,6 +65,17 @@ func TestProvisionAgent_FailsClosed(t *testing.T) {
 	}
 }
 
+func TestProvisionAgentRejectsForeignMXIDServer(t *testing.T) {
+	m := &fakeMASReg{result: &masreg.DeviceTokens{UserID: "@agent:foreign.example"}}
+	p, err := NewProvisioner(m, "https://backend.telecrypt.io", "telecrypt.io")
+	if err != nil {
+		t.Fatalf("NewProvisioner: %v", err)
+	}
+	if _, err := p.ProvisionAgent(context.Background()); err == nil || !strings.Contains(err.Error(), "unexpected user_id") {
+		t.Fatalf("ProvisionAgent foreign MXID error = %v, want exact-server rejection", err)
+	}
+}
+
 // fakeMASServer models the complete supported public sequence. Its catch-all records any
 // unsupported password-login or admin route, proving ProvisionAgent does not retain either path.
 type fakeMASServer struct {
@@ -72,6 +83,7 @@ type fakeMASServer struct {
 	users            map[string]string
 	registeredClient bool
 	approved         bool
+	displayNameDone  bool
 	fallbackCalls    int
 	deviceID         string
 }
@@ -128,6 +140,10 @@ func (f *fakeMASServer) passwordPost(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/register/steps/a/finish", http.StatusSeeOther)
 }
 func (f *fakeMASServer) finishGet(w http.ResponseWriter, r *http.Request) {
+	if f.displayNameDone {
+		http.Redirect(w, r, "/welcome", http.StatusSeeOther)
+		return
+	}
 	http.Redirect(w, r, "/register/steps/a/display-name", http.StatusSeeOther)
 }
 func (f *fakeMASServer) displayNameGet(w http.ResponseWriter, _ *http.Request) { f.form(w) }
@@ -137,7 +153,8 @@ func (f *fakeMASServer) displayNamePost(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: "mas_session", Value: "registered", Path: "/"})
-	http.Redirect(w, r, "/done", http.StatusSeeOther)
+	f.displayNameDone = true
+	http.Redirect(w, r, "/register/steps/a/finish", http.StatusSeeOther)
 }
 func (f *fakeMASServer) clientRegister(w http.ResponseWriter, r *http.Request) {
 	var metadata map[string]any
@@ -193,7 +210,7 @@ func (f *fakeMASServer) devicePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.approved = true
-	http.Redirect(w, r, "/done", http.StatusSeeOther)
+	http.Redirect(w, r, "/device/complete", http.StatusSeeOther)
 }
 func (f *fakeMASServer) tokenPost(w http.ResponseWriter, r *http.Request) {
 	if !f.approved || r.FormValue("grant_type") != "urn:ietf:params:oauth:grant-type:device_code" || r.FormValue("device_code") != "device-code" || r.FormValue("client_id") != "dynamic-client" || r.FormValue("client_secret") != "" {
@@ -250,8 +267,19 @@ func TestProvisionAgent_FullPublicRegistrationAndDeviceOAuth(t *testing.T) {
 }
 
 func TestProvisionerValidatesBackendHostAndServerName(t *testing.T) {
-	if _, err := NewProvisioner(&fakeMASReg{}, "not a URL", "telecrypt.io"); err == nil {
-		t.Fatal("accepted invalid backend URL")
+	for _, raw := range []string{
+		"not a URL",
+		"https://backend.example/path",
+		"https://backend.example/%2F",
+		"https://backend.example/?client=secret",
+		"https://user:password@backend.example",
+		"http://backend.example",
+	} {
+		if _, err := NewProvisioner(&fakeMASReg{}, raw, "telecrypt.io"); err == nil {
+			t.Fatalf("accepted unsafe backend URL %q", raw)
+		} else if strings.Contains(err.Error(), "password") || strings.Contains(err.Error(), "secret") {
+			t.Fatalf("backend URL error exposed URL contents: %v", err)
+		}
 	}
 	if _, err := NewProvisioner(&fakeMASReg{}, "https://backend.example", ""); err == nil {
 		t.Fatal("accepted missing server name")
@@ -259,10 +287,17 @@ func TestProvisionerValidatesBackendHostAndServerName(t *testing.T) {
 	if _, err := NewProvisioner(&fakeMASReg{}, "http://127.0.0.1:9009", "telecrypt.io"); err != nil {
 		t.Fatalf("valid loopback backend URL: %v", err)
 	}
+	if _, err := NewProvisioner(&fakeMASReg{}, "http://[::1]:9009", "telecrypt.io"); err != nil {
+		t.Fatalf("valid IPv6 loopback backend URL: %v", err)
+	}
+	if _, err := NewProvisioner(&fakeMASReg{}, "https://backend.example:8448", "telecrypt.io"); err != nil {
+		t.Fatalf("valid explicit-port backend URL: %v", err)
+	}
 }
 
 func TestFullFlowRejectsOAuthFailure(t *testing.T) {
 	// A device authorization failure is fatal; there is no password-login fallback.
+	displayNameDone := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/register" {
 			http.Redirect(w, r, "/register/password", http.StatusSeeOther)
@@ -274,7 +309,15 @@ func TestFullFlowRejectsOAuthFailure(t *testing.T) {
 			return
 		}
 		if r.URL.Path == "/register/password" {
-			http.Redirect(w, r, "/register/steps/a/display-name", http.StatusSeeOther)
+			http.Redirect(w, r, "/register/steps/a/finish", http.StatusSeeOther)
+			return
+		}
+		if strings.Contains(r.URL.Path, "/finish") {
+			if displayNameDone {
+				http.Redirect(w, r, "/welcome", http.StatusSeeOther)
+			} else {
+				http.Redirect(w, r, "/register/steps/a/display-name", http.StatusSeeOther)
+			}
 			return
 		}
 		if strings.Contains(r.URL.Path, "display-name") && r.Method == http.MethodGet {
@@ -284,7 +327,8 @@ func TestFullFlowRejectsOAuthFailure(t *testing.T) {
 		}
 		if strings.Contains(r.URL.Path, "display-name") {
 			http.SetCookie(w, &http.Cookie{Name: "mas_session", Value: "registered", Path: "/"})
-			http.Redirect(w, r, "/done", http.StatusSeeOther)
+			displayNameDone = true
+			http.Redirect(w, r, "/register/steps/a/finish", http.StatusSeeOther)
 			return
 		}
 		if r.URL.Path == "/oauth2/registration" {

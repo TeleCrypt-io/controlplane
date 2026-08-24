@@ -1,24 +1,26 @@
-"""Unit tests for tier_controller using a fake module_api — no live Synapse required.
-
-From the repository root, run these commands in an isolated environment::
-
-    python3 -m venv /tmp/tier-controller-venv
-    /tmp/tier-controller-venv/bin/python -m pip install --disable-pip-version-check \
-        matrix-synapse==1.159.0 pytest==9.0.2 pytest-asyncio==1.4.0
-    PYTHONPATH=synapse/tier_controller /tmp/tier-controller-venv/bin/python -m pytest -q \
-        synapse/tier_controller/test_tier_controller.py
-
-GitHub Actions alone builds and verifies release wheels; local testing runs directly from this
-source tree.
-"""
+"""Unit tests for the installed tier_controller wheel against the exact Synapse runtime."""
+import asyncio
+import pathlib
+import site
+import sys
 from types import SimpleNamespace
 
-import pytest
+# Running this file from the source checkout would otherwise put the source package ahead of the
+# wheel under test. CI mounts this file separately and installs the wheel into site-packages.
+source_dir = pathlib.Path(__file__).resolve().parent
+sys.path[:] = [entry for entry in sys.path if pathlib.Path(entry or ".").resolve() != source_dir]
 
 from synapse.api.errors import Codes
 from synapse.module_api import NOT_SPAM
+from synapse.module_api.errors import ConfigError
 
+import tier_controller
 from tier_controller import TierController, TierControllerConfig, _DENIAL_MESSAGE
+
+module_path = pathlib.Path(tier_controller.__file__).resolve()
+site_packages = {pathlib.Path(path).resolve() for path in site.getsitepackages()}
+if not any(root in module_path.parents for root in site_packages):
+    raise RuntimeError(f"tier_controller imported outside site-packages: {module_path}")
 
 
 class FakeModuleApi:
@@ -84,35 +86,48 @@ def make_module(user_types=None, room_counts=None, db_error=False, restricted_ro
     return module, api
 
 
+def test_parse_config_rejects_negative_room_cap():
+    try:
+        TierController.parse_config({"restricted_room_cap": -1})
+    except ConfigError as exc:
+        assert "must not be negative" in str(exc)
+    else:
+        raise AssertionError("negative restricted_room_cap unexpectedly accepted")
+
+
+def test_parse_config_accepts_zero_room_cap():
+    assert TierController.parse_config({"restricted_room_cap": 0}).restricted_room_cap == 0
+
+
+def test_controller_does_not_retain_unused_module_api():
+    module, _ = make_module()
+    assert not hasattr(module, "api")
+
+
 def make_event(event_type, sender, is_state=True):
     return SimpleNamespace(type=event_type, sender=sender, is_state=lambda: is_state)
 
 
-@pytest.mark.asyncio
 async def test_unverified_denied_upload():
     module, _ = make_module(user_types={"@a:x": "unverified"})
     assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
 
 
-@pytest.mark.asyncio
 async def test_verified_allowed_upload():
     module, _ = make_module(user_types={"@a:x": "verified"})
     assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is True
 
 
-@pytest.mark.asyncio
 async def test_null_type_denied_upload():
     module, _ = make_module(user_types={"@a:x": None})
     assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
 
 
-@pytest.mark.asyncio
 async def test_unknown_legacy_type_denied_upload():
     module, _ = make_module(user_types={"@a:x": "paid_agent"})
     assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
 
 
-@pytest.mark.asyncio
 async def test_restricted_room_cap_denied_at_cap():
     module, _ = make_module(
         user_types={"@a:x": "unverified"}, room_counts={"@a:x": 3}, restricted_room_cap=3
@@ -123,7 +138,6 @@ async def test_restricted_room_cap_denied_at_cap():
     )
 
 
-@pytest.mark.asyncio
 async def test_restricted_room_cap_allowed_under_cap():
     module, _ = make_module(
         user_types={"@a:x": "unverified"}, room_counts={"@a:x": 2}, restricted_room_cap=3
@@ -131,7 +145,6 @@ async def test_restricted_room_cap_allowed_under_cap():
     assert await module.user_may_create_room("@a:x", {}) is NOT_SPAM
 
 
-@pytest.mark.asyncio
 async def test_unverified_encrypted_initial_state_denied_before_room_creation():
     module, _ = make_module(
         user_types={"@a:x": "unverified"}, room_counts={"@a:x": 0}, restricted_room_cap=3
@@ -152,7 +165,6 @@ async def test_unverified_encrypted_initial_state_denied_before_room_creation():
     )
 
 
-@pytest.mark.asyncio
 async def test_verified_encrypted_initial_state_allowed():
     module, _ = make_module(user_types={"@a:x": "verified"})
     room_config = {
@@ -167,13 +179,11 @@ async def test_verified_encrypted_initial_state_allowed():
     assert await module.user_may_create_room("@a:x", room_config) is NOT_SPAM
 
 
-@pytest.mark.asyncio
 async def test_verified_bypasses_room_cap():
     module, _ = make_module(user_types={"@a:x": "verified"}, room_counts={"@a:x": 999999})
     assert await module.user_may_create_room("@a:x", {}) is NOT_SPAM
 
 
-@pytest.mark.asyncio
 async def test_unverified_encryption_denied():
     module, _ = make_module(user_types={"@a:x": "unverified"})
     assert await module.check_event_for_spam(make_event("m.room.encryption", "@a:x")) == (
@@ -182,13 +192,11 @@ async def test_unverified_encryption_denied():
     )
 
 
-@pytest.mark.asyncio
 async def test_verified_encryption_allowed():
     module, _ = make_module(user_types={"@a:x": "verified"})
     assert await module.check_event_for_spam(make_event("m.room.encryption", "@a:x")) is NOT_SPAM
 
 
-@pytest.mark.asyncio
 async def test_null_type_encryption_denied():
     module, _ = make_module(user_types={"@a:x": None})
     assert await module.check_event_for_spam(make_event("m.room.encryption", "@a:x")) == (
@@ -197,13 +205,11 @@ async def test_null_type_encryption_denied():
     )
 
 
-@pytest.mark.asyncio
 async def test_non_encryption_event_ignored():
     module, _ = make_module(user_types={"@a:x": "unverified"})
     assert await module.check_event_for_spam(make_event("m.room.message", "@a:x")) is NOT_SPAM
 
 
-@pytest.mark.asyncio
 async def test_encryption_event_non_state_ignored():
     module, _ = make_module(user_types={"@a:x": "unverified"})
     assert await module.check_event_for_spam(
@@ -211,13 +217,11 @@ async def test_encryption_event_non_state_ignored():
     ) is NOT_SPAM
 
 
-@pytest.mark.asyncio
 async def test_db_error_fails_closed_on_upload():
     module, _ = make_module(user_types={"@a:x": "verified"}, db_error=True)
     assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
 
 
-@pytest.mark.asyncio
 async def test_db_error_fails_closed_on_room_create():
     module, _ = make_module(user_types={"@a:x": "verified"}, db_error=True)
     assert await module.user_may_create_room("@a:x", {}) == (
@@ -226,7 +230,6 @@ async def test_db_error_fails_closed_on_room_create():
     )
 
 
-@pytest.mark.asyncio
 async def test_user_type_grant_and_revocation_are_visible_immediately():
     module, api = make_module(user_types={"@a:x": None})
     assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
@@ -238,10 +241,23 @@ async def test_user_type_grant_and_revocation_are_visible_immediately():
     assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
 
 
-@pytest.mark.asyncio
 async def test_db_error_recovers_on_next_decision():
     module, api = make_module(user_types={"@a:x": "verified"}, db_error=True)
     assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
 
     api.db_error = False
     assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is True
+
+
+if __name__ == "__main__":
+    tests = [value for name, value in globals().items() if name.startswith("test_")]
+    failures = 0
+    for test in tests:
+        try:
+            asyncio.run(test())
+        except Exception as error:
+            failures += 1
+            print(f"{test.__name__}: {error}", file=sys.stderr)
+    if failures:
+        raise SystemExit(f"{failures} of {len(tests)} tests failed")
+    print(f"{len(tests)} tests passed")

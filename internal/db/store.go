@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -15,135 +17,253 @@ type Store struct{ pool *pgxpool.Pool }
 
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
-// BindBillingEnvironment verifies the guard written exclusively by private Cashier.
-func (s *Store) BindBillingEnvironment(ctx context.Context, billingEnv, serverName string) error {
-	var boundEnv, boundServerName string
-	err := s.pool.QueryRow(ctx, `SELECT billing_env, server_name FROM cashier.billing_environment_guard WHERE singleton = TRUE`).Scan(&boundEnv, &boundServerName)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("private cashier has not bound the billing environment")
+const (
+	maxDeploymentIdentityRows = 1
+)
+
+// ValidateDeploymentProfile is the one exact profile table shared by Plan, Janitor, and
+// deployment-time checks. Billing mode is explicit and never inferred from credentials or a
+// hostname alone.
+func ValidateDeploymentProfile(serverName, billingEnvironment string) error {
+	switch {
+	case serverName == "telecrypt.io" && (billingEnvironment == "test" || billingEnvironment == "live"):
+		return nil
+	case serverName == "stage.telecrypt.io" && billingEnvironment == "test":
+		return nil
+	default:
+		return fmt.Errorf("invalid SERVER_NAME/BILLING_ENVIRONMENT profile")
 	}
+}
+
+// VerifyDeploymentIdentity re-reads Cashier's owner-rights identity view. Janitor deliberately
+// has no access to Cashier base tables, including deployment_identity.
+func (s *Store) VerifyDeploymentIdentity(ctx context.Context, serverName, billingEnvironment string) error {
+	if err := ValidateDeploymentProfile(serverName, billingEnvironment); err != nil {
+		return err
+	}
+	rows, err := s.pool.Query(ctx, `SELECT server_name, billing_environment FROM cashier.janitor_deployment_identity LIMIT $1`, maxDeploymentIdentityRows+1)
 	if err != nil {
-		return fmt.Errorf("read private cashier billing environment binding: %w", err)
+		return fmt.Errorf("read private Cashier deployment identity: %w", err)
 	}
-	if boundEnv != billingEnv || boundServerName != serverName {
-		return fmt.Errorf("billing database is bound to environment %q and server %q, not %q and %q", boundEnv, boundServerName, billingEnv, serverName)
+	defer rows.Close()
+	var rowCount int
+	var boundServerName, boundBillingEnvironment string
+	for rows.Next() {
+		rowCount++
+		if err := rows.Scan(&boundServerName, &boundBillingEnvironment); err != nil {
+			return fmt.Errorf("scan private Cashier deployment identity: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate private Cashier deployment identity: %w", err)
+	}
+	if rowCount == 0 {
+		return fmt.Errorf("private Cashier has not bound the deployment identity")
+	}
+	if rowCount != 1 {
+		return fmt.Errorf("Cashier deployment identity view must contain exactly one row")
+	}
+	if boundServerName != serverName || boundBillingEnvironment != billingEnvironment {
+		return fmt.Errorf("Cashier deployment identity is bound to server %q and billing environment %q, not %q and %q", boundServerName, boundBillingEnvironment, serverName, billingEnvironment)
 	}
 	return nil
 }
 
-// VerifiedMXIDs returns Cashier-owned billing grants without allowing Janitor to modify them.
-func (s *Store) VerifiedMXIDs(ctx context.Context) (map[string]bool, error) {
-	rows, err := s.pool.Query(ctx, `SELECT mxid FROM cashier.billing_verification_grants`)
+// LockExclusions returns the authoritative paid-entitlement projection exposed by Cashier. The
+// view has exactly one column; no Janitor code reconstructs subscription, team, or seat state.
+func (s *Store) LockExclusions(ctx context.Context) (map[string]struct{}, error) {
+	rows, err := s.pool.Query(ctx, `SELECT mxid FROM cashier.janitor_lock_exclusions`)
 	if err != nil {
-		return nil, fmt.Errorf("query Cashier billing grants: %w", err)
+		return nil, fmt.Errorf("query Cashier lock-exclusion view: %w", err)
 	}
 	defer rows.Close()
-	set := make(map[string]bool)
+	exclusions := make(map[string]struct{})
 	for rows.Next() {
 		var mxid string
 		if err := rows.Scan(&mxid); err != nil {
-			return nil, fmt.Errorf("scan Cashier billing grant: %w", err)
+			return nil, fmt.Errorf("scan Cashier lock-exclusion view: %w", err)
 		}
-		set[mxid] = true
+		if mxid == "" || len(mxid) > 255 || strings.ContainsAny(mxid, " \t\r\n") {
+			return nil, fmt.Errorf("Cashier lock-exclusion view returned an empty MXID")
+		}
+		if _, duplicate := exclusions[mxid]; duplicate {
+			return nil, fmt.Errorf("Cashier lock-exclusion view returned a duplicate MXID")
+		}
+		exclusions[mxid] = struct{}{}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate Cashier billing grants: %w", err)
+		return nil, fmt.Errorf("iterate Cashier lock-exclusion view: %w", err)
 	}
-	return set, nil
+	return exclusions, nil
 }
 
-func (s *Store) IsVerified(ctx context.Context, mxid string) (bool, error) {
-	var exists bool
-	err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM cashier.billing_verification_grants WHERE mxid = $1)`, mxid).Scan(&exists)
+// RunEvent is the bounded, append-only Janitor audit record. It deliberately contains no
+// account identifiers, email addresses, provider errors, tokens, or free-form text.
+type RunEvent struct {
+	EventID            uuid.UUID
+	RunID              uuid.UUID
+	EventKind          string
+	Status             string
+	Outcome            string
+	Reason             string
+	ServerName         string
+	BillingEnvironment string
+	DryRun             bool
+	Considered         int64
+	Skipped            int64
+	LockedOrWouldLock  int64
+	Failures           int64
+	NotificationStatus string
+	Labels             []string
+}
+
+var allowedRunEventLabels = map[string]struct{}{
+	"database": {}, "entitlement_view": {}, "mas_users": {}, "mas_emails": {},
+	"candidate_recheck": {}, "lock": {}, "lock_readback": {}, "notification": {},
+	"audit_started": {}, "audit_finished": {}, "cancelled": {},
+}
+
+func validateRunEvent(event RunEvent) error {
+	if event.EventID == uuid.Nil || event.RunID == uuid.Nil {
+		return fmt.Errorf("Janitor audit event IDs must be nonzero UUIDs")
+	}
+	if err := ValidateDeploymentProfile(event.ServerName, event.BillingEnvironment); err != nil {
+		return err
+	}
+	if (event.BillingEnvironment == "test") != event.DryRun {
+		return fmt.Errorf("Janitor audit dry-run flag does not match billing environment")
+	}
+	if event.Considered < 0 || event.Skipped < 0 || event.LockedOrWouldLock < 0 || event.Failures < 0 {
+		return fmt.Errorf("Janitor audit aggregates must be nonnegative")
+	}
+	if event.NotificationStatus != "not_attempted" && event.NotificationStatus != "succeeded" && event.NotificationStatus != "failed" {
+		return fmt.Errorf("invalid Janitor audit notification status")
+	}
+	if len(event.Labels) > 16 {
+		return fmt.Errorf("Janitor audit labels exceed sixteen entries")
+	}
+	seen := make(map[string]struct{}, len(event.Labels))
+	for _, label := range event.Labels {
+		if _, ok := allowedRunEventLabels[label]; !ok {
+			return fmt.Errorf("Janitor audit label is not allowlisted")
+		}
+		if _, duplicate := seen[label]; duplicate {
+			return fmt.Errorf("Janitor audit labels must be unique")
+		}
+		seen[label] = struct{}{}
+	}
+	if event.EventKind == "started" {
+		if event.Status != "started" || event.Outcome != "pending" || event.Reason != "pending" || event.NotificationStatus != "not_attempted" {
+			return fmt.Errorf("invalid Janitor started audit state")
+		}
+		if event.Considered != 0 || event.Skipped != 0 || event.LockedOrWouldLock != 0 || event.Failures != 0 {
+			return fmt.Errorf("started Janitor audit event must have zero aggregates")
+		}
+		return nil
+	}
+	if event.EventKind != "finished" {
+		return fmt.Errorf("invalid Janitor audit event kind")
+	}
+	if event.Status == "succeeded" {
+		if event.Outcome != "dry_run" && event.Outcome != "success" {
+			return fmt.Errorf("invalid Janitor success audit outcome")
+		}
+		if event.Reason != "would_disable" && event.Reason != "disabled" && event.Reason != "no_eligible_accounts" {
+			return fmt.Errorf("invalid Janitor success audit reason")
+		}
+		if event.Reason == "no_eligible_accounts" && event.LockedOrWouldLock != 0 {
+			return fmt.Errorf("no-eligible Janitor audit event has a lock count")
+		}
+		if event.Reason == "would_disable" && (event.Outcome != "dry_run" || event.LockedOrWouldLock == 0) {
+			return fmt.Errorf("would-disable Janitor audit event is inconsistent")
+		}
+		if event.Reason == "disabled" && (event.Outcome != "success" || event.LockedOrWouldLock == 0) {
+			return fmt.Errorf("disabled Janitor audit event is inconsistent")
+		}
+	} else if event.Status != "failed" || event.Outcome != "operational_failure" {
+		return fmt.Errorf("invalid Janitor finished audit state")
+	} else {
+		switch event.Reason {
+		case "database", "mas", "entitlement_view", "notification", "audit", "cancelled", "lock", "lock_readback":
+		default:
+			return fmt.Errorf("invalid Janitor failure audit reason")
+		}
+	}
+	return nil
+}
+
+func (s *Store) InsertRunEvent(ctx context.Context, event RunEvent) error {
+	if err := validateRunEvent(event); err != nil {
+		return err
+	}
+	labels := append([]string(nil), event.Labels...)
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO janitor.run_events
+		(event_id, run_id, event_kind, status, outcome, reason, server_name, billing_environment,
+		 dry_run, considered, skipped, locked_or_would_lock, failures, notification_status, labels)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+		event.EventID, event.RunID, event.EventKind, event.Status, event.Outcome, event.Reason,
+		event.ServerName, event.BillingEnvironment, event.DryRun, event.Considered, event.Skipped,
+		event.LockedOrWouldLock, event.Failures, event.NotificationStatus, labels)
 	if err != nil {
-		return false, fmt.Errorf("query Cashier billing grant %s: %w", mxid, err)
+		return fmt.Errorf("insert Janitor audit event: %w", err)
 	}
-	return exists, nil
+	return nil
 }
 
-func (s *Store) LockerHighWaterMark(ctx context.Context, key string) (time.Time, bool, error) {
-	var value time.Time
-	err := s.pool.QueryRow(ctx, `SELECT value FROM locker_state WHERE key = $1`, key).Scan(&value)
+// DigestCursor identifies the last email-attachment event included in a successfully delivered
+// digest. MAS's stable email-resource ID makes events sharing a timestamp unambiguous.
+type DigestCursor struct {
+	CreatedAt time.Time
+	EmailID   string
+}
+
+// Valid reports whether the cursor can be ordered without ambiguity against canonical MAS email
+// resource ULIDs.
+func (c DigestCursor) Valid() bool {
+	if c.CreatedAt.IsZero() || len(c.EmailID) != 26 || c.EmailID[0] > '7' {
+		return false
+	}
+	const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+	for _, r := range c.EmailID {
+		if !strings.ContainsRune(alphabet, r) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Store) JanitorDigestCursor(ctx context.Context) (DigestCursor, bool, error) {
+	var cursor DigestCursor
+	err := s.pool.QueryRow(ctx, `SELECT created_at, email_id FROM janitor.janitor_digest_cursor WHERE singleton = TRUE`).Scan(&cursor.CreatedAt, &cursor.EmailID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return time.Time{}, false, nil
+		return DigestCursor{}, false, nil
 	}
 	if err != nil {
-		return time.Time{}, false, fmt.Errorf("query locker_state %s: %w", key, err)
+		return DigestCursor{}, false, fmt.Errorf("query janitor_digest_cursor: %w", err)
 	}
-	return value, true, nil
+	return cursor, true, nil
 }
 
-func (s *Store) SetLockerHighWaterMark(ctx context.Context, key string, value time.Time) error {
-	_, err := s.pool.Exec(ctx, `INSERT INTO locker_state (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, key, value)
+func (s *Store) SetJanitorDigestCursor(ctx context.Context, cursor DigestCursor) error {
+	if !cursor.Valid() {
+		return fmt.Errorf("janitor_digest_cursor is invalid")
+	}
+	tag, err := s.pool.Exec(ctx, `
+		INSERT INTO janitor.janitor_digest_cursor AS current_cursor (singleton, created_at, email_id)
+		VALUES (TRUE, $1, $2)
+		ON CONFLICT (singleton) DO UPDATE
+		SET created_at = EXCLUDED.created_at, email_id = EXCLUDED.email_id
+		WHERE current_cursor.created_at < EXCLUDED.created_at
+		   OR (current_cursor.created_at = EXCLUDED.created_at
+		       AND current_cursor.email_id COLLATE pg_catalog."C"
+		           < EXCLUDED.email_id COLLATE pg_catalog."C")
+	`, cursor.CreatedAt, cursor.EmailID)
 	if err != nil {
-		return fmt.Errorf("upsert locker_state %s: %w", key, err)
+		return fmt.Errorf("upsert janitor_digest_cursor: %w", err)
 	}
-	return nil
-}
-
-const (
-	janitorLockKeyPrefix       = "janitor-lock:"
-	janitorLockIntentKeyPrefix = "janitor-lock-intent:"
-)
-
-func (s *Store) JanitorLockState(ctx context.Context) (confirmed, pending map[string]time.Time, err error) {
-	rows, err := s.pool.Query(ctx, `
-        SELECT 'confirmed', substr(key, length($1) + 1), value FROM locker_state WHERE key LIKE $1 || '%'
-        UNION ALL
-        SELECT 'pending', substr(key, length($2) + 1), value FROM locker_state WHERE key LIKE $2 || '%'`, janitorLockKeyPrefix, janitorLockIntentKeyPrefix)
-	if err != nil {
-		return nil, nil, fmt.Errorf("query janitor lock state: %w", err)
-	}
-	defer rows.Close()
-	confirmed, pending = make(map[string]time.Time), make(map[string]time.Time)
-	for rows.Next() {
-		var kind, userID string
-		var at time.Time
-		if err := rows.Scan(&kind, &userID, &at); err != nil {
-			return nil, nil, fmt.Errorf("scan janitor lock state: %w", err)
-		}
-		if kind == "confirmed" {
-			confirmed[userID] = at
-		} else {
-			pending[userID] = at
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("iterate janitor lock state: %w", err)
-	}
-	return confirmed, pending, nil
-}
-
-func (s *Store) BeginJanitorLock(ctx context.Context, userID string) (time.Time, error) {
-	beganAt := time.Now().UTC()
-	if err := s.SetLockerHighWaterMark(ctx, janitorLockIntentKeyPrefix+userID, beganAt); err != nil {
-		return time.Time{}, err
-	}
-	return beganAt, nil
-}
-
-func (s *Store) ConfirmJanitorLock(ctx context.Context, userID string, lockedAt time.Time) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin janitor lock confirmation %s: %w", userID, err)
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `INSERT INTO locker_state (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, janitorLockKeyPrefix+userID, lockedAt); err != nil {
-		return fmt.Errorf("record confirmed janitor lock %s: %w", userID, err)
-	}
-	if _, err := tx.Exec(ctx, `DELETE FROM locker_state WHERE key = $1`, janitorLockIntentKeyPrefix+userID); err != nil {
-		return fmt.Errorf("clear janitor lock intent %s: %w", userID, err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit janitor lock confirmation %s: %w", userID, err)
-	}
-	return nil
-}
-
-func (s *Store) DeleteJanitorLock(ctx context.Context, userID string) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM locker_state WHERE key = $1 OR key = $2`, janitorLockKeyPrefix+userID, janitorLockIntentKeyPrefix+userID)
-	if err != nil {
-		return fmt.Errorf("delete janitor lock state %s: %w", userID, err)
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("janitor_digest_cursor refused a non-advancing cursor")
 	}
 	return nil
 }

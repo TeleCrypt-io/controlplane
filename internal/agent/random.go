@@ -17,7 +17,7 @@ func randomLocalpart() (string, error) {
 }
 
 // randomPassword returns a high-entropy password. It is used for MAS's public registration form
-// and returned only once to the immediate Redpill caller; it is never stored or logged.
+// and returned only once to the immediate Registration caller; it is never stored or logged.
 func randomPassword() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
