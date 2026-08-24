@@ -305,11 +305,11 @@ func loadServerIdentity() (string, backendEndpoints, error) {
 	return serverName, endpoints, nil
 }
 
-// loadBillingIdentity is used only by Plan and Janitor. Registration and other public
-// topology-only consumers may accept a syntactically valid future hostname, but these two
-// services hold billing-sensitive behavior and therefore require one of the three frozen
-// server/billing profiles. The nonsecret billing value is never inferred from credentials or
-// hostname.
+// loadBillingIdentity is used only by Plan and Janitor. Registration is topology-only and may
+// derive a public endpoint before a billing profile exists, but these two services hold
+// billing-sensitive behavior and therefore require exactly one of the three frozen
+// server/billing profiles: telecrypt.io/test, stage.telecrypt.io/test, or telecrypt.io/live. The
+// nonsecret billing value is never inferred from credentials or hostname.
 func loadBillingIdentity() (string, string, backendEndpoints, error) {
 	serverName, endpoints, err := loadServerIdentity()
 	if err != nil {
@@ -376,15 +376,11 @@ func validateDerivedServerLabel(label string) error {
 	return nil
 }
 
-type serverTopology struct {
-	production      bool
-	label           string
-	normalizedLabel string
-}
+type serverTopology struct{}
 
 func parseServerTopology(serverName string) (serverTopology, error) {
 	if serverName == "telecrypt.io" {
-		return serverTopology{production: true}, nil
+		return serverTopology{}, nil
 	}
 	const suffix = ".telecrypt.io"
 	if !strings.HasSuffix(serverName, suffix) {
@@ -394,7 +390,7 @@ func parseServerTopology(serverName string) (serverTopology, error) {
 	if err := validateDerivedServerLabel(label); err != nil {
 		return serverTopology{}, err
 	}
-	return serverTopology{label: label, normalizedLabel: strings.ReplaceAll(label, "-", "_")}, nil
+	return serverTopology{}, nil
 }
 
 func requireNonEmptyNoSurroundingWhitespace(name, value string) error {
@@ -444,25 +440,25 @@ func validateJanitorDBURL(raw, serverName string) error {
 }
 
 func expectedJanitorDatabaseIdentity(serverName string) (string, string, error) {
-	topology, err := parseServerTopology(serverName)
-	if err != nil {
-		return "", "", err
-	}
-	if topology.production {
+	switch serverName {
+	case "telecrypt.io":
 		return "telecrypt_billing", "telecrypt_janitor_user", nil
+	case "stage.telecrypt.io":
+		return "telecrypt_billing_stage", "telecrypt_janitor_stage_user", nil
+	default:
+		return "", "", fmt.Errorf("SERVER_NAME must be telecrypt.io or stage.telecrypt.io for Janitor")
 	}
-	return "telecrypt_billing_" + topology.normalizedLabel, "telecrypt_janitor_" + topology.normalizedLabel + "_user", nil
 }
 
 func expectedCashierDatabaseRole(serverName string) (string, error) {
-	topology, err := parseServerTopology(serverName)
-	if err != nil {
-		return "", err
-	}
-	if topology.production {
+	switch serverName {
+	case "telecrypt.io":
 		return "telecrypt_cashier_user", nil
+	case "stage.telecrypt.io":
+		return "telecrypt_cashier_stage_user", nil
+	default:
+		return "", fmt.Errorf("SERVER_NAME must be telecrypt.io or stage.telecrypt.io for Janitor")
 	}
-	return "telecrypt_cashier_" + topology.normalizedLabel + "_user", nil
 }
 
 func validatePublicHTTPSURL(raw, name string) error {

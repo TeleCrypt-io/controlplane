@@ -59,22 +59,35 @@ validation, and the plan UI. It has no Dodo, Synapse-admin, or Postgres credenti
 signed to the private Cashier service, which alone handles checkout, payment webhooks, entitlement
 mutation, and Dodo customer portal links.
 
-One-label preproduction configurations visibly render `TEST / SANDBOX — no real charges` on every Plan page. Payment card data is entered only on the Dodo-hosted checkout or customer-portal page, never at TeleCrypt.
+The two test profiles, `telecrypt.io` with `BILLING_ENVIRONMENT=test` during the temporary
+pre-launch acceptance and `stage.telecrypt.io` with `BILLING_ENVIRONMENT=test` after the owner
+creates the isolated stage environment, visibly render `TEST / SANDBOX — no real charges` on every
+Plan page. The later `telecrypt.io` with `BILLING_ENVIRONMENT=live` profile never renders that
+banner. Payment card data is entered only on the Dodo-hosted checkout or customer-portal page,
+never at TeleCrypt.
 
-`SERVER_NAME` is the sole public-host topology input for Registration, Plan, and Janitor. The exact production name `telecrypt.io`
-selects `https://backend.telecrypt.io`; one-label preproduction names such as
-`stage.telecrypt.io` select `https://backend.stage.telecrypt.io`. Other hostname shapes are
-rejected. The public MAS, Registration, and Plan URLs are derived as `/auth`, `/agents`, and
-`/plan` on that backend origin. The exact `telecrypt.io` identity is production; every one-label
-preproduction name is an isolated test deployment. Registration, Plan, and Janitor all derive their
-environment identity from `SERVER_NAME` alone.
+Plan and Janitor accept exactly these three frozen profiles:
+
+| `SERVER_NAME` | `BILLING_ENVIRONMENT` | Use |
+| --- | --- | --- |
+| `telecrypt.io` | `test` | Temporary v1 acceptance on the production public surface |
+| `stage.telecrypt.io` | `test` | Later isolated test environment |
+| `telecrypt.io` | `live` | Final launched production |
+
+`SERVER_NAME` owns public, Matrix, and database topology. `BILLING_ENVIRONMENT` is an explicit
+nonsecret input for Plan and Janitor and selects test/live behavior; neither value is inferred from
+credentials or the other field. Every other server-name, billing-environment, or pair is rejected.
+The public MAS, Registration, and Plan URLs are derived as `/auth`, `/agents`, and `/plan` on the
+backend origin: `https://backend.telecrypt.io` for the production public surface and
+`https://backend.stage.telecrypt.io` for the later stage profile. Registration is topology-only;
+Plan and Janitor perform the exact frozen-profile check before billing-sensitive behavior.
 
 Janitor runs one single-flight sweep per invocation and reads Cashier-owned billing grants through
 `JANITOR_DB_URL`, using a separate database credential from Cashier's `CASHIER_DB_URL`. The
-URL must use the exact environment database and Janitor role: production uses
-`telecrypt_billing` with `telecrypt_janitor_user`, while `<label>.telecrypt.io` uses
-`telecrypt_billing_<label>` with `telecrypt_janitor_<label>_user` (hyphens in a label become
-underscores in database identifiers). The Janitor role is owner-precreated for the private
+URL must use the exact profile database and Janitor role: `telecrypt.io` uses
+`telecrypt_billing` with `telecrypt_janitor_user`, while `stage.telecrypt.io` uses
+`telecrypt_billing_stage` with `telecrypt_janitor_stage_user`. No other host label is an active
+billing profile. The Janitor role is owner-precreated for the private
 `janitor` schema, is read-only on Cashier's private `cashier` schema, and has schema-owner DDL
 authority (including CREATE, ALTER, and DROP) only within that private `janitor` schema so the
 one-shot can apply its exact migration. The application writes only its own
@@ -82,9 +95,10 @@ one-shot can apply its exact migration. The application writes only its own
 the Janitor schema. Cashier's billing migration history remains private to the Cashier repository.
 Cashier grants it usage of `cashier` and read access to only the
 deployment-identity and verification-grant tables.
-The private schema and both read-side tables must remain owned by the exact environment Cashier
-role (`telecrypt_cashier_user` in production or `telecrypt_cashier_<label>_user` in preproduction);
-Cashier durably binds both `SERVER_NAME` and its derived billing environment (`live` or `test`) in
+The private schema and both read-side tables must remain owned by the exact profile Cashier role
+(`telecrypt_cashier_user` for `telecrypt.io` or `telecrypt_cashier_stage_user` for
+`stage.telecrypt.io`);
+Cashier durably binds both `SERVER_NAME` and the explicit billing environment (`live` or `test`) in
 that identity row. Janitor rejects any server or billing-environment drift before it can sweep.
 
 These migrations intentionally accept only the final schema and exact migration digests. An older
@@ -131,8 +145,9 @@ MASREG_INTEGRATION_MATRIX_ORIGIN=http://127.0.0.1:8008 \
 go test -tags=integration ./internal/masreg -run '^TestRegisterAndAuthorizeDeviceDisposableMAS$' -count=1
 ```
 
-Never point these variables at production or a shared test environment. The generated account,
-client, device, password, and tokens are disposable test data and must not be retained.
+Never point these variables at `telecrypt.io`, `stage.telecrypt.io`, or a shared test environment.
+The generated account, client, device, password, and tokens are disposable test data and must not
+be retained.
 
 ## License
 

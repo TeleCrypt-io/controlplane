@@ -180,7 +180,7 @@ func TestSweepRequiredAuditWriteFailureIsNonSuccess(t *testing.T) {
 	}
 }
 
-func TestSweepRejectsHostnameOnlyOrDryRunProfileMismatch(t *testing.T) {
+func TestSweepRejectsUnsupportedOrMismatchedProfile(t *testing.T) {
 	for _, cfg := range []Config{{ServerName: "preview.telecrypt.io", BillingEnvironment: "test", DryRun: true}, {ServerName: testServerName, BillingEnvironment: "live", DryRun: true}} {
 		store := &fakeStore{}
 		if err := NewSweeper(&fakeMAS{}, store, &fakeMailer{}, cfg).Sweep(context.Background()); err == nil {

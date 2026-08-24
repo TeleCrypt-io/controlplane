@@ -191,38 +191,36 @@ func TestLoadPlanRejectsInvalidPrivateKeyMaterial(t *testing.T) {
 	}
 }
 
-func TestServerIdentityRequiresExactServerNameShape(t *testing.T) {
+func TestServerIdentityDerivesFrozenPublicHostnames(t *testing.T) {
 	tests := []struct {
-		name        string
-		serverName  string
-		wantMessage string
+		name       string
+		serverName string
+		valid      bool
+		wantOrigin string
 	}{
-		{"production", "telecrypt.io", ""},
-		{"preproduction", "preview-1.telecrypt.io", ""},
-		{"nested hostname", "foo.preview.telecrypt.io", "SERVER_NAME"},
-		{"wrong suffix", "preview.example.com", "SERVER_NAME"},
-		{"uppercase label", "Preview.telecrypt.io", "SERVER_NAME"},
+		{"production", "telecrypt.io", true, "https://backend.telecrypt.io"},
+		{"stage", "stage.telecrypt.io", true, "https://backend.stage.telecrypt.io"},
+		{"nested hostname", "foo.stage.telecrypt.io", false, "SERVER_NAME"},
+		{"wrong suffix", "stage.example.com", false, "SERVER_NAME"},
+		{"uppercase label", "Stage.telecrypt.io", false, "SERVER_NAME"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			endpoints, err := deriveBackendEndpoints(tt.serverName)
-			if tt.wantMessage == "" {
+			if tt.valid {
 				if err != nil {
 					t.Fatalf("deriveBackendEndpoints: %v", err)
 				}
-				if tt.serverName == "telecrypt.io" && endpoints.origin != "https://backend.telecrypt.io" {
-					t.Fatalf("production backend = %q", endpoints.origin)
-				}
-				if tt.serverName != "telecrypt.io" && endpoints.origin != "https://backend.preview-1.telecrypt.io" {
-					t.Fatalf("preproduction backend = %q", endpoints.origin)
+				if endpoints.origin != tt.wantOrigin {
+					t.Fatalf("backend = %q, want %q", endpoints.origin, tt.wantOrigin)
 				}
 				if endpoints.mas != endpoints.origin+"/auth" || endpoints.plan != endpoints.origin+"/plan" {
 					t.Fatalf("derived endpoints = %#v", endpoints)
 				}
 				return
 			}
-			if err == nil || !strings.Contains(err.Error(), tt.wantMessage) {
-				t.Fatalf("error = %v, want %q", err, tt.wantMessage)
+			if err == nil || !strings.Contains(err.Error(), tt.wantOrigin) {
+				t.Fatalf("error = %v, want %q", err, tt.wantOrigin)
 			}
 		})
 	}
@@ -384,29 +382,10 @@ func TestLoadJanitorRejectsInvalidSMTPFrom(t *testing.T) {
 	}
 }
 
-func TestLoadJanitorNormalizesPreproductionDatabaseLabel(t *testing.T) {
+func TestLoadJanitorRejectsUnsupportedServerProfile(t *testing.T) {
 	setRequiredJanitorEnv(t)
-	t.Setenv("SERVER_NAME", "preview-1.telecrypt.io")
+	t.Setenv("SERVER_NAME", "preview.telecrypt.io")
 	t.Setenv("BILLING_ENVIRONMENT", "test")
-	t.Setenv("JANITOR_DB_URL", "postgres://telecrypt_janitor_preview_1_user:secret@db/telecrypt_billing_preview_1")
-	if _, err := LoadJanitor(); err == nil {
-		t.Fatal("LoadJanitor accepted an unsupported billing profile")
-	}
-}
-
-func TestLoadJanitorRejectsLabelsTooLongForDerivedIdentifiers(t *testing.T) {
-	setRequiredJanitorEnv(t)
-	t.Setenv("SERVER_NAME", strings.Repeat("a", 41)+".telecrypt.io")
-	if _, err := LoadJanitor(); err == nil || !strings.Contains(err.Error(), "at most 40 bytes") {
-		t.Fatalf("LoadJanitor error = %v, want label-length error", err)
-	}
-}
-
-func TestLoadJanitorAcceptsTightestDerivedLabelBoundary(t *testing.T) {
-	setRequiredJanitorEnv(t)
-	label := strings.Repeat("a", 40)
-	t.Setenv("SERVER_NAME", label+".telecrypt.io")
-	t.Setenv("JANITOR_DB_URL", "postgres://telecrypt_janitor_"+label+"_user:secret@db/telecrypt_billing_"+label)
 	if _, err := LoadJanitor(); err == nil {
 		t.Fatal("LoadJanitor accepted an unsupported billing profile")
 	}
