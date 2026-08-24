@@ -49,6 +49,8 @@ jobs:
           grep -Fq -- '--draft' .github/workflows/build.yml
           grep -Fq 'gh release edit' .github/workflows/build.yml
           grep -Fq 'bounded_capture_deadline' .github/workflows/build.yml
+          grep -Fq 'name: controlplane-wheel-${{ github.run_id }}-${{ github.sha }}' .github/workflows/build.yml
+          grep -Fq 'overwrite: true' .github/workflows/build.yml
           if grep -Eq 'bounded_capture\(\)' .github/workflows/build.yml; then
             echo 'release workflow contains a duplicate capture implementation' >&2
             exit 1
@@ -115,13 +117,13 @@ jobs:
         run: scripts/check-release-source.sh
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: controlplane-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          name: controlplane-wheel-${{ github.run_id }}-${{ github.sha }}
           path: |
             dist/tier-controller/*.whl
             dist/tier-controller/*.whl.sha256
           if-no-files-found: error
           retention-days: 7
-          overwrite: false
+          overwrite: true
 
   release:
     if: startsWith(github.ref, 'refs/tags/')
@@ -163,7 +165,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
       - uses: actions/download-artifact@v8.0.1
         with:
-          name: controlplane-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          name: controlplane-wheel-${{ github.run_id }}-${{ github.sha }}
           path: dist/tier-controller
       - name: Require the exact tested wheel
         run: |
