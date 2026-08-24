@@ -1,9 +1,11 @@
 """Unit tests for the installed tier_controller wheel against the exact Synapse runtime."""
 import asyncio
+import inspect
 import pathlib
 import site
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 # Running this file from the source checkout would otherwise put the source package ahead of the
 # wheel under test. CI mounts this file separately and installs the wheel into site-packages.
@@ -15,7 +17,14 @@ from synapse.module_api import NOT_SPAM
 from synapse.module_api.errors import ConfigError
 
 import tier_controller
-from tier_controller import TierController, TierControllerConfig, _DENIAL_MESSAGE
+from tier_controller import (
+    MAX_MEDIA_BYTES,
+    MAX_USER_MEDIA_BYTES,
+    STAGING_FREE_RESERVE_BYTES,
+    TierController,
+    TierControllerConfig,
+    _DENIAL_MESSAGE,
+)
 
 module_path = pathlib.Path(tier_controller.__file__).resolve()
 site_packages = {pathlib.Path(path).resolve() for path in site.getsitepackages()}
@@ -26,10 +35,19 @@ if not any(root in module_path.parents for root in site_packages):
 class FakeModuleApi:
     """Duck-typed stand-in for synapse.module_api.ModuleApi."""
 
-    def __init__(self, user_types: dict, room_counts: dict, db_error: bool = False):
+    def __init__(
+        self,
+        user_types: dict,
+        room_counts: dict,
+        media_usage: dict,
+        db_error: bool = False,
+    ):
         self.user_types = user_types
         self.room_counts = room_counts
+        self.media_usage = media_usage
         self.db_error = db_error
+        self.db_calls = []
+        self.queries = []
         self.registered_media = {}
         self.registered_spam = {}
 
@@ -40,12 +58,15 @@ class FakeModuleApi:
         self.registered_spam.update(callbacks)
 
     async def run_db_interaction(self, desc, func):
+        self.db_calls.append(desc)
         if self.db_error:
             raise RuntimeError("simulated db failure")
         if desc == "tier_controller_get_user_type":
             return _run_user_type(self, func)
         if desc == "tier_controller_count_created_rooms":
             return _run_room_count(self, func)
+        if desc == "tier_controller_get_upload_snapshot":
+            return _run_upload_snapshot(self, func)
         raise AssertionError(f"unexpected desc {desc}")
 
 
@@ -56,6 +77,7 @@ def _run_user_type(api, func):
 
         def execute(self, sql, args):
             self.user_id = args[0]
+            api.queries.append((sql, args))
 
         def fetchone(self):
             val = self.table.get(self.user_id, "__missing__")
@@ -73,6 +95,7 @@ def _run_room_count(api, func):
 
         def execute(self, sql, args):
             self.user_id = args[0]
+            api.queries.append((sql, args))
 
         def fetchone(self):
             return (self.table.get(self.user_id, 0),)
@@ -80,10 +103,56 @@ def _run_room_count(api, func):
     return func(RecordingCursor(api.room_counts))
 
 
-def make_module(user_types=None, room_counts=None, db_error=False, restricted_room_cap=3):
-    api = FakeModuleApi(user_types or {}, room_counts or {}, db_error=db_error)
-    module = TierController(TierControllerConfig(restricted_room_cap), api)
+def _run_upload_snapshot(api, func):
+    class RecordingCursor:
+        def __init__(self):
+            self.user_id = None
+            self.query = ""
+
+        def execute(self, sql, args):
+            self.query = sql
+            self.user_id = args[0]
+            api.queries.append((sql, args))
+
+        def fetchone(self):
+            if "SELECT user_type" in self.query:
+                val = api.user_types.get(self.user_id, "__missing__")
+                return None if val == "__missing__" else (val,)
+            return (api.media_usage.get(self.user_id, 0),)
+
+    return func(RecordingCursor())
+
+
+def make_module(
+    user_types=None,
+    room_counts=None,
+    media_usage=None,
+    db_error=False,
+    restricted_room_cap=3,
+    media_store_path="/staging/media",
+):
+    api = FakeModuleApi(
+        user_types or {}, room_counts or {}, media_usage or {}, db_error=db_error
+    )
+    module = TierController(
+        TierControllerConfig(restricted_room_cap, media_store_path), api
+    )
     return module, api
+
+
+def _statvfs_for_free_bytes(free_bytes):
+    return SimpleNamespace(f_bavail=free_bytes, f_frsize=1)
+
+
+async def upload_decision(module, user_id, size, free_bytes=None):
+    if free_bytes is None:
+        free_bytes = STAGING_FREE_RESERVE_BYTES + MAX_MEDIA_BYTES
+    with patch.object(
+        tier_controller.os,
+        "statvfs",
+        return_value=_statvfs_for_free_bytes(free_bytes),
+    ):
+        return await module.is_user_allowed_to_upload_media_of_size(user_id, size)
 
 
 def test_parse_config_rejects_negative_room_cap():
@@ -99,6 +168,26 @@ def test_parse_config_accepts_zero_room_cap():
     assert TierController.parse_config({"restricted_room_cap": 0}).restricted_room_cap == 0
 
 
+def test_upload_limits_are_explicit():
+    assert MAX_MEDIA_BYTES == 128 * 1024 * 1024
+    assert MAX_USER_MEDIA_BYTES == 50 * 1024 * 1024 * 1024
+    assert STAGING_FREE_RESERVE_BYTES == 10 * 1024 * 1024 * 1024
+
+
+def test_parse_config_validates_media_store_path():
+    assert (
+        TierController.parse_config({"media_store_path": "/staging/media"}).media_store_path
+        == "/staging/media"
+    )
+    for value in (None, "", "relative/media", "\x00"):
+        try:
+            TierController.parse_config({"media_store_path": value})
+        except ConfigError:
+            pass
+        else:
+            raise AssertionError(f"invalid media_store_path unexpectedly accepted: {value!r}")
+
+
 def test_controller_does_not_retain_unused_module_api():
     module, _ = make_module()
     assert not hasattr(module, "api")
@@ -110,22 +199,96 @@ def make_event(event_type, sender, is_state=True):
 
 async def test_unverified_denied_upload():
     module, _ = make_module(user_types={"@a:x": "unverified"})
-    assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
+    assert await upload_decision(module, "@a:x", 100) is False
 
 
 async def test_verified_allowed_upload():
     module, _ = make_module(user_types={"@a:x": "verified"})
-    assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is True
+    assert await upload_decision(module, "@a:x", 100) is True
 
 
 async def test_null_type_denied_upload():
     module, _ = make_module(user_types={"@a:x": None})
-    assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
+    assert await upload_decision(module, "@a:x", 100) is False
 
 
 async def test_unknown_legacy_type_denied_upload():
     module, _ = make_module(user_types={"@a:x": "paid_agent"})
-    assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
+    assert await upload_decision(module, "@a:x", 100) is False
+
+
+async def test_upload_boundaries_and_staging_reserve():
+    module, _ = make_module(user_types={"@a:x": "verified"})
+    assert await upload_decision(module, "@a:x", 0, STAGING_FREE_RESERVE_BYTES) is True
+    assert await upload_decision(
+        module, "@a:x", MAX_MEDIA_BYTES - 1
+    ) is True
+    assert await upload_decision(module, "@a:x", MAX_MEDIA_BYTES) is True
+    assert await upload_decision(module, "@a:x", MAX_MEDIA_BYTES + 1) is False
+    assert await upload_decision(
+        module, "@a:x", 100, STAGING_FREE_RESERVE_BYTES + 99
+    ) is False
+    assert await upload_decision(
+        module, "@a:x", 100, STAGING_FREE_RESERVE_BYTES + 100
+    ) is True
+
+
+async def test_upload_quota_boundaries():
+    module, _ = make_module(
+        user_types={"@a:x": "verified"},
+        media_usage={"@a:x": MAX_USER_MEDIA_BYTES - 1},
+    )
+    assert await upload_decision(module, "@a:x", 1) is True
+    assert await upload_decision(module, "@a:x", 2) is False
+
+    module, _ = make_module(
+        user_types={"@a:x": "verified"},
+        media_usage={"@a:x": MAX_USER_MEDIA_BYTES},
+    )
+    assert await upload_decision(module, "@a:x", 0) is True
+    assert await upload_decision(module, "@a:x", 1) is False
+
+
+async def test_upload_query_is_one_parameterized_snapshot_and_excludes_url_cache():
+    module, api = make_module(user_types={"@a:x": "verified"})
+    assert await upload_decision(module, "@a:x", 100) is True
+    assert api.db_calls == ["tier_controller_get_upload_snapshot"]
+    assert len(api.queries) == 2
+    usage_sql, usage_args = api.queries[-1]
+    assert "COALESCE(SUM(media_length), 0)" in usage_sql
+    assert "local_media_repository" in usage_sql
+    assert "url_cache IS NULL" in usage_sql
+    assert usage_args == ("@a:x",)
+
+
+async def test_upload_rejects_malformed_or_overflowing_values():
+    module, _ = make_module(
+        user_types={"@a:x": "verified"}, media_usage={"@a:x": -1}
+    )
+    assert await upload_decision(module, "@a:x", 1) is False
+
+    module, _ = make_module(
+        user_types={"@a:x": "verified"}, media_usage={"@a:x": 1 << 63}
+    )
+    assert await upload_decision(module, "@a:x", 1) is False
+
+    module, _ = make_module(user_types={"@a:x": "verified"})
+    assert await upload_decision(module, "@a:x", -1) is False
+    assert await upload_decision(module, "@a:x", True) is False
+    assert await upload_decision(module, "@a:x", 1.0) is False
+
+
+async def test_upload_rejects_staging_errors_and_free_space_overflow():
+    module, _ = make_module(user_types={"@a:x": "verified"})
+    with patch.object(tier_controller.os, "statvfs", side_effect=OSError("gone")):
+        assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 1) is False
+
+    with patch.object(
+        tier_controller.os,
+        "statvfs",
+        return_value=SimpleNamespace(f_bavail=2, f_frsize=(1 << 63) - 1),
+    ):
+        assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 1) is False
 
 
 async def test_restricted_room_cap_denied_at_cap():
@@ -219,7 +382,7 @@ async def test_encryption_event_non_state_ignored():
 
 async def test_db_error_fails_closed_on_upload():
     module, _ = make_module(user_types={"@a:x": "verified"}, db_error=True)
-    assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
+    assert await upload_decision(module, "@a:x", 100) is False
 
 
 async def test_db_error_fails_closed_on_room_create():
@@ -232,21 +395,21 @@ async def test_db_error_fails_closed_on_room_create():
 
 async def test_user_type_grant_and_revocation_are_visible_immediately():
     module, api = make_module(user_types={"@a:x": None})
-    assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
+    assert await upload_decision(module, "@a:x", 100) is False
 
     api.user_types["@a:x"] = "verified"
-    assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is True
+    assert await upload_decision(module, "@a:x", 100) is True
 
     api.user_types["@a:x"] = None
-    assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
+    assert await upload_decision(module, "@a:x", 100) is False
 
 
 async def test_db_error_recovers_on_next_decision():
     module, api = make_module(user_types={"@a:x": "verified"}, db_error=True)
-    assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is False
+    assert await upload_decision(module, "@a:x", 100) is False
 
     api.db_error = False
-    assert await module.is_user_allowed_to_upload_media_of_size("@a:x", 100) is True
+    assert await upload_decision(module, "@a:x", 100) is True
 
 
 if __name__ == "__main__":
@@ -254,7 +417,9 @@ if __name__ == "__main__":
     failures = 0
     for test in tests:
         try:
-            asyncio.run(test())
+            result = test()
+            if inspect.isawaitable(result):
+                asyncio.run(result)
         except Exception as error:
             failures += 1
             print(f"{test.__name__}: {error}", file=sys.stderr)

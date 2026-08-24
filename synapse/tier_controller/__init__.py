@@ -5,8 +5,8 @@
 # model: everyone is RESTRICTED (no uploads,
 # a capped number of created rooms, no m.room.encryption) unless user_type == 'verified'.
 # NULL/absent user_type (the default for a freshly registered account, agent or human) is
-# restricted; only an explicit 'verified' user_type lifts the restriction. There is no second
-# tier — 'verified' is uncapped, everything else shares one cap.
+# restricted; only an explicit 'verified' user_type lifts the restriction. Verified uploads also
+# obey the fixed per-user original-media quota and disposable staging reserve below.
 #
 # Callback signatures + return-value handling verified against the exact Synapse 1.159.0 package:
 #   - media_repository_callbacks.is_user_allowed_to_upload_media_of_size(user_id, size) -> bool.
@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from synapse.api.errors import Codes
@@ -27,6 +28,20 @@ logger = logging.getLogger(__name__)
 
 VERIFIED = "verified"
 
+BYTES_PER_MIB = 1024**2
+BYTES_PER_GIB = 1024**3
+
+# Synapse's max_upload_size is the primary per-file limit. Keep the same bound here so the
+# callback cannot admit a request that the surrounding media path is not meant to process.
+MAX_MEDIA_BYTES = 128 * BYTES_PER_MIB
+MAX_USER_MEDIA_BYTES = 50 * BYTES_PER_GIB
+STAGING_FREE_RESERVE_BYTES = 10 * BYTES_PER_GIB
+DEFAULT_MEDIA_STORE_PATH = "/data"
+
+# PostgreSQL's SUM(integer) returns a signed BIGINT. Values outside that range are malformed for
+# this policy even though Python itself can represent arbitrarily large integers.
+_MAX_SIGNED_INTEGER = (1 << 63) - 1
+
 _DENIAL_MESSAGE = (
     "This account is unverified. Uploads/room creation/encryption require a verified account "
     "— sign in at https://telecrypt.io with an email address to request verification. "
@@ -35,8 +50,13 @@ _DENIAL_MESSAGE = (
 
 
 class TierControllerConfig:
-    def __init__(self, restricted_room_cap: int) -> None:
+    def __init__(
+        self,
+        restricted_room_cap: int,
+        media_store_path: str = DEFAULT_MEDIA_STORE_PATH,
+    ) -> None:
         self.restricted_room_cap = restricted_room_cap
+        self.media_store_path = media_store_path
 
 
 class TierController:
@@ -60,7 +80,16 @@ class TierController:
             raise ConfigError("restricted_room_cap must be an integer") from e
         if restricted_room_cap < 0:
             raise ConfigError("restricted_room_cap must not be negative")
-        return TierControllerConfig(restricted_room_cap)
+
+        media_store_path = config.get("media_store_path", DEFAULT_MEDIA_STORE_PATH)
+        if (
+            not isinstance(media_store_path, str)
+            or not media_store_path
+            or not os.path.isabs(media_store_path)
+            or "\x00" in media_store_path
+        ):
+            raise ConfigError("media_store_path must be a non-empty absolute path")
+        return TierControllerConfig(restricted_room_cap, media_store_path)
 
     async def _get_user_type(self, user_id: str) -> str | None:
         def txn(cursor: Any) -> str | None:
@@ -99,8 +128,92 @@ class TierController:
             )
             return self.config.restricted_room_cap
 
+    async def _get_upload_snapshot(self, user_id: str) -> tuple[str | None, Any]:
+        """Read the verified projection and original-media usage in one DB interaction."""
+
+        def txn(cursor: Any) -> tuple[str | None, Any]:
+            cursor.execute("SELECT user_type FROM users WHERE name = %s", (user_id,))
+            user_row = cursor.fetchone()
+            user_type = user_row[0] if user_row else None
+            if user_type != VERIFIED:
+                return user_type, None
+
+            # URL-preview rows share this table but are not user-uploaded originals. Thumbnails,
+            # remote media, deleted rows, and staging files are outside this query by design.
+            cursor.execute(
+                "SELECT COALESCE(SUM(media_length), 0) "
+                "FROM local_media_repository "
+                "WHERE user_id = %s AND url_cache IS NULL",
+                (user_id,),
+            )
+            usage_row = cursor.fetchone()
+            return user_type, usage_row[0] if usage_row else None
+
+        try:
+            snapshot = await self._run_db_interaction(
+                "tier_controller_get_upload_snapshot", txn
+            )
+        except Exception:
+            logger.exception(
+                "tier_controller: upload policy lookup failed for %s, failing closed", user_id
+            )
+            return None, None
+
+        if not isinstance(snapshot, tuple) or len(snapshot) != 2:
+            logger.error("tier_controller: malformed upload policy result, failing closed")
+            return None, None
+        return snapshot
+
+    @staticmethod
+    def _bounded_nonnegative_integer(value: Any) -> int | None:
+        if type(value) is not int or value < 0 or value > _MAX_SIGNED_INTEGER:
+            return None
+        return value
+
+    def _staging_free_bytes(self) -> int | None:
+        try:
+            stats = os.statvfs(self.config.media_store_path)
+            available_blocks = self._bounded_nonnegative_integer(
+                getattr(stats, "f_bavail", None)
+            )
+            fragment_size = self._bounded_nonnegative_integer(
+                getattr(stats, "f_frsize", None)
+            )
+            if available_blocks is None or fragment_size is None or fragment_size == 0:
+                return None
+            if available_blocks > _MAX_SIGNED_INTEGER // fragment_size:
+                return None
+            return available_blocks * fragment_size
+        except Exception:
+            logger.exception(
+                "tier_controller: staging free-space lookup failed, failing closed"
+            )
+            return None
+
     async def is_user_allowed_to_upload_media_of_size(self, user_id: str, size: int) -> bool:
-        return not await self._is_restricted(user_id)
+        proposed_size = self._bounded_nonnegative_integer(size)
+        if proposed_size is None or proposed_size > MAX_MEDIA_BYTES:
+            return False
+
+        user_type, current_usage = await self._get_upload_snapshot(user_id)
+        if user_type != VERIFIED:
+            return False
+        usage = self._bounded_nonnegative_integer(current_usage)
+        if usage is None or usage > MAX_USER_MEDIA_BYTES:
+            return False
+        if usage > _MAX_SIGNED_INTEGER - proposed_size:
+            return False
+        total_usage = usage + proposed_size
+        if total_usage > MAX_USER_MEDIA_BYTES:
+            return False
+
+        free_bytes = self._staging_free_bytes()
+        if free_bytes is None:
+            return False
+        if proposed_size > _MAX_SIGNED_INTEGER - STAGING_FREE_RESERVE_BYTES:
+            return False
+        required_free_bytes = proposed_size + STAGING_FREE_RESERVE_BYTES
+        return free_bytes >= required_free_bytes
 
     async def user_may_create_room(self, user_id: str, room_config: dict) -> Any:
         if not await self._is_restricted(user_id):
