@@ -231,19 +231,17 @@ func TestServerIdentityDerivesFrozenPublicHostnames(t *testing.T) {
 	}
 }
 
-func TestServerIdentityDerivedLabelLengthBoundary(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		label string
-		valid bool
-	}{
-		{name: "maximum", label: strings.Repeat("a", maxDerivedServerLabelBytes), valid: true},
-		{name: "one over maximum", label: strings.Repeat("a", maxDerivedServerLabelBytes+1), valid: false},
+func TestServerIdentityRejectsUnprovisionedSubdomains(t *testing.T) {
+	for _, serverName := range []string{
+		"preview.telecrypt.io",
+		"foo.stage.telecrypt.io",
+		"stage.example.com",
+		"Stage.telecrypt.io",
+		"telecrypt.io.example.com",
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := deriveBackendEndpoints(tc.label + ".telecrypt.io")
-			if (err == nil) != tc.valid {
-				t.Fatalf("deriveBackendEndpoints(%q) error = %v, valid = %t", tc.label, err, tc.valid)
+		t.Run(serverName, func(t *testing.T) {
+			if _, err := deriveBackendEndpoints(serverName); err == nil {
+				t.Fatalf("deriveBackendEndpoints(%q) accepted an unprovisioned hostname", serverName)
 			}
 		})
 	}
@@ -451,6 +449,13 @@ func TestLoadAndValidateRegistrationDerivesPublicURLs(t *testing.T) {
 	cfg.MASPublicURL = "http://mas:8080"
 	if err := cfg.ValidateRegistration(); err == nil {
 		t.Fatal("ValidateRegistration accepted an internal MAS endpoint")
+	}
+}
+
+func TestRegistrationLoadRejectsUnprovisionedSubdomain(t *testing.T) {
+	t.Setenv("SERVER_NAME", "preview.telecrypt.io")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SERVER_NAME") {
+		t.Fatalf("Load accepted an unprovisioned registration hostname: %v", err)
 	}
 }
 

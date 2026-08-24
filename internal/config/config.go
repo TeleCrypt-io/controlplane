@@ -356,45 +356,13 @@ func deriveBackendEndpoints(serverName string) (backendEndpoints, error) {
 	}, nil
 }
 
-func validServerLabel(label string) bool {
-	if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-		return false
-	}
-	for _, r := range label {
-		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
-			return false
-		}
-	}
-	return true
-}
-
-const maxDerivedServerLabelBytes = 40
-
-func validateDerivedServerLabel(label string) error {
-	if !validServerLabel(label) {
-		return fmt.Errorf("SERVER_NAME must be exactly telecrypt.io or one <label>.telecrypt.io hostname")
-	}
-	if len(label) > maxDerivedServerLabelBytes {
-		return fmt.Errorf("SERVER_NAME label must be at most %d bytes for derived identities", maxDerivedServerLabelBytes)
-	}
-	return nil
-}
-
 type serverTopology struct{}
 
 func parseServerTopology(serverName string) (serverTopology, error) {
-	if serverName == "telecrypt.io" {
+	if serverName == "telecrypt.io" || serverName == "stage.telecrypt.io" {
 		return serverTopology{}, nil
 	}
-	const suffix = ".telecrypt.io"
-	if !strings.HasSuffix(serverName, suffix) {
-		return serverTopology{}, fmt.Errorf("SERVER_NAME must be exactly telecrypt.io or one <label>.telecrypt.io hostname")
-	}
-	label := strings.TrimSuffix(serverName, suffix)
-	if err := validateDerivedServerLabel(label); err != nil {
-		return serverTopology{}, err
-	}
-	return serverTopology{}, nil
+	return serverTopology{}, fmt.Errorf("SERVER_NAME must be exactly telecrypt.io or stage.telecrypt.io")
 }
 
 func requireNonEmptyNoSurroundingWhitespace(name, value string) error {
