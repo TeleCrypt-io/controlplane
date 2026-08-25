@@ -39,6 +39,29 @@ grep -Fq "releases/\$RELEASE_ID" "$workflow"
 grep -Fq 'name: controlplane-wheel-${{ github.run_id }}-${{ github.sha }}' "$workflow"
 grep -Fq 'github_expression_prefix=' "$workflow"
 grep -Fq 'expected_wheel_name=' "$workflow"
+grep -Fq 'wheel_name = pathlib.Path(sys.argv[1]).name' "$workflow"
+grep -Fq "wheel_version = wheel_name.removeprefix(wheel_prefix).split('-', 1)[0]" "$workflow"
+if grep -Fq "sys.argv[1].split('-')[1]" "$workflow"; then
+  echo 'wheel version validation must parse the wheel basename' >&2
+  exit 1
+fi
+PYTHONDONTWRITEBYTECODE=1 python3 - "$tier_controller_pyproject" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+pyproject = pathlib.Path(sys.argv[1])
+project_version = tomllib.loads(pyproject.read_text())['project']['version']
+wheel_path = pathlib.Path(
+    '/tmp/tier-controller/'
+    f'telecrypt_tier_controller-{project_version}-py3-none-any.whl'
+)
+wheel_name = wheel_path.name
+wheel_prefix = 'telecrypt_tier_controller-'
+assert wheel_name.startswith(wheel_prefix)
+wheel_version = wheel_name.removeprefix(wheel_prefix).split('-', 1)[0]
+assert wheel_version == project_version
+PY
 legacy_edit="$(printf '%s %s' gh 'release edit')"
 tag_release_path="$(printf '%s/%s/' releases tags)"
 if grep -Fq "$legacy_edit" "$workflow" || grep -Fq "$tag_release_path" "$workflow"; then

@@ -196,7 +196,7 @@ jobs:
           [[ "$wheel" == "$RELEASE_WHEEL" ]]
           (cd dist/tier-controller && sha256sum --strict --check "$wheel.sha256")
           python - "${wheels[0]}" <<'PY'
-          import email, sys, zipfile
+          import email, pathlib, sys, zipfile
           with zipfile.ZipFile(sys.argv[1]) as archive:
               names = set(archive.namelist())
               metadata_name = next(n for n in names if n.endswith('.dist-info/METADATA'))
@@ -205,7 +205,11 @@ jobs:
               assert not metadata.get_all('Requires-Dist')
               assert any(n.endswith('.dist-info/licenses/LICENSE') for n in names)
               assert any(n.endswith('.dist-info/licenses/NOTICE') for n in names)
-              assert metadata['Version'] == sys.argv[1].split('-')[1]
+              wheel_name = pathlib.Path(sys.argv[1]).name
+              wheel_prefix = 'telecrypt_tier_controller-'
+              assert wheel_name.startswith(wheel_prefix)
+              wheel_version = wheel_name.removeprefix(wheel_prefix).split('-', 1)[0]
+              assert wheel_version and metadata['Version'] == wheel_version
           PY
           for notice in LICENSE NOTICE; do test -s "$notice"; done
       - name: Log in to GHCR
