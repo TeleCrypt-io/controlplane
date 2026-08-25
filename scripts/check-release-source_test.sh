@@ -34,6 +34,12 @@ grep -Fq -- '--draft' "$workflow"
 grep -Fq -- '--method PATCH' "$workflow"
 grep -Fq 'scripts/check-release-source.sh' "$workflow"
 grep -Fq 'RELEASE_IMAGE_DIGEST' "$workflow"
+grep -Fq -- '--arg image_digest "$RELEASE_IMAGE_DIGEST"' "$workflow"
+grep -Fq '.digest == $image_digest' "$workflow"
+if grep -Fq -- '--arg digest "$(jq -er --arg name "$RELEASE_BINDING"' "$workflow"; then
+  echo 'binding image digest must not be compared with the Release asset file digest' >&2
+  exit 1
+fi
 grep -Fq 'RELEASE_BINDING' "$workflow"
 grep -Fq 'RELEASE_WHEEL' "$workflow"
 grep -Fq 'source_commit' "$workflow"
@@ -89,6 +95,8 @@ grep -Fq 'GHCR package version response failed strict schema validation' "$workf
 grep -Fq -- "--jq '[.[] | {id,name,metadata}]'" "$workflow"
 grep -Fq '[[ "$page" -lt 100 ]]' "$workflow"
 grep -Fq 'for page in $(seq 1 100); do' "$workflow"
+grep -Fq 'for attempt in $(seq 1 5); do' "$workflow"
+grep -Fq '[[ "$attempt" -lt 5 ]] && sleep 2' "$workflow"
 grep -Fq '(.id | type == "number" and . > 0 and . == floor)' "$workflow"
 if grep -Fq '(.id | type) == "number" and .id > 0 and .id == floor' "$workflow"; then
   echo 'Release asset IDs must be validated while the jq input is the numeric ID' >&2
@@ -216,6 +224,17 @@ printf '%s\n' \
   'private key=fake-private-key' >"$temporary/diagnostic"
 test "$(redact_diagnostics "$temporary/diagnostic")" = $'MAS_OIDC_CLIENT_SECRET=[redacted]\nPLAN_SESSION_KEY: [redacted]\nprivate key=[redacted]'
 test_digest='sha256:0000000000000000000000000000000000000000000000000000000000000000'
+binding_image_digest='sha256:1111111111111111111111111111111111111111111111111111111111111111'
+jq -cn --arg digest "$binding_image_digest" \
+  '{schema_version: 1, image: "ghcr.io/telecrypt-io/controlplane", tag: "test", source_commit: ("a" * 40), annotated_tag_sha: ("b" * 40), digest: $digest}' >"$temporary/binding.json"
+binding_asset_digest="sha256:$(sha256sum "$temporary/binding.json" | awk '{print $1}')"
+test "$binding_asset_digest" != "$binding_image_digest"
+binding_filter='type == "object" and .schema_version == 1 and (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and .digest == $image_digest'
+jq -e --arg image_digest "$binding_image_digest" "$binding_filter" "$temporary/binding.json" >/dev/null
+if jq -e --arg image_digest "$binding_asset_digest" "$binding_filter" "$temporary/binding.json" >/dev/null; then
+  echo 'binding asset digest was incorrectly accepted as the image digest' >&2
+  exit 1
+fi
 asset_shape_filter='all(.assets[];
   (.id | type == "number" and . > 0 and . == floor) and
   (.size | type == "number" and . > 0 and . <= 67108864) and

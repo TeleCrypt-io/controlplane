@@ -271,9 +271,8 @@ jobs:
           done
           cmp -- "dist/tier-controller/$RELEASE_WHEEL" "$download_dir/$RELEASE_WHEEL"
           jq -e --arg image "$IMAGE" --arg tag "$RELEASE_TAG" --arg source "$RELEASE_SHA" --arg tag_object "$tag_object" \
-            --arg digest "$(jq -er --arg name "$RELEASE_BINDING" '.assets[] | select(.name == $name) | .digest' "$release_json")" \
-            'type == "object" and (keys | sort) == ["annotated_tag_sha", "digest", "image", "schema_version", "source_commit", "tag"] and .schema_version == 1 and .image == $image and .tag == $tag and .source_commit == $source and .annotated_tag_sha == $tag_object and (.digest == $digest)' "$download_dir/$RELEASE_BINDING" >/dev/null
-          digest="$(jq -er '.digest' "$download_dir/$RELEASE_BINDING")"
+            'type == "object" and (keys | sort) == ["annotated_tag_sha", "digest", "image", "schema_version", "source_commit", "tag"] and .schema_version == 1 and .image == $image and .tag == $tag and .source_commit == $source and .annotated_tag_sha == $tag_object and (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))' "$download_dir/$RELEASE_BINDING" >/dev/null
+          digest="$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))' "$download_dir/$RELEASE_BINDING")"
           test "$(docker_bounded buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --format '{{.Manifest.Digest}}')" = "$digest"
           cp -- "$download_dir/$RELEASE_BINDING" "$RELEASE_METADATA_DIR/$RELEASE_BINDING"
           printf 'RELEASE_REUSE=true\nRELEASE_IMAGE_DIGEST=%s\n' "$digest" >>"$GITHUB_ENV"
@@ -490,19 +489,24 @@ jobs:
           draft_json="$(mktemp)"; page_json="$(mktemp)"; download_dir="$(mktemp -d)"
           cleanup() { rm -f -- "$draft_json" "$draft_json.stderr" "$page_json" "$page_json.stderr"; rm -rf -- "$download_dir"; }; trap cleanup EXIT
           found=false
-          for page in $(seq 1 10); do
-            bounded_capture_deadline 1048576 "$page_json" 120 gh api --hostname github.com -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' \
-              "repos/$GITHUB_REPOSITORY/releases?per_page=100&page=$page"
-            jq -e 'type == "array" and length <= 100' "$page_json" >/dev/null
-            matches="$(jq --arg tag "$RELEASE_TAG" '[.[] | select(.draft == true and .tag_name == $tag)]' "$page_json")"
-            match_count="$(jq length <<<"$matches")"
-            [[ "$match_count" -le 1 ]] || { echo 'multiple matching draft Releases on one page' >&2; exit 1; }
-            if [[ "$match_count" -eq 1 ]]; then
-              [[ "$found" != true ]] || { echo 'matching draft Release appeared on multiple pages' >&2; exit 1; }
-              jq -e '.[0]' <<<"$matches" >"$draft_json"; found=true
-            fi
-            [[ "$(jq length "$page_json")" -lt 100 ]] && break
-            [[ "$page" -lt 10 ]] || { echo 'draft Release list reached its bound' >&2; exit 1; }
+          for attempt in $(seq 1 5); do
+            found=false
+            for page in $(seq 1 10); do
+              bounded_capture_deadline 1048576 "$page_json" 120 gh api --hostname github.com -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' \
+                "repos/$GITHUB_REPOSITORY/releases?per_page=100&page=$page"
+              jq -e 'type == "array" and length <= 100' "$page_json" >/dev/null
+              matches="$(jq --arg tag "$RELEASE_TAG" '[.[] | select(.draft == true and .tag_name == $tag)]' "$page_json")"
+              match_count="$(jq length <<<"$matches")"
+              [[ "$match_count" -le 1 ]] || { echo 'multiple matching draft Releases on one page' >&2; exit 1; }
+              if [[ "$match_count" -eq 1 ]]; then
+                [[ "$found" != true ]] || { echo 'matching draft Release appeared on multiple pages' >&2; exit 1; }
+                jq -e '.[0]' <<<"$matches" >"$draft_json"; found=true
+              fi
+              [[ "$(jq length "$page_json")" -lt 100 ]] && break
+              [[ "$page" -lt 10 ]] || { echo 'draft Release list reached its bound' >&2; exit 1; }
+            done
+            [[ "$found" == true ]] && break
+            [[ "$attempt" -lt 5 ]] && sleep 2
           done
           [[ "$found" == true ]] || { echo 'exact matching draft Release was not found' >&2; exit 1; }
           release_id="$(jq -er '.id | select(type == "number" and . > 0 and . == floor)' "$draft_json")"
@@ -569,8 +573,8 @@ jobs:
           done
           cmp -- "dist/tier-controller/$RELEASE_WHEEL" "$download_dir/$RELEASE_WHEEL"
           tag_object="$ANNOTATED_TAG_SHA"
-          jq -e --arg image "$IMAGE" --arg tag "$RELEASE_TAG" --arg source "$RELEASE_SHA" --arg tag_object "$tag_object" --arg digest "$(jq -er --arg name "$RELEASE_BINDING" '.assets[] | select(.name == $name) | .digest' "$final_json")" \
-            'type == "object" and (keys | sort) == ["annotated_tag_sha", "digest", "image", "schema_version", "source_commit", "tag"] and .schema_version == 1 and .image == $image and .tag == $tag and .source_commit == $source and .annotated_tag_sha == $tag_object and .digest == $digest' "$download_dir/$RELEASE_BINDING" >/dev/null
+          jq -e --arg image "$IMAGE" --arg tag "$RELEASE_TAG" --arg source "$RELEASE_SHA" --arg tag_object "$tag_object" --arg image_digest "$RELEASE_IMAGE_DIGEST" \
+            'type == "object" and (keys | sort) == ["annotated_tag_sha", "digest", "image", "schema_version", "source_commit", "tag"] and .schema_version == 1 and .image == $image and .tag == $tag and .source_commit == $source and .annotated_tag_sha == $tag_object and .digest == $image_digest' "$download_dir/$RELEASE_BINDING" >/dev/null
           expected_digest="$(jq -er '.digest' "$download_dir/$RELEASE_BINDING")"
           [[ "$expected_digest" == "$RELEASE_IMAGE_DIGEST" ]]
           [[ "$(docker_bounded buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --format '{{.Manifest.Digest}}')" == "$expected_digest" ]]
