@@ -4,10 +4,12 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 helper="$repo_root/scripts/check-release-source.sh"
+url_helper="$repo_root/scripts/check-release-source_helpers.sh"
 workflow="$repo_root/.github/workflows/build.yml"
 tier_controller_pyproject="$repo_root/synapse/tier_controller/pyproject.toml"
 
 grep -Fqx '#!/usr/bin/env bash' "$helper"
+grep -Fqx '#!/usr/bin/env bash' "$url_helper"
 grep -Fq 'actions/checkout@v7.0.1' "$workflow"
 grep -Fq 'fetch-depth: 0' "$workflow"
 grep -Fq 'persist-credentials: false' "$workflow"
@@ -17,6 +19,9 @@ grep -Fq 'GIT_CONFIG_SYSTEM=/dev/null' "$helper"
 grep -Fq 'credential.helper=' "$helper"
 grep -Fq 'http.proxy=' "$helper"
 grep -Fq 'https://github.com/${GITHUB_REPOSITORY}.git' "$helper"
+grep -Fq 'remote get-url --all origin' "$helper"
+grep -Fq 'remote get-url --all --push origin' "$helper"
+grep -Fq 'normalize_canonical_origin_url' "$helper"
 grep -Fq 'refs/tags/$RELEASE_TAG:$remote_tag_ref' "$helper"
 grep -Fq 'refs/heads/main:"$remote_main_ref"' "$helper"
 grep -Fq 'merge-base --is-ancestor' "$helper"
@@ -97,3 +102,28 @@ status=$?
 set -e
 test "$status" -eq 0
 test "$(cat "$temporary/descendant")" = leader
+
+source "$url_helper"
+canonical_repository='TeleCrypt-io/controlplane'
+canonical_url='https://github.com/TeleCrypt-io/controlplane.git'
+test "$(normalize_canonical_origin_url "$canonical_repository" 'https://github.com/TeleCrypt-io/controlplane')" = "$canonical_url"
+test "$(normalize_canonical_origin_url "$canonical_repository" "$canonical_url")" = "$canonical_url"
+
+for hostile_url in \
+  'https://user:secret@github.com/TeleCrypt-io/controlplane.git' \
+  'http://github.com/TeleCrypt-io/controlplane.git' \
+  'https://gitlab.com/TeleCrypt-io/controlplane.git' \
+  'https://github.com/TeleCrypt-io/controlplane/' \
+  'https://github.com/TeleCrypt-io/controlplane.git?query=1' \
+  'ssh://git@github.com/TeleCrypt-io/controlplane.git' \
+  $'https://github.com/TeleCrypt-io/controlplane\nhttps://github.com/TeleCrypt-io/controlplane.git'; do
+  if normalize_canonical_origin_url "$canonical_repository" "$hostile_url" >/dev/null; then
+    echo "hostile origin URL was accepted: $hostile_url" >&2
+    exit 1
+  fi
+done
+
+if normalize_canonical_origin_url "$canonical_repository" '' >/dev/null; then
+  echo 'empty origin URL was accepted' >&2
+  exit 1
+fi

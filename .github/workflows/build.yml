@@ -43,7 +43,7 @@ jobs:
       - name: Verify release workflow contract
         run: |
           set -euo pipefail
-          bash -n scripts/check-release-source.sh scripts/check-release-source_test.sh scripts/release-helpers.sh
+          bash -n scripts/check-release-source.sh scripts/check-release-source_helpers.sh scripts/check-release-source_test.sh scripts/release-helpers.sh
           scripts/check-release-source_test.sh
           test "$(grep -Fc 'source scripts/release-helpers.sh' .github/workflows/build.yml)" -ge 1
           grep -Fq -- '--draft' .github/workflows/build.yml

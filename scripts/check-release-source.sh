@@ -5,6 +5,12 @@ set -euo pipefail
 : "${RELEASE_TAG:?RELEASE_TAG is required}"
 : "${RELEASE_SHA:?RELEASE_SHA is required}"
 
+readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# The checkout action's canonical HTTPS origin may omit .git.  Normalize only those
+# two spellings before requiring both origin URL lists to resolve to one repository.
+# The later fetch deliberately uses repo_url so it remains public and anonymous.
+source "$script_dir/check-release-source_helpers.sh"
+
 [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
   echo 'GITHUB_REPOSITORY is not canonical' >&2
   exit 2
@@ -23,7 +29,6 @@ readonly tag_ref="refs/tags/$RELEASE_TAG"
 readonly remote_tag_ref='refs/remotes/origin/release-tag'
 readonly remote_main_ref='refs/remotes/origin/main'
 readonly max_output_bytes=$((64 * 1024))
-readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/controlplane-git.XXXXXX")"
 cleanup() { rm -rf -- "$temporary_root"; }
 trap cleanup EXIT
@@ -65,8 +70,14 @@ bounded_git() {
 
 die() { echo "$1" >&2; exit 1; }
 
-remote_url="$(bounded_git remote get-url origin)" || die 'could not read the origin remote'
-[[ "$remote_url" == "$repo_url" ]] || die 'origin is not the canonical HTTPS repository'
+remote_fetch_urls="$(bounded_git remote get-url --all origin)" || die 'could not read the origin fetch URL'
+remote_push_urls="$(bounded_git remote get-url --all --push origin)" || die 'could not read the origin push URL'
+normalized_fetch_url="$(normalize_canonical_origin_url "$GITHUB_REPOSITORY" "$remote_fetch_urls")" ||
+  die 'origin fetch URL is not exactly one canonical HTTPS repository URL'
+normalized_push_url="$(normalize_canonical_origin_url "$GITHUB_REPOSITORY" "$remote_push_urls")" ||
+  die 'origin push URL is not exactly one canonical HTTPS repository URL'
+[[ "$normalized_fetch_url" == "$repo_url" && "$normalized_push_url" == "$repo_url" ]] ||
+  die 'origin fetch and push URLs do not resolve to the canonical repository'
 
 checkout_tag_type="$(bounded_git cat-file -t "$tag_ref")" || die 'checked-out release tag cannot be read'
 [[ "$checkout_tag_type" == tag ]] || die 'release tag is not annotated'
