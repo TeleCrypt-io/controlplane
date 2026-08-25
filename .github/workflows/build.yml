@@ -290,10 +290,9 @@ jobs:
           platforms: linux/amd64
           provenance: false
           target: controlplane
-          tags: ${{ env.IMAGE_BUILD_REF }}
           outputs: |
-            type=docker,dest=${{ runner.temp }}/controlplane-image.tar
-            type=registry,name=${{ env.IMAGE_BUILD_REF }},push=true
+            type=docker,name=${{ env.IMAGE_BUILD_REF }},dest=${{ runner.temp }}/controlplane-image.tar
+            type=image,name=${{ env.IMAGE }},push=true,push-by-digest=true,name-canonical=true
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ env.RELEASE_SHA }}
@@ -314,18 +313,71 @@ jobs:
           set -euo pipefail
           source scripts/release-helpers.sh
           docker_bounded() { timeout --signal=TERM --kill-after=5s 120s docker "$@"; }
-          image_id_file="$(mktemp)"; trap 'rm -f -- "$image_id_file" "$image_id_file.stderr"' EXIT
+          image_id_file="$(mktemp)"; diagnostics_dir="$(mktemp -d)"
           bounded_capture 65536 "$image_id_file" docker load --input "$RUNNER_TEMP/controlplane-image.tar"
           IMAGE_REF="$IMAGE_REF" RELEASE_TAG="$RELEASE_TAG" RELEASE_SHA="$RELEASE_SHA" GITHUB_REPOSITORY="$GITHUB_REPOSITORY" bash scripts/validate-image-contract.sh
           registration_name=controlplane-registration-smoke; plan_name=controlplane-plan-smoke
-          cleanup() { timeout --signal=TERM --kill-after=5s 30s docker rm -f "$registration_name" "$plan_name" >/dev/null 2>&1 || true; }
+          cleanup() {
+            timeout --signal=TERM --kill-after=5s 30s docker rm -f "$registration_name" "$plan_name" >/dev/null 2>&1 || true
+            rm -f -- "$image_id_file" "$image_id_file.stderr"
+            rm -rf -- "$diagnostics_dir"
+          }
           trap cleanup EXIT
-          docker_bounded run --detach --rm --name "$registration_name" --publish 127.0.0.1:19009:9009 --env SERVER_NAME=stage.telecrypt.io "$IMAGE_REF" /registration
-          docker_bounded run --detach --rm --name "$plan_name" --publish 127.0.0.1:19012:9012 --env SERVER_NAME=stage.telecrypt.io --env BILLING_ENVIRONMENT=test --env MAS_OIDC_CLIENT_ID=01J00000000000000000000 --env MAS_OIDC_CLIENT_SECRET=smoke-secret --env PLAN_SESSION_KEY=ssssssssssssssssssssssssssssssss --env PLAN_ASSERTION_PRIVATE_KEY=AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyB5tVYuj-ZU-UB4sRLoqYunkB-FOuaVvtfg45ELrQSWZA "$IMAGE_REF" /plan
-          registration_status=""; for _ in $(seq 1 30); do registration_status="$(curl --silent --show-error --connect-timeout 1 --max-time 3 --request HEAD --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19009/agents || true)"; [[ "$registration_status" == 405 ]] && break; sleep 1; done
-          [[ "$registration_status" == 405 ]]
-          plan_status=""; for _ in $(seq 1 30); do plan_status="$(curl --silent --show-error --connect-timeout 1 --max-time 3 --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19012/plan || true)"; [[ "$plan_status" == 200 ]] && break; sleep 1; done
-          [[ "$plan_status" == 200 ]]
+          capture_diagnostics() {
+            local stdout_file="$1" max_bytes="$2"
+            shift 2
+            set +e
+            /usr/bin/python3 scripts/bounded-command.py \
+              --stdout-limit "$max_bytes" --stderr-limit "$max_bytes" \
+              --stdout-path "$stdout_file" --stderr-path "$stdout_file.stderr" \
+              --timeout 120 -- "$@"
+            local status="$?"
+            set -e
+            return "$status"
+          }
+          emit_container_diagnostics() {
+            local name="$1" status_file="$diagnostics_dir/$1.status" log_file="$diagnostics_dir/$1.log"
+            local inspect_status logs_status
+            if capture_diagnostics "$status_file" 8192 docker inspect --format 'status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}' "$name"; then
+              inspect_status=0
+            else
+              inspect_status="$?"
+            fi
+            if capture_diagnostics "$log_file" 65536 docker logs "$name"; then
+              logs_status=0
+            else
+              logs_status="$?"
+            fi
+            printf 'sanitized container diagnostics for %s:\n' "$name" >&2
+            if [[ "$inspect_status" -eq 0 ]]; then
+              redact_diagnostics "$status_file" >&2
+            else
+              echo 'container status unavailable' >&2
+            fi
+            if [[ -s "$status_file.stderr" ]]; then
+              redact_diagnostics "$status_file.stderr" >&2
+            fi
+            if [[ "$logs_status" -eq 0 || -s "$log_file" || -s "$log_file.stderr" ]]; then
+              redact_diagnostics "$log_file" >&2
+              redact_diagnostics "$log_file.stderr" >&2
+            else
+              echo 'container logs unavailable' >&2
+            fi
+          }
+          docker_bounded run --detach --name "$registration_name" --publish 127.0.0.1:19009:9009 --env SERVER_NAME=stage.telecrypt.io "$IMAGE_REF" /registration
+          docker_bounded run --detach --name "$plan_name" --publish 127.0.0.1:19012:9012 --env SERVER_NAME=stage.telecrypt.io --env BILLING_ENVIRONMENT=test --env MAS_OIDC_CLIENT_ID=01J00000000000000000000000 --env MAS_OIDC_CLIENT_SECRET=smoke-secret --env PLAN_SESSION_KEY=ssssssssssssssssssssssssssssssss --env PLAN_ASSERTION_PRIVATE_KEY=AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyB5tVYuj-ZU-UB4sRLoqYunkB-FOuaVvtfg45ELrQSWZA "$IMAGE_REF" /plan
+          registration_status=""; for _ in $(seq 1 30); do registration_status="$(curl --silent --connect-timeout 1 --max-time 3 --request HEAD --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19009/agents || true)"; [[ "$registration_status" == 405 ]] && break; sleep 1; done
+          if [[ "$registration_status" != 405 ]]; then
+            echo "registration smoke readiness failed with HTTP status $registration_status" >&2
+            emit_container_diagnostics "$registration_name"
+            exit 1
+          fi
+          plan_status=""; for _ in $(seq 1 30); do plan_status="$(curl --silent --connect-timeout 1 --max-time 3 --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19012/plan || true)"; [[ "$plan_status" == 200 ]] && break; sleep 1; done
+          if [[ "$plan_status" != 200 ]]; then
+            echo "plan smoke readiness failed with HTTP status $plan_status" >&2
+            emit_container_diagnostics "$plan_name"
+            exit 1
+          fi
           echo "image-id=$(docker_bounded image inspect "$IMAGE_REF" --format '{{.Id}}')" >>"$GITHUB_OUTPUT"
       - name: Refuse a pre-existing exact version tag
         if: env.RELEASE_REUSE != 'true'
@@ -339,7 +391,7 @@ jobs:
           docker_bounded() { timeout --signal=TERM --kill-after=5s 120s docker "$@"; }
           [[ "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$(docker_bounded image inspect "$IMAGE_BUILD_REF" --format '{{.Id}}')" == "$SMOKE_IMAGE_ID" ]]
-          staging_digest="$(docker_bounded buildx imagetools inspect "$IMAGE_BUILD_REF" --format '{{.Manifest.Digest}}')"
+          staging_digest="$(docker_bounded buildx imagetools inspect "$IMAGE@$BUILD_DIGEST" --format '{{.Manifest.Digest}}')"
           [[ "$staging_digest" == "$BUILD_DIGEST" ]]
           set +e
           inspection="$(docker_bounded buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --format '{{.Manifest.Digest}}' 2>&1)"

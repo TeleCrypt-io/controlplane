@@ -45,6 +45,30 @@ if grep -Fq "sys.argv[1].split('-')[1]" "$workflow"; then
   echo 'wheel version validation must parse the wheel basename' >&2
   exit 1
 fi
+grep -Fq -- '--env MAS_OIDC_CLIENT_ID=01J00000000000000000000000' "$workflow"
+if grep -Eq -- '--env MAS_OIDC_CLIENT_ID=01J00000000000000000000([[:space:]]|")' "$workflow"; then
+  echo 'smoke Plan client ID must satisfy the canonical 26-character contract' >&2
+  exit 1
+fi
+grep -Fq 'emit_container_diagnostics' "$workflow"
+grep -Fq 'docker inspect --format' "$workflow"
+grep -Fq 'docker logs' "$workflow"
+grep -Fq 'redact_diagnostics' "$workflow"
+grep -Fq 'type=docker,name=${{ env.IMAGE_BUILD_REF }},dest=${{ runner.temp }}/controlplane-image.tar' "$workflow"
+grep -Fq 'type=image,name=${{ env.IMAGE }},push=true,push-by-digest=true,name-canonical=true' "$workflow"
+if grep -Fq 'type=registry,name=${{ env.IMAGE_BUILD_REF }},push=true' "$workflow" || grep -Fq 'tags: ${{ env.IMAGE_BUILD_REF }}' "$workflow"; then
+  echo 'staging image must not leave a mutable registry tag' >&2
+  exit 1
+fi
+grep -Fq 'buildx imagetools inspect "$IMAGE@$BUILD_DIGEST"' "$workflow"
+if grep -Fq -- '--detach --rm --name "$registration_name"' "$workflow" || grep -Fq -- '--detach --rm --name "$plan_name"' "$workflow"; then
+  echo 'failed smoke containers must remain available for bounded diagnostics until cleanup' >&2
+  exit 1
+fi
+if grep -Fq 'curl --silent --show-error' "$workflow"; then
+  echo 'expected readiness retries must not emit transport errors before the final diagnosis' >&2
+  exit 1
+fi
 PYTHONDONTWRITEBYTECODE=1 python3 - "$tier_controller_pyproject" <<'PY'
 import pathlib
 import sys
@@ -100,6 +124,12 @@ fi
 
 temporary="$(mktemp -d)"
 trap 'rm -rf -- "$temporary"' EXIT
+source "$repo_root/scripts/release-helpers.sh"
+printf '%s\n' \
+  'MAS_OIDC_CLIENT_SECRET=fake-secret' \
+  'PLAN_SESSION_KEY: fake-token' \
+  'private key=fake-private-key' >"$temporary/diagnostic"
+test "$(redact_diagnostics "$temporary/diagnostic")" = $'MAS_OIDC_CLIENT_SECRET=[redacted]\nPLAN_SESSION_KEY: [redacted]\nprivate key=[redacted]'
 set +e
 (
   cd "$temporary"

@@ -34,3 +34,10 @@ bounded_capture_deadline() {
   [[ "$timeout_seconds" =~ ^[0-9]+$ && "$timeout_seconds" -gt 0 ]] || return 2
   _bounded_capture "$max_bytes" "$output" "$timeout_seconds" "$@"
 }
+
+redact_diagnostics() {
+  sed -E \
+    -e 's/(MAS_OIDC_CLIENT_SECRET|PLAN_SESSION_KEY|PLAN_ASSERTION_PRIVATE_KEY)([=:][[:space:]]*)[^[:space:]]+/\1\2[redacted]/g' \
+    -e 's/((secret|token|password|private[[:space:]]+key))([=:][[:space:]]*)[^[:space:]]+/\1\3[redacted]/Ig' \
+    "$@"
+}
