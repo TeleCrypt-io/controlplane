@@ -250,9 +250,10 @@ jobs:
             '.tag_name == $tag and .name == $tag and .prerelease == false and ((.draft == false and .immutable == true) or (.draft == true and .immutable == false))' "$release_json" >/dev/null
           count="$(jq -er '.assets | type == "array" and length' "$release_json")"
           [[ "$count" -eq 2 ]] || { echo 'immutable Release must contain exactly two assets' >&2; exit 1; }
-          jq -e 'all(.assets[]; (.id | type) == "number" and .id > 0 and .id == floor and
-            (.size | type) == "number" and .size > 0 and .size <= 67108864 and
-            (.digest | type) == "string" and (.digest | test("^sha256:[0-9a-f]{64}$")))' "$release_json" >/dev/null
+          jq -e 'all(.assets[];
+            (.id | type == "number" and . > 0 and . == floor) and
+            (.size | type == "number" and . > 0 and . <= 67108864) and
+            (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")))' "$release_json" >/dev/null
           printf 'RELEASE_EXISTS=true\nRELEASE_ID=%s\n' "$release_id" >>"$GITHUB_ENV"
           if [[ "$(jq -er '.draft' "$release_json")" == true ]]; then
             printf 'RELEASE_DRAFT_ID=%s\n' "$release_id" >>"$GITHUB_ENV"
@@ -511,7 +512,10 @@ jobs:
           fi
           printf 'RELEASE_ID=%s\nRELEASE_DRAFT_ID=%s\n' "$release_id" "$release_id" >>"$GITHUB_ENV"
           jq -e --arg tag "$RELEASE_TAG" --arg wheel "$RELEASE_WHEEL" --arg binding "$RELEASE_BINDING" \
-            '.tag_name == $tag and .name == $tag and .draft == true and .prerelease == false and (.assets | type == "array" and length == 2 and ([.[].name] | sort) == ([$wheel, $binding] | sort) and all(.[]; (.size | type) == "number" and .size > 0 and .size <= 67108864 and (.digest | type) == "string" and (.digest | test("^sha256:[0-9a-f]{64}$"))))' "$draft_json" >/dev/null
+            '.tag_name == $tag and .name == $tag and .draft == true and .prerelease == false and (.assets | type == "array" and length == 2 and ([.[].name] | sort) == ([$wheel, $binding] | sort) and all(.[];
+              (.id | type == "number" and . > 0 and . == floor) and
+              (.size | type == "number" and . > 0 and . <= 67108864) and
+              (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))))' "$draft_json" >/dev/null
           for asset in "$RELEASE_WHEEL" "$RELEASE_BINDING"; do
             asset_id="$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .id' "$draft_json")"
             asset_size="$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .size' "$draft_json")"
@@ -549,7 +553,10 @@ jobs:
           jq -e --arg tag "$RELEASE_TAG" --arg wheel "$RELEASE_WHEEL" --arg binding "$RELEASE_BINDING" \
             '.tag_name == $tag and .name == $tag and .draft == false and .prerelease == false and .immutable == true and
              (.assets | type == "array" and length == 2 and ([.[].name] | sort) == ([$wheel, $binding] | sort) and
-              all(.[]; (.id | type) == "number" and .id > 0 and .id == floor and (.size | type) == "number" and .size > 0 and .size <= 67108864 and (.digest | type) == "string" and (.digest | test("^sha256:[0-9a-f]{64}$"))))' "$final_json" >/dev/null
+              all(.[];
+                (.id | type == "number" and . > 0 and . == floor) and
+                (.size | type == "number" and . > 0 and . <= 67108864) and
+                (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))))' "$final_json" >/dev/null
           final_id="$(jq -er '.id' "$final_json")"; if [[ "${RELEASE_EXISTS:-false}" == true ]]; then [[ "$final_id" == "$RELEASE_ID" ]]; fi
           expected_digest="$RELEASE_IMAGE_DIGEST"
           for asset in "$RELEASE_WHEEL" "$RELEASE_BINDING"; do

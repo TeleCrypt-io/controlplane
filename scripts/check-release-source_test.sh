@@ -89,6 +89,11 @@ grep -Fq 'GHCR package version response failed strict schema validation' "$workf
 grep -Fq -- "--jq '[.[] | {id,name,metadata}]'" "$workflow"
 grep -Fq '[[ "$page" -lt 100 ]]' "$workflow"
 grep -Fq 'for page in $(seq 1 100); do' "$workflow"
+grep -Fq '(.id | type == "number" and . > 0 and . == floor)' "$workflow"
+if grep -Fq '(.id | type) == "number" and .id > 0 and .id == floor' "$workflow"; then
+  echo 'Release asset IDs must be validated while the jq input is the numeric ID' >&2
+  exit 1
+fi
 if grep -Fq 'inspection="$(docker_bounded buildx imagetools inspect "$IMAGE:$RELEASE_TAG"' "$workflow"; then
   echo 'immutable image-tag absence must use the authenticated Packages API, not human Docker text' >&2
   exit 1
@@ -211,6 +216,20 @@ printf '%s\n' \
   'private key=fake-private-key' >"$temporary/diagnostic"
 test "$(redact_diagnostics "$temporary/diagnostic")" = $'MAS_OIDC_CLIENT_SECRET=[redacted]\nPLAN_SESSION_KEY: [redacted]\nprivate key=[redacted]'
 test_digest='sha256:0000000000000000000000000000000000000000000000000000000000000000'
+asset_shape_filter='all(.assets[];
+  (.id | type == "number" and . > 0 and . == floor) and
+  (.size | type == "number" and . > 0 and . <= 67108864) and
+  (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")))'
+jq -cn --arg digest "$test_digest" '{assets: [{id: 7, size: 1, digest: $digest}]}' >"$temporary/release-assets-valid.json"
+jq -e "$asset_shape_filter" "$temporary/release-assets-valid.json" >/dev/null
+for hostile_id in 7.5 '{}'; do
+  jq -cn --argjson id "$hostile_id" --arg digest "$test_digest" \
+    '{assets: [{id: $id, size: 1, digest: $digest}]}' >"$temporary/release-assets-hostile.json"
+  if jq -e "$asset_shape_filter" "$temporary/release-assets-hostile.json" >/dev/null; then
+    echo "hostile Release asset ID was accepted: $hostile_id" >&2
+    exit 1
+  fi
+done
 printf '%s' "[{\"id\":7,\"name\":\"$test_digest\",\"metadata\":{\"package_type\":\"container\",\"container\":{\"tags\":[]}}}]" >"$temporary/ghcr-valid.json"
 test "$(ghcr_version_records "$temporary/ghcr-valid.json" "$project_version" "$test_digest")" = $'7\tsha256:0000000000000000000000000000000000000000000000000000000000000000\t0\t1'
 printf '%s' "[{\"id\":1,\"name\":\"$test_digest\",\"metadata\":{\"package_type\":\"container\",\"container\":{\"tags\":[\"hostile-tag\",\"hostile-tag\"]}}}]" >"$temporary/ghcr-duplicate-tags.json"
