@@ -61,6 +61,54 @@ if grep -Fq 'type=registry,name=${{ env.IMAGE_BUILD_REF }},push=true' "$workflow
   exit 1
 fi
 grep -Fq 'buildx imagetools inspect "$IMAGE@$BUILD_DIGEST"' "$workflow"
+grep -Fq 'GH_TOKEN: ${{ github.token }}' "$workflow"
+grep -Fq 'orgs/$package_owner/packages/container/$package_name/versions?per_page=100&page=' "$workflow"
+grep -Fq 'ghcr_version_records' "$workflow"
+grep -Fq 'declare -A package_ids=() package_digests=()' "$workflow"
+grep -Fq 'GHCR package version pagination returned a duplicate ID or digest' "$workflow"
+grep -Fq 'GHCR package version response failed strict schema validation' "$workflow"
+grep -Fq -- "--jq '[.[] | {id,name,metadata}]'" "$workflow"
+grep -Fq '[[ "$page" -lt 100 ]]' "$workflow"
+grep -Fq 'for page in $(seq 1 100); do' "$workflow"
+if grep -Fq 'inspection="$(docker_bounded buildx imagetools inspect "$IMAGE:$RELEASE_TAG"' "$workflow"; then
+  echo 'immutable image-tag absence must use the authenticated Packages API, not human Docker text' >&2
+  exit 1
+fi
+PYTHONDONTWRITEBYTECODE=1 python3 - "$workflow" <<'PY'
+import pathlib
+import re
+import sys
+
+lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+blocks = []
+block = []
+for line in lines:
+    if re.match(r'^      - ', line):
+        if block:
+            blocks.append(block)
+        block = [line]
+    elif block:
+        block.append(line)
+if block:
+    blocks.append(block)
+
+for block in blocks:
+    invocations = [
+        index for index, line in enumerate(block)
+        if 'docker_bounded' in line and not re.search(r'docker_bounded\s*\(\)\s*\{', line)
+    ]
+    if not invocations:
+        continue
+    definitions = [
+        index for index, line in enumerate(block)
+        if re.search(r'docker_bounded\s*\(\)\s*\{', line)
+    ]
+    assert definitions and min(definitions) < min(invocations), block[0]
+
+create = next(index for index, line in enumerate(lines) if 'buildx imagetools create --prefer-index=false' in line)
+final = next(index for index, line in enumerate(lines) if 'final_digest="$(docker_bounded buildx imagetools inspect "$IMAGE:$RELEASE_TAG"' in line)
+assert create < final
+PY
 if grep -Fq -- '--detach --rm --name "$registration_name"' "$workflow" || grep -Fq -- '--detach --rm --name "$plan_name"' "$workflow"; then
   echo 'failed smoke containers must remain available for bounded diagnostics until cleanup' >&2
   exit 1
@@ -125,11 +173,26 @@ fi
 temporary="$(mktemp -d)"
 trap 'rm -rf -- "$temporary"' EXIT
 source "$repo_root/scripts/release-helpers.sh"
+project_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$tier_controller_pyproject")"
+test -n "$project_version"
 printf '%s\n' \
   'MAS_OIDC_CLIENT_SECRET=fake-secret' \
   'PLAN_SESSION_KEY: fake-token' \
   'private key=fake-private-key' >"$temporary/diagnostic"
 test "$(redact_diagnostics "$temporary/diagnostic")" = $'MAS_OIDC_CLIENT_SECRET=[redacted]\nPLAN_SESSION_KEY: [redacted]\nprivate key=[redacted]'
+test_digest='sha256:0000000000000000000000000000000000000000000000000000000000000000'
+printf '%s' "[{\"id\":7,\"name\":\"$test_digest\",\"metadata\":{\"package_type\":\"container\",\"container\":{\"tags\":[]}}}]" >"$temporary/ghcr-valid.json"
+test "$(ghcr_version_records "$temporary/ghcr-valid.json" "$project_version" "$test_digest")" = $'7\tsha256:0000000000000000000000000000000000000000000000000000000000000000\t0\t1'
+printf '%s' "[{\"id\":1,\"name\":\"$test_digest\",\"metadata\":{\"package_type\":\"container\",\"container\":{\"tags\":[\"hostile-tag\",\"hostile-tag\"]}}}]" >"$temporary/ghcr-duplicate-tags.json"
+if ghcr_version_records "$temporary/ghcr-duplicate-tags.json" hostile-tag "$test_digest" >/dev/null; then
+  echo 'GHCR response with duplicate tags was accepted' >&2
+  exit 1
+fi
+printf '%s' "[{\"id\":\"1\",\"name\":\"$test_digest\",\"metadata\":{\"package_type\":\"container\",\"container\":{\"tags\":[]}}}]" >"$temporary/ghcr-invalid-shape.json"
+if ghcr_version_records "$temporary/ghcr-invalid-shape.json" "$project_version" "$test_digest" >/dev/null; then
+  echo 'GHCR response with nonnumeric ID was accepted' >&2
+  exit 1
+fi
 set +e
 (
   cd "$temporary"

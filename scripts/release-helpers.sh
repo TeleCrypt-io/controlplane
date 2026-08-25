@@ -41,3 +41,28 @@ redact_diagnostics() {
     -e 's/((secret|token|password|private[[:space:]]+key))([=:][[:space:]]*)[^[:space:]]+/\1\3[redacted]/Ig' \
     "$@"
 }
+
+ghcr_version_records() {
+  local page_json="$1" release_tag="$2" build_digest="$3"
+  jq -e '
+    type == "array" and length <= 100 and
+    all(.[];
+      type == "object" and
+      (.id | type == "number" and . > 0 and . == floor) and
+      (.name | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      (.metadata | type == "object" and .package_type == "container") and
+      (.metadata.container | type == "object") and
+      (.metadata.container.tags | type == "array" and
+        all(.[]; type == "string" and test("^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")) and
+        (length == (unique | length)))
+    )' "$page_json" >/dev/null || return 1
+  jq -r --arg tag "$release_tag" --arg digest "$build_digest" '
+    .[] |
+    [
+      (.id | tostring),
+      .name,
+      ([.metadata.container.tags[] | select(. == $tag)] | length | tostring),
+      (if .name == $digest then "1" else "0" end)
+    ] | @tsv
+  ' "$page_json"
+}
