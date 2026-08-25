@@ -59,7 +59,11 @@ jobs:
             exit 1
           fi
           grep -Fq 'bounded_capture_deadline' .github/workflows/build.yml
-          grep -Fq 'name: controlplane-wheel-${{ github.run_id }}-${{ github.sha }}' .github/workflows/build.yml
+          github_expression_prefix="$(printf '%s' '$' '{')"
+          run_id_expression="${github_expression_prefix}{ github.run_id }}"
+          sha_expression="${github_expression_prefix}{ github.sha }}"
+          expected_wheel_name="name: controlplane-wheel-${run_id_expression}-${sha_expression}"
+          grep -Fq "$expected_wheel_name" .github/workflows/build.yml
           grep -Fq 'overwrite: true' .github/workflows/build.yml
           if grep -Eq 'bounded_capture\(\)' .github/workflows/build.yml; then
             echo 'release workflow contains a duplicate capture implementation' >&2
