@@ -59,6 +59,13 @@ jobs:
             exit 1
           fi
           grep -Fq 'bounded_capture_deadline' .github/workflows/build.yml
+          grep -Fq "bounded_capture 65536 \"\$image_pull_output\" docker pull \"\$SYNAPSE_IMAGE\"" .github/workflows/build.yml
+          grep -Fq "bounded_capture 65536 \"\$image_test_output\" docker run --rm --user 0:0" .github/workflows/build.yml
+          bounded_function_name="$(printf '%s_%s' docker bounded)"
+          if grep -Eq "bounded_capture.*${bounded_function_name}" .github/workflows/build.yml; then
+            echo 'bounded_capture must invoke an executable, not a shell function' >&2
+            exit 1
+          fi
           github_expression_prefix="$(printf '%s' '$' '{')"
           run_id_expression="${github_expression_prefix}{ github.run_id }}"
           sha_expression="${github_expression_prefix}{ github.sha }}"
@@ -91,7 +98,6 @@ jobs:
         run: |
           set -euo pipefail
           source scripts/release-helpers.sh
-          docker_bounded() { timeout --signal=TERM --kill-after=5s 120s docker "$@"; }
           test_wheelhouse=/tmp/tier-controller-test-wheelhouse
           rm -rf -- "$test_wheelhouse"; mkdir -p "$test_wheelhouse"
           python -m pip download --disable-pip-version-check --only-binary=:all: --no-deps --require-hashes \
@@ -104,8 +110,8 @@ jobs:
           "$python_bin" -m build --no-isolation --wheel --outdir dist/tier-controller synapse/tier_controller
           image_pull_output="$(mktemp)"; image_test_output="$(mktemp)"
           trap 'rm -f -- "$image_pull_output" "$image_pull_output.stderr" "$image_test_output" "$image_test_output.stderr"' EXIT
-          bounded_capture 65536 "$image_pull_output" docker_bounded pull "$SYNAPSE_IMAGE"
-          bounded_capture 65536 "$image_test_output" docker_bounded run --rm --user 0:0 \
+          bounded_capture 65536 "$image_pull_output" docker pull "$SYNAPSE_IMAGE"
+          bounded_capture 65536 "$image_test_output" docker run --rm --user 0:0 \
             --env PIP_ROOT_USER_ACTION=ignore \
             --mount "type=bind,src=$GITHUB_WORKSPACE/dist/tier-controller,dst=/wheel,readonly" \
             --mount "type=bind,src=$GITHUB_WORKSPACE/synapse/tier_controller/test_tier_controller.py,dst=/work/test_tier_controller.py,readonly" \
@@ -305,7 +311,7 @@ jobs:
           source scripts/release-helpers.sh
           docker_bounded() { timeout --signal=TERM --kill-after=5s 120s docker "$@"; }
           image_id_file="$(mktemp)"; trap 'rm -f -- "$image_id_file" "$image_id_file.stderr"' EXIT
-          bounded_capture 65536 "$image_id_file" docker_bounded load --input "$RUNNER_TEMP/controlplane-image.tar"
+          bounded_capture 65536 "$image_id_file" docker load --input "$RUNNER_TEMP/controlplane-image.tar"
           IMAGE_REF="$IMAGE_REF" RELEASE_TAG="$RELEASE_TAG" RELEASE_SHA="$RELEASE_SHA" GITHUB_REPOSITORY="$GITHUB_REPOSITORY" bash scripts/validate-image-contract.sh
           registration_name=controlplane-registration-smoke; plan_name=controlplane-plan-smoke
           cleanup() { timeout --signal=TERM --kill-after=5s 30s docker rm -f "$registration_name" "$plan_name" >/dev/null 2>&1 || true; }

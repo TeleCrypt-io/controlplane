@@ -9,6 +9,7 @@ description = "TeleCrypt fail-closed Synapse capability-policy module"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "LicenseRef-BUSL-1.1"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "TeleCrypt.io" }]
 classifiers = [
   "Programming Language :: Python :: 3",
@@ -20,4 +21,3 @@ classifiers = [
 [tool.setuptools]
 packages = ["tier_controller"]
 package-dir = { tier_controller = "." }
-license-files = ["../../LICENSE", "../../NOTICE"]

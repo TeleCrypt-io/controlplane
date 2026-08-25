@@ -5,6 +5,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 helper="$repo_root/scripts/check-release-source.sh"
 workflow="$repo_root/.github/workflows/build.yml"
+tier_controller_pyproject="$repo_root/synapse/tier_controller/pyproject.toml"
 
 grep -Fqx '#!/usr/bin/env bash' "$helper"
 grep -Fq 'actions/checkout@v7.0.1' "$workflow"
@@ -45,6 +46,20 @@ grep -Fq 'checkout_commit" == "$RELEASE_SHA"' "$helper"
 grep -Fq 'ANNOTATED_TAG_SHA=' "$helper"
 grep -Fq 'bounded-command.py' "$helper"
 grep -Fq 'start_new_session=True' "$repo_root/scripts/bounded-command.py"
+grep -Fq 'bounded_capture 65536 "$image_pull_output" docker pull "$SYNAPSE_IMAGE"' "$workflow"
+grep -Fq 'bounded_capture 65536 "$image_test_output" docker run --rm --user 0:0' "$workflow"
+bounded_function_name="$(printf '%s_%s' docker bounded)"
+if grep -Eq "bounded_capture.*${bounded_function_name}" "$workflow"; then
+  echo 'bounded_capture must invoke an executable, not a shell function' >&2
+  exit 1
+fi
+grep -Fq 'license-files = ["LICENSE", "NOTICE"]' "$tier_controller_pyproject"
+if grep -Fq 'license-files = ["../../LICENSE", "../../NOTICE"]' "$tier_controller_pyproject"; then
+  echo 'tier-controller license metadata must use project-local files' >&2
+  exit 1
+fi
+cmp -s "$repo_root/LICENSE" "$repo_root/synapse/tier_controller/LICENSE"
+cmp -s "$repo_root/NOTICE" "$repo_root/synapse/tier_controller/NOTICE"
 
 if grep -Eq 'GIT_CONFIG_KEY_|GIT_INDEX_FILE|config --(local|worktree)|symlink' "$helper"; then
   echo 'source helper contains retired hostile Git machinery' >&2
