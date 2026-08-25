@@ -164,8 +164,6 @@ jobs:
       contents: write
       actions: read
       packages: write
-      attestations: write
-      id-token: write
     steps:
       - uses: actions/checkout@v7.0.1
         timeout-minutes: 5
@@ -457,7 +455,7 @@ jobs:
           tag_object="$ANNOTATED_TAG_SHA"
           jq -cS -n --arg image "$IMAGE" --arg tag "$RELEASE_TAG" --arg source_commit "$RELEASE_SHA" --arg annotated_tag_sha "$tag_object" --arg digest "$RELEASE_IMAGE_DIGEST" \
             '{schema_version: 1, image: $image, tag: $tag, source_commit: $source_commit, annotated_tag_sha: $annotated_tag_sha, digest: $digest}' >"$RELEASE_METADATA_DIR/$RELEASE_BINDING"
-      - name: Recheck image digest and source before attestation
+      - name: Recheck image digest and source before Release
         if: env.RELEASE_REUSE != 'true'
         run: |
           set -euo pipefail
@@ -465,12 +463,6 @@ jobs:
           docker_bounded() { timeout --signal=TERM --kill-after=5s 120s docker "$@"; }
           test "$(docker_bounded buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --format '{{.Manifest.Digest}}')" = "$RELEASE_IMAGE_DIGEST"
           scripts/check-release-source.sh
-      - uses: actions/attest-build-provenance@v4.2.2
-        if: env.RELEASE_REUSE != 'true'
-        with:
-          subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ env.RELEASE_IMAGE_DIGEST }}
-          push-to-registry: true
       - name: Create the exact immutable Release
         if: env.RELEASE_REUSE != 'true'
         env:
@@ -478,6 +470,7 @@ jobs:
           RELEASE_METADATA_DIR: ${{ runner.temp }}/controlplane-release-assets
         run: |
           set -euo pipefail
+          source scripts/release-helpers.sh
           scripts/check-release-source.sh
           shopt -s nullglob; wheels=(dist/tier-controller/*.whl); [[ "${#wheels[@]}" -eq 1 ]]
           assets=("${wheels[0]}" "$RELEASE_METADATA_DIR/$RELEASE_BINDING")

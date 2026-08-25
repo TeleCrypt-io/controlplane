@@ -32,6 +32,25 @@ if grep -Eq '2>&1[[:space:]]*\|[[:space:]]*/usr/bin/head' "$repo_root/scripts/ch
 fi
 grep -Fq -- '--draft' "$workflow"
 grep -Fq -- '--method PATCH' "$workflow"
+grep -Fq 'scripts/check-release-source.sh' "$workflow"
+grep -Fq 'RELEASE_IMAGE_DIGEST' "$workflow"
+grep -Fq 'RELEASE_BINDING' "$workflow"
+grep -Fq 'RELEASE_WHEEL' "$workflow"
+grep -Fq 'source_commit' "$workflow"
+grep -Fq 'annotated_tag_sha' "$workflow"
+grep -Fq 'org.telecrypt.controlplane.release=${{ env.RELEASE_TAG }}' "$workflow"
+grep -Fq 'org.telecrypt.tier-controller.release=${{ env.RELEASE_TAG }}' "$workflow"
+grep -Fq "'{schema_version: 1, image: \$image, tag: \$tag, source_commit: \$source_commit, annotated_tag_sha: \$annotated_tag_sha, digest: \$digest}'" "$workflow"
+grep -Fq '(.assets | type == "array" and length == 2' "$workflow"
+grep -Fq 'and .immutable == true' "$workflow"
+if grep -Eqi '(release[_ -](tag|version)|RELEASE_(TAG|WHEEL|BINDING)).*[0-9]+\.[0-9]+\.[0-9]+' "$workflow"; then
+  echo 'release workflow must derive the release version from the exact tag' >&2
+  exit 1
+fi
+if grep -Eq 'attest-build-provenance@|^[[:space:]]+(attestations|id-token|artifact-metadata):' "$workflow"; then
+  echo 'release workflow must not request attestation or related token authority' >&2
+  exit 1
+fi
 grep -Fq 'releases?per_page=100&page=' "$workflow"
 grep -Fq "select(.draft == true and .tag_name == \$tag)" "$workflow"
 grep -Fq "releases/\$RELEASE_DRAFT_ID" "$workflow"
@@ -104,6 +123,17 @@ for block in blocks:
         if re.search(r'docker_bounded\s*\(\)\s*\{', line)
     ]
     assert definitions and min(definitions) < min(invocations), block[0]
+
+    deadline_invocations = [
+        index for index, line in enumerate(block)
+        if 'bounded_capture_deadline ' in line and 'grep' not in line
+    ]
+    if deadline_invocations:
+        helper_sources = [
+            index for index, line in enumerate(block)
+            if line.strip() == 'source scripts/release-helpers.sh'
+        ]
+        assert helper_sources and min(helper_sources) < min(deadline_invocations), block[0]
 
 create = next(index for index, line in enumerate(lines) if 'buildx imagetools create --prefer-index=false' in line)
 final = next(index for index, line in enumerate(lines) if 'final_digest="$(docker_bounded buildx imagetools inspect "$IMAGE:$RELEASE_TAG"' in line)
