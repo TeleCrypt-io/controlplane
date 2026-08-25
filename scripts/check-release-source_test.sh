@@ -25,7 +25,17 @@ if grep -Eq '2>&1[[:space:]]*\|[[:space:]]*/usr/bin/head' "$repo_root/scripts/ch
   exit 1
 fi
 grep -Fq -- '--draft' "$workflow"
-grep -Fq 'gh release edit' "$workflow"
+grep -Fq -- '--method PATCH' "$workflow"
+grep -Fq 'releases?per_page=100&page=' "$workflow"
+grep -Fq "select(.draft == true and .tag_name == \$tag)" "$workflow"
+grep -Fq "releases/\$RELEASE_DRAFT_ID" "$workflow"
+grep -Fq "releases/\$RELEASE_ID" "$workflow"
+legacy_edit="$(printf '%s %s' gh 'release edit')"
+tag_release_path="$(printf '%s/%s/' releases tags)"
+if grep -Fq "$legacy_edit" "$workflow" || grep -Fq "$tag_release_path" "$workflow"; then
+  echo 'draft Release path must use bounded discovery and numeric release IDs' >&2
+  exit 1
+fi
 grep -Fq 'cat-file -t' "$helper"
 grep -Fq 'tag_ref^{}' "$helper"
 grep -Fq 'checkout_commit" == "$RELEASE_SHA"' "$helper"

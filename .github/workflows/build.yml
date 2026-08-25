@@ -47,7 +47,17 @@ jobs:
           scripts/check-release-source_test.sh
           test "$(grep -Fc 'source scripts/release-helpers.sh' .github/workflows/build.yml)" -ge 1
           grep -Fq -- '--draft' .github/workflows/build.yml
-          grep -Fq 'gh release edit' .github/workflows/build.yml
+          grep -Fq -- '--method PATCH' .github/workflows/build.yml
+          grep -Fq 'releases?per_page=100&page=' .github/workflows/build.yml
+          grep -Fq "select(.draft == true and .tag_name == \$tag)" .github/workflows/build.yml
+          grep -Fq "releases/\$RELEASE_DRAFT_ID" .github/workflows/build.yml
+          grep -Fq "releases/\$RELEASE_ID" .github/workflows/build.yml
+          legacy_edit="$(printf '%s %s' gh 'release edit')"
+          tag_release_path="$(printf '%s/%s/' releases tags)"
+          if grep -Fq "$legacy_edit" .github/workflows/build.yml || grep -Fq "$tag_release_path" .github/workflows/build.yml; then
+            echo 'draft Release path must use bounded discovery and numeric release IDs' >&2
+            exit 1
+          fi
           grep -Fq 'bounded_capture_deadline' .github/workflows/build.yml
           grep -Fq 'name: controlplane-wheel-${{ github.run_id }}-${{ github.sha }}' .github/workflows/build.yml
           grep -Fq 'overwrite: true' .github/workflows/build.yml
@@ -140,7 +150,6 @@ jobs:
       IMAGE_BUILD_REF: ghcr.io/telecrypt-io/controlplane:controlplane-build-${{ github.run_id }}-${{ github.run_attempt }}
       RELEASE_WHEEL: telecrypt_tier_controller-${{ github.ref_name }}-py3-none-any.whl
       RELEASE_BINDING: controlplane-${{ github.ref_name }}.digest.json
-      RELEASE_METADATA_DIR: ${{ runner.temp }}/controlplane-release-assets
     permissions:
       contents: write
       actions: read
@@ -199,6 +208,7 @@ jobs:
       - name: Reuse and verify an exact immutable Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_METADATA_DIR: ${{ runner.temp }}/controlplane-release-assets
         run: |
           set -euo pipefail
           source scripts/release-helpers.sh
@@ -336,6 +346,8 @@ jobs:
           printf 'RELEASE_IMAGE_DIGEST=%s\n' "$final_digest" >>"$GITHUB_ENV"
       - name: Write the exact image digest asset
         if: env.RELEASE_REUSE != 'true'
+        env:
+          RELEASE_METADATA_DIR: ${{ runner.temp }}/controlplane-release-assets
         run: |
           set -euo pipefail
           mkdir -p "$RELEASE_METADATA_DIR"
@@ -360,6 +372,7 @@ jobs:
         if: env.RELEASE_REUSE != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_METADATA_DIR: ${{ runner.temp }}/controlplane-release-assets
         run: |
           set -euo pipefail
           scripts/check-release-source.sh
@@ -367,18 +380,40 @@ jobs:
           assets=("${wheels[0]}" "$RELEASE_METADATA_DIR/$RELEASE_BINDING")
           draft_output="$(mktemp)"; trap 'rm -f -- "$draft_output" "$draft_output.stderr"' EXIT
           bounded_capture_deadline 65536 "$draft_output" 120 gh release create "$RELEASE_TAG" "${assets[@]}" --repo "github.com/$GITHUB_REPOSITORY" --verify-tag --draft --title "$RELEASE_TAG" --notes "Exact Controlplane release $RELEASE_TAG."
-          printf 'RELEASE_DRAFT_ID=%s\n' "$RELEASE_TAG" >>"$GITHUB_ENV"
+          printf 'RELEASE_DRAFT_PENDING=true\n' >>"$GITHUB_ENV"
 
       - name: Verify exact draft before publishing
-        if: env.RELEASE_DRAFT_ID != ''
+        if: env.RELEASE_DRAFT_ID != '' || env.RELEASE_DRAFT_PENDING == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_METADATA_DIR: ${{ runner.temp }}/controlplane-release-assets
         run: |
           set -euo pipefail
           source scripts/release-helpers.sh
-          draft_json="$(mktemp)"; download_dir="$(mktemp -d)"
-          cleanup() { rm -f -- "$draft_json" "$draft_json.stderr"; rm -rf -- "$download_dir"; }; trap cleanup EXIT
-          bounded_capture_deadline 1048576 "$draft_json" 120 gh api --hostname github.com -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"
+          draft_json="$(mktemp)"; page_json="$(mktemp)"; download_dir="$(mktemp -d)"
+          cleanup() { rm -f -- "$draft_json" "$draft_json.stderr" "$page_json" "$page_json.stderr"; rm -rf -- "$download_dir"; }; trap cleanup EXIT
+          found=false
+          for page in $(seq 1 10); do
+            bounded_capture_deadline 1048576 "$page_json" 120 gh api --hostname github.com -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100&page=$page"
+            jq -e 'type == "array" and length <= 100' "$page_json" >/dev/null
+            matches="$(jq --arg tag "$RELEASE_TAG" '[.[] | select(.draft == true and .tag_name == $tag)]' "$page_json")"
+            match_count="$(jq length <<<"$matches")"
+            [[ "$match_count" -le 1 ]] || { echo 'multiple matching draft Releases on one page' >&2; exit 1; }
+            if [[ "$match_count" -eq 1 ]]; then
+              [[ "$found" != true ]] || { echo 'matching draft Release appeared on multiple pages' >&2; exit 1; }
+              jq -e '.[0]' <<<"$matches" >"$draft_json"; found=true
+            fi
+            [[ "$(jq length "$page_json")" -lt 100 ]] && break
+            [[ "$page" -lt 10 ]] || { echo 'draft Release list reached its bound' >&2; exit 1; }
+          done
+          [[ "$found" == true ]] || { echo 'exact matching draft Release was not found' >&2; exit 1; }
+          release_id="$(jq -er '.id | select(type == "number" and . > 0 and . == floor)' "$draft_json")"
+          if [[ -n "${RELEASE_DRAFT_ID:-}" && "$RELEASE_DRAFT_ID" != "$release_id" ]]; then
+            echo 'draft Release identity changed during verification' >&2
+            exit 1
+          fi
+          printf 'RELEASE_ID=%s\nRELEASE_DRAFT_ID=%s\n' "$release_id" "$release_id" >>"$GITHUB_ENV"
           jq -e --arg tag "$RELEASE_TAG" --arg wheel "$RELEASE_WHEEL" --arg binding "$RELEASE_BINDING" \
             '.tag_name == $tag and .name == $tag and .draft == true and .prerelease == false and (.assets | type == "array" and length == 2 and ([.[].name] | sort) == ([$wheel, $binding] | sort) and all(.[]; (.size | type) == "number" and .size > 0 and .size <= 67108864 and (.digest | type) == "string" and (.digest | test("^sha256:[0-9a-f]{64}$"))))' "$draft_json" >/dev/null
           for asset in "$RELEASE_WHEEL" "$RELEASE_BINDING"; do
@@ -401,7 +436,9 @@ jobs:
           source scripts/release-helpers.sh
           scripts/check-release-source.sh
           publish_output="$(mktemp)"; trap 'rm -f -- "$publish_output" "$publish_output.stderr"' EXIT
-          bounded_capture_deadline 65536 "$publish_output" 120 gh release edit "$RELEASE_TAG" --repo "github.com/$GITHUB_REPOSITORY" --draft=false
+          bounded_capture_deadline 65536 "$publish_output" 120 gh api --hostname github.com --method PATCH \
+            -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' \
+            --field draft=false "repos/$GITHUB_REPOSITORY/releases/$RELEASE_DRAFT_ID"
       - name: Verify the final immutable Release, exact assets, and source
         env:
           GH_TOKEN: ${{ github.token }}
@@ -412,7 +449,7 @@ jobs:
           final_json="$(mktemp)"; download_dir="$(mktemp -d)"
           cleanup() { rm -f -- "$final_json"; rm -rf -- "$download_dir"; }; trap cleanup EXIT
           bounded_capture_deadline 1048576 "$final_json" 120 gh api --hostname github.com -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"
           jq -e --arg tag "$RELEASE_TAG" --arg wheel "$RELEASE_WHEEL" --arg binding "$RELEASE_BINDING" \
             '.tag_name == $tag and .name == $tag and .draft == false and .prerelease == false and .immutable == true and
              (.assets | type == "array" and length == 2 and ([.[].name] | sort) == ([$wheel, $binding] | sort) and

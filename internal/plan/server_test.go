@@ -359,14 +359,27 @@ func TestPlanAssetsAreLocalAndCarryCommandContract(t *testing.T) {
 
 func TestPlanSharedUIAssetMatchesProvenance(t *testing.T) {
 	var provenance struct {
-		SourceFile string `json:"source_file"`
-		SHA256     string `json:"sha256"`
+		Version          string `json:"version"`
+		CanonicalSource  string `json:"canonical_source"`
+		CanonicalRelease string `json:"canonical_release"`
+		CanonicalCommit  string `json:"canonical_commit"`
+		SourceFile       string `json:"source_file"`
+		SHA256           string `json:"sha256"`
 	}
 	if err := json.Unmarshal(sharedUIProvenanceJSON, &provenance); err != nil {
 		t.Fatalf("decode shared UI provenance: %v", err)
 	}
 	if provenance.SourceFile != "src/product.css" {
 		t.Fatalf("shared UI provenance source_file = %q, want src/product.css", provenance.SourceFile)
+	}
+	if provenance.Version != "0.1.8" || provenance.CanonicalRelease != "v0.1.8" {
+		t.Fatalf("shared UI provenance release = %q/%q, want 0.1.8/v0.1.8", provenance.Version, provenance.CanonicalRelease)
+	}
+	if provenance.CanonicalSource != "https://github.com/TeleCrypt-io/ui-shared-css" {
+		t.Fatalf("shared UI provenance source = %q, want the canonical shared UI repository", provenance.CanonicalSource)
+	}
+	if provenance.CanonicalCommit != "257c9ec70024b5d39b76c266c3ab5d129fc34c65" {
+		t.Fatalf("shared UI provenance commit = %q, want the v0.1.8 source commit", provenance.CanonicalCommit)
 	}
 	if len(provenance.SHA256) != sha256.Size*2 {
 		t.Fatalf("shared UI provenance sha256 = %q, want a SHA-256 hex digest", provenance.SHA256)

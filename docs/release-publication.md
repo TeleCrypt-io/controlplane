@@ -10,11 +10,13 @@ Before any image build, the workflow enumerates bounded authenticated Releases-l
 verifies an exact final immutable Release, including its source binding, registry digest, and both
 downloaded assets; an exact match is reused without rebuilding. An exact matching draft is also
 recovered only after its complete asset set, API digests and sizes, and downloaded bytes are verified.
-Otherwise the workflow creates one exact `gh release create --verify-tag --draft` result, verifies the
-draft, and promotes that same draft with `gh release edit --draft=false`. If a later promotion step
-fails, a rerun can recover the exact draft or final release and repeat the bounded verification.
-Final verification requires the tag, peeled annotated-tag commit, complete asset set, API asset
-digests and sizes, downloaded bytes, IDs, and `immutable: true` state. Any mismatch fails closed.
+Otherwise the workflow creates one exact `gh release create --verify-tag --draft` result, discovers
+exactly one matching draft through the bounded Releases-list pagination, verifies the draft, and
+promotes that same draft through its numeric Release ID. Tag-based draft lookup and tag-based edit
+are not used. If a later promotion step fails, a rerun can recover the exact draft or final release
+and repeat the bounded verification. Final verification requires the tag, peeled annotated-tag
+commit, complete asset set, API asset digests and sizes, downloaded bytes, numeric Release ID, and
+`immutable: true` state. Any mismatch or ambiguous draft identity fails closed.
 
 GitHub's immutable-release feature supplies a release attestation for the published tag and its
 assets. Separately, the workflow attaches one build-provenance attestation to the exact registry
