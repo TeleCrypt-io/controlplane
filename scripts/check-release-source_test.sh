@@ -287,6 +287,7 @@ set -e
 test "$status" -eq 0
 test "$(cat "$temporary/descendant")" = leader
 
+# shellcheck source=scripts/check-release-source_helpers.sh
 source "$url_helper"
 canonical_repository='TeleCrypt-io/controlplane'
 canonical_url='https://github.com/TeleCrypt-io/controlplane.git'

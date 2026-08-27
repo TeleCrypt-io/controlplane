@@ -92,7 +92,7 @@ const (
 	maxMASHTMLBodyBytes       = 1 << 20
 	maxMASJSONBodyBytes       = 1 << 20
 	maxMASOAuthFieldBytes     = 8 << 10
-	maxMASDeviceLifetime      = 15 * time.Minute
+	maxMASDeviceLifetime      = 20 * time.Minute
 	maxMASDeviceInterval      = 5 * time.Minute
 	maxMASAccessLifetime      = 24 * time.Hour
 	maxMatrixIdentityBytes    = 255

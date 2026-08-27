@@ -231,7 +231,7 @@ func TestRegisterAndAuthorizeDeviceMAS123Contract(t *testing.T) {
 				t.Errorf("device scope = %q, want device grant", r.PostForm.Get("scope"))
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"device_code":"device-123","user_code":"user-123","expires_in":60,"interval":1}`))
+			_, _ = w.Write([]byte(`{"device_code":"device-123","user_code":"user-123","expires_in":1200,"interval":1}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/link":
 			if r.URL.RawQuery != "" {
 				t.Errorf("device link GET query = %q, want no code auto-fill query", r.URL.RawQuery)
@@ -352,10 +352,61 @@ func TestMatrixIdentityValidationAndDeviceFlowBounds(t *testing.T) {
 			}
 		})
 	}
-	state := &deviceAuthorization{DeviceCode: "device", UserCode: "user", ExpiresIn: int(maxMASDeviceLifetime/time.Second) + 1, Interval: 1}
+	state := &deviceAuthorization{DeviceCode: "device", UserCode: "user", ExpiresIn: 1201, Interval: 1}
 	s := &session{baseURL: "https://mas.example"}
-	if _, err := s.pollDeviceToken(context.Background(), "client", state); err == nil {
+	if _, err := s.pollDeviceToken(context.Background(), "client", state); err == nil || registrationfailure.Code(err) != "device_token/invariant" {
 		t.Fatal("pollDeviceToken accepted an overflowing device lifetime")
+	}
+}
+
+func TestStartDeviceAuthorizationMASDeviceLifetimeBounds(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		expiresIn int
+		wantError bool
+	}{
+		{name: "MAS 1.23 maximum", expiresIn: 1200},
+		{name: "over maximum", expiresIn: 1201, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/oauth2/device" {
+					t.Fatalf("device authorization request = %s %s, want POST /oauth2/device", r.Method, r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"device_code":"device-123","user_code":"user-123","expires_in":%d,"interval":1}`, test.expiresIn)
+			}))
+			defer srv.Close()
+
+			s := &session{baseURL: srv.URL, publicHTTPClient: srv.Client()}
+			got, err := s.startDeviceAuthorization(context.Background(), "client-123", "DEVICE-123")
+			if (err != nil) != test.wantError {
+				t.Fatalf("startDeviceAuthorization error = %v, wantError %t", err, test.wantError)
+			}
+			if test.wantError {
+				if got != nil || registrationfailure.Code(err) != "device_authorization/protocol" {
+					t.Fatalf("startDeviceAuthorization result = %#v, error = %v, want protocol rejection", got, err)
+				}
+				return
+			}
+			if got == nil || got.ExpiresIn != test.expiresIn {
+				t.Fatalf("startDeviceAuthorization result = %#v, want expires_in %d", got, test.expiresIn)
+			}
+		})
+	}
+}
+
+func TestPollDeviceTokenAcceptsMASDeviceLifetimeMaximum(t *testing.T) {
+	transport := &flakyTransport{calls: 1, body: `{"access_token":"access","refresh_token":"refresh","expires_in":60}`}
+	s := &session{
+		baseURL:          "https://mas.example",
+		publicHTTPClient: &http.Client{Transport: transport},
+	}
+	got, err := s.pollDeviceToken(context.Background(), "client", &deviceAuthorization{
+		DeviceCode: "device", UserCode: "user", ExpiresIn: 1200, Interval: 1,
+	})
+	if err != nil || got == nil || got.AccessToken != "access" {
+		t.Fatalf("pollDeviceToken at MAS maximum = %#v, error = %v, want successful token", got, err)
 	}
 }
 

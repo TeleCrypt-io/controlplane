@@ -5,10 +5,12 @@ set -euo pipefail
 : "${RELEASE_TAG:?RELEASE_TAG is required}"
 : "${RELEASE_SHA:?RELEASE_SHA is required}"
 
-readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
 # The checkout action's canonical HTTPS origin may omit .git.  Normalize only those
 # two spellings before requiring both origin URL lists to resolve to one repository.
 # The later fetch deliberately uses repo_url so it remains public and anonymous.
+# shellcheck source=scripts/check-release-source_helpers.sh
 source "$script_dir/check-release-source_helpers.sh"
 
 [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
@@ -29,7 +31,8 @@ readonly tag_ref="refs/tags/$RELEASE_TAG"
 readonly remote_tag_ref='refs/remotes/origin/release-tag'
 readonly remote_main_ref='refs/remotes/origin/main'
 readonly max_output_bytes=$((64 * 1024))
-readonly temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/controlplane-git.XXXXXX")"
+temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/controlplane-git.XXXXXX")"
+readonly temporary_root
 cleanup() { rm -rf -- "$temporary_root"; }
 trap cleanup EXIT
 trap 'cleanup; exit 143' HUP INT TERM
