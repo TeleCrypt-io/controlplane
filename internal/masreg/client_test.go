@@ -1,7 +1,6 @@
 package masreg
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,18 +13,9 @@ import (
 	"strings"
 	"testing"
 	"time"
-)
 
-func TestSniffErrorDoesNotExposeUpstreamBody(t *testing.T) {
-	secret := "database-password=must-not-escape"
-	body := append([]byte("<div class=\"text-critical\">"+secret+"</div>"), bytes.Repeat([]byte("x"), maxMASHTMLBodyBytes)...)
-	if got := sniffError(body); got != "upstream validation error" {
-		t.Fatalf("sniffError = %q, want stable validation error", got)
-	}
-	if strings.Contains(sniffError(body), secret) {
-		t.Fatal("sniffError returned sensitive upstream body")
-	}
-}
+	"github.com/TeleCrypt-io/controlplane/internal/registrationfailure"
+)
 
 func TestValidateSameOrigin(t *testing.T) {
 	tests := []struct {
@@ -67,7 +57,7 @@ func TestRegisterAndAuthorizeDeviceRejectsInvalidInputsBeforeHTTP(t *testing.T) 
 			_, err := client.RegisterAndAuthorizeDevice(
 				context.Background(), test.username, test.password, test.deviceID, "https://backend.example",
 			)
-			if err == nil || !strings.Contains(err.Error(), "invalid") {
+			if err == nil || registrationfailure.Code(err) != "internal/invariant" {
 				t.Fatalf("RegisterAndAuthorizeDevice error = %v, want input rejection", err)
 			}
 		})
@@ -105,7 +95,6 @@ func TestRegistrationRedirectPolicy(t *testing.T) {
 		{http.MethodPost, "/register/steps/01J00000000000000000000000/display-name", "/register/steps/01J00000000000000000000000/finish"},
 		{http.MethodGet, "/register/steps/01J00000000000000000000000/finish", "/welcome"},
 		{http.MethodPost, "/link", "/device/01J00000000000000000000000"},
-		{http.MethodPost, "/device/01J00000000000000000000000", "/device/complete"},
 	}
 	for _, test := range valid {
 		from := "https://[2001:db8::1]:8448/auth" + test.from
@@ -129,6 +118,7 @@ func TestRegistrationRedirectPolicy(t *testing.T) {
 		{name: "encoded path", status: http.StatusSeeOther, from: "/register", to: "https://[2001:db8::1]:8448/auth/%72egister/password", wantError: "unsafe"},
 		{name: "query", status: http.StatusSeeOther, from: "/register", to: "https://[2001:db8::1]:8448/auth/register/password?next=secret", wantError: "unsafe"},
 		{name: "unexpected path", status: http.StatusSeeOther, from: "/register/password", to: "/oauth2/token", wantError: "expected flow"},
+		{name: "fabricated device completion", status: http.StatusSeeOther, from: "/device/01J00000000000000000000000", to: "/device/complete", wantError: "expected flow"},
 	}
 	for _, test := range invalid {
 		t.Run(test.name, func(t *testing.T) {
@@ -276,9 +266,9 @@ func TestRegisterAndAuthorizeDeviceMAS123Contract(t *testing.T) {
 					t.Errorf("device consent %s = %q, want %q", field, got, want)
 				}
 			}
-			http.Redirect(w, r, "/device/complete", http.StatusSeeOther)
-		case r.Method == http.MethodGet && r.URL.Path == "/device/complete":
-			_, _ = w.Write([]byte("device linked"))
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("<html><body>device linked</body></html>"))
 		case r.Method == http.MethodPost && r.URL.Path == "/oauth2/token":
 			if err := r.ParseForm(); err != nil {
 				t.Errorf("token form: %v", err)
@@ -331,7 +321,6 @@ func TestRegisterAndAuthorizeDeviceMAS123Contract(t *testing.T) {
 		"POST /link",
 		"GET /device/device-123",
 		"POST /device/device-123",
-		"GET /device/complete",
 		"POST /oauth2/token",
 		"GET /_matrix/client/v3/account/whoami",
 	} {
@@ -425,10 +414,8 @@ func TestApproveDeviceAuthorizationRejectsUnexpectedSameOriginLanding(t *testing
 	}
 	s := &session{baseURL: base.String(), httpClient: &http.Client{CheckRedirect: registrationRedirectPolicy(base)}}
 	err = s.approveDeviceAuthorization(context.Background(), "user-123")
-	if err == nil || !strings.Contains(err.Error(), "did not redirect to consent") {
-		if err == nil || !strings.Contains(err.Error(), "expected flow") {
-			t.Fatalf("approveDeviceAuthorization error = %v, want unexpected same-origin landing rejection", err)
-		}
+	if err == nil || registrationfailure.Code(err) != "device_consent/protocol" {
+		t.Fatalf("approveDeviceAuthorization error = %v, want unexpected same-origin landing rejection", err)
 	}
 }
 
@@ -449,7 +436,7 @@ func TestRegisterAndAuthorizeDeviceRejectsOffOriginRedirect(t *testing.T) {
 	defer mas.Close()
 
 	err := runRegistration(t, mas.URL)
-	if err == nil || !strings.Contains(err.Error(), "redirected outside its configured origin") {
+	if err == nil || registrationfailure.Code(err) != "registration_form/protocol" {
 		t.Fatalf("registration error = %v, want off-origin redirect rejection", err)
 	}
 	if offOriginRequests != 0 {
@@ -465,7 +452,7 @@ func TestRegisterAndAuthorizeDeviceRejectsOffOriginBackend(t *testing.T) {
 	_, err := NewClient(mas.URL).RegisterAndAuthorizeDevice(
 		context.Background(), "alice", "generated-password", "DEVICE-12345", "https://backend.example",
 	)
-	if err == nil || !strings.Contains(err.Error(), "same origin") {
+	if err == nil || registrationfailure.Code(err) != "internal/invariant" {
 		t.Fatalf("registration error = %v, want same-origin rejection", err)
 	}
 	if requests != 0 {
@@ -502,7 +489,7 @@ func TestRegisterAndAuthorizeDeviceRejectsProviderChoicePage(t *testing.T) {
 	defer mas.Close()
 
 	err := runRegistration(t, mas.URL)
-	if err == nil || !strings.Contains(err.Error(), "password-registration form") {
+	if err == nil || registrationfailure.Code(err) != "registration_form/protocol" {
 		t.Fatalf("registration error = %v, want provider-choice rejection", err)
 	}
 	if passwordPosts != 0 {
@@ -548,7 +535,7 @@ func TestRegisterAndAuthorizeDeviceRejectsIncompleteRegistrationAtBasePath(t *te
 	_, err := NewClient(mas.URL+prefix).RegisterAndAuthorizeDevice(
 		context.Background(), "alice", "generated-password", "DEVICE-12345", mas.URL,
 	)
-	if err == nil || !strings.Contains(err.Error(), "registration did not complete") {
+	if err == nil || registrationfailure.Code(err) != "registration_display_name/protocol" {
 		t.Fatalf("registration error = %v, want incomplete registration rejection", err)
 	}
 }
@@ -558,10 +545,10 @@ func TestOAuthRetriesHonorCanceledContext(t *testing.T) {
 	cancel()
 	s := &session{baseURL: "http://127.0.0.1:1"}
 	device := &deviceAuthorization{DeviceCode: "code", UserCode: "user", ExpiresIn: 60, Interval: 1}
-	if _, err := s.pollDeviceToken(ctx, "client", device); !errors.Is(err, context.Canceled) {
+	if _, err := s.pollDeviceToken(ctx, "client", device); !errors.Is(err, context.Canceled) || registrationfailure.Code(err) != "device_token/cancelled" {
 		t.Fatalf("poll error = %v, want context canceled", err)
 	}
-	if _, _, err := s.whoAmI(ctx, "http://127.0.0.1:1", "token"); !errors.Is(err, context.Canceled) {
+	if _, _, err := s.whoAmI(ctx, "http://127.0.0.1:1", "token"); !errors.Is(err, context.Canceled) || registrationfailure.Code(err) != "identity/cancelled" {
 		t.Fatalf("whoami error = %v, want context canceled", err)
 	}
 }
@@ -574,6 +561,56 @@ type flakyTransport struct {
 type errorTransport struct{ err error }
 
 func (t errorTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, t.err }
+
+type cancelOnCloseBody struct {
+	io.Reader
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnCloseBody) Close() error {
+	b.cancel()
+	return nil
+}
+
+type retryCancelTransport struct {
+	status int
+	cancel context.CancelFunc
+}
+
+func (t retryCancelTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: t.status,
+		Header:     make(http.Header),
+		Body:       &cancelOnCloseBody{Reader: strings.NewReader("retry"), cancel: t.cancel},
+	}, nil
+}
+
+type cancelRequestTransport struct{ cancel context.CancelFunc }
+
+func (t cancelRequestTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	t.cancel()
+	return nil, errors.New("transport error contains secret=must-not-escape")
+}
+
+type trackingBody struct {
+	closed bool
+}
+
+func (b *trackingBody) Read([]byte) (int, error) { return 0, io.EOF }
+func (b *trackingBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+type unexpectedStatusTransport struct{ body *trackingBody }
+
+func (t unexpectedStatusTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Header:     make(http.Header),
+		Body:       t.body,
+	}, nil
+}
 
 func (t *flakyTransport) RoundTrip(*http.Request) (*http.Response, error) {
 	t.calls++
@@ -600,6 +637,54 @@ func TestOAuthRetriesTransientTransportErrors(t *testing.T) {
 	userID, deviceID, err := s.whoAmI(context.Background(), "https://mas.example", "access")
 	if err != nil || userID != "@agent:telecrypt.io" || deviceID != "DEVICE-12345" || whoamiTransport.calls != 2 {
 		t.Fatalf("whoami result = %q, %q, %v, calls = %d", userID, deviceID, err, whoamiTransport.calls)
+	}
+}
+
+func TestOAuthRetryCancellationPreservesDeviceTokenStage(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusBadGateway} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			s := &session{
+				baseURL: "https://mas.example",
+				publicHTTPClient: &http.Client{Transport: retryCancelTransport{
+					status: status,
+					cancel: cancel,
+				}},
+			}
+			_, err := s.pollDeviceToken(ctx, "client", &deviceAuthorization{DeviceCode: "code", UserCode: "user", ExpiresIn: 60, Interval: 1})
+			if !errors.Is(err, context.Canceled) || registrationfailure.Code(err) != "device_token/cancelled" {
+				t.Fatalf("poll error = %v, want device_token/cancelled", err)
+			}
+		})
+	}
+}
+
+func TestWhoAmICancellationPreservesIdentityStage(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &session{
+		baseURL:          "https://mas.example",
+		publicHTTPClient: &http.Client{Transport: cancelRequestTransport{cancel: cancel}},
+	}
+	_, _, err := s.whoAmI(ctx, "https://mas.example", "access")
+	if !errors.Is(err, context.Canceled) || registrationfailure.Code(err) != "identity/cancelled" {
+		t.Fatalf("whoami error = %v, want identity/cancelled", err)
+	}
+}
+
+func TestWhoAmIClosesBodyBeforeUnexpectedStatusReturn(t *testing.T) {
+	body := &trackingBody{}
+	s := &session{
+		baseURL:          "https://mas.example",
+		publicHTTPClient: &http.Client{Transport: unexpectedStatusTransport{body: body}},
+	}
+	_, _, err := s.whoAmI(context.Background(), "https://mas.example", "access")
+	if err == nil || registrationfailure.Code(err) != "identity/upstream" {
+		t.Fatalf("whoami error = %v, want identity/upstream", err)
+	}
+	if !body.closed {
+		t.Fatal("whoami did not close response body before returning unexpected status")
 	}
 }
 

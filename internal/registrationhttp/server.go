@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/TeleCrypt-io/controlplane/internal/agent"
+	"github.com/TeleCrypt-io/controlplane/internal/registrationfailure"
 )
 
 // provisioner is the subset of *agent.Provisioner the server needs. Defined here so tests can
@@ -29,6 +30,8 @@ type Server struct {
 }
 
 const maxRegistrationBodyBytes = 4096
+
+const registrationErrorHeader = "Telecrypt-Registration-Error"
 
 func New(p provisioner, rl *RateLimiter, planURL string) *Server {
 	s := &Server{
@@ -64,6 +67,7 @@ type registrationResponse struct {
 // in-memory backstop; client-facing fairness belongs at the network boundary.
 func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Del(registrationErrorHeader)
 	if r.Body != nil {
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxRegistrationBodyBytes+1))
 		if err != nil || len(body) != 0 {
@@ -81,9 +85,11 @@ func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	result, err := s.provisioner.ProvisionAgent(ctx)
 	if err != nil {
-		// Provisioning errors may contain third-party form text or generated identifiers. Do not
-		// risk logging any part of the one-time credential exchange.
-		slog.Error("registration: provisioning failed")
+		// Provisioning errors may contain third-party form text or generated identifiers. The
+		// typed code is the sole diagnostic crossing this boundary; never log or return err.
+		code := registrationfailure.Code(err)
+		w.Header().Set(registrationErrorHeader, code)
+		slog.Error("registration: provisioning failed", "code", code)
 		http.Error(w, "provisioning failed", http.StatusInternalServerError)
 		return
 	}
@@ -104,6 +110,6 @@ func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		slog.Error("registration: failed to write response", "error", err)
+		slog.Error("registration: failed to write response", "code", registrationfailure.Code(registrationfailure.WithKind(registrationfailure.StageInternal, registrationfailure.KindInternal, err)))
 	}
 }

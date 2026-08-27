@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/TeleCrypt-io/controlplane/internal/masreg"
+	"github.com/TeleCrypt-io/controlplane/internal/registrationfailure"
 )
 
 type fakeMASReg struct {
@@ -71,7 +72,7 @@ func TestProvisionAgentRejectsForeignMXIDServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProvisioner: %v", err)
 	}
-	if _, err := p.ProvisionAgent(context.Background()); err == nil || !strings.Contains(err.Error(), "unexpected user_id") {
+	if _, err := p.ProvisionAgent(context.Background()); err == nil || registrationfailure.Code(err) != "identity/invariant" {
 		t.Fatalf("ProvisionAgent foreign MXID error = %v, want exact-server rejection", err)
 	}
 }
@@ -210,7 +211,9 @@ func (f *fakeMASServer) devicePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.approved = true
-	http.Redirect(w, r, "/device/complete", http.StatusSeeOther)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("<html><body>device linked</body></html>"))
 }
 func (f *fakeMASServer) tokenPost(w http.ResponseWriter, r *http.Request) {
 	if !f.approved || r.FormValue("grant_type") != "urn:ietf:params:oauth:grant-type:device_code" || r.FormValue("device_code") != "device-code" || r.FormValue("client_id") != "dynamic-client" || r.FormValue("client_secret") != "" {

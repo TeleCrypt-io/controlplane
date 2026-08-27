@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/TeleCrypt-io/controlplane/internal/agent"
+	"github.com/TeleCrypt-io/controlplane/internal/registrationfailure"
 )
 
 type fakeProvisioner struct {
@@ -44,11 +45,17 @@ func TestHandleRegistration_DoesNotLogProvisioningError(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 	secret := "generated-password-must-not-appear"
-	s := New(&fakeProvisioner{err: errors.New(secret)}, NewRateLimiter(60, time.Minute), "https://telecrypt.io/plan")
+	s := New(&fakeProvisioner{err: registrationfailure.WithKind(registrationfailure.StageDeviceConsent, registrationfailure.KindUpstream, errors.New(secret))}, NewRateLimiter(60, time.Minute), "https://telecrypt.io/plan")
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest("POST", "/agents", nil))
 	if strings.Contains(logs.String(), secret) {
 		t.Fatalf("provisioning log leaked secret: %s", logs.String())
+	}
+	if got, want := w.Header().Get(registrationErrorHeader), "device_consent/upstream"; got != want {
+		t.Fatalf("registration error header = %q, want %q", got, want)
+	}
+	if strings.Contains(w.Body.String(), secret) {
+		t.Fatalf("provisioning response leaked secret: %s", w.Body.String())
 	}
 }
 
@@ -99,6 +106,9 @@ func TestHandleRegistration_HappyPath(t *testing.T) {
 	if w.Header().Get("Cache-Control") != "no-store" {
 		t.Errorf("Cache-Control = %q, want no-store", w.Header().Get("Cache-Control"))
 	}
+	if got := w.Header().Get(registrationErrorHeader); got != "" {
+		t.Fatalf("successful response has registration error header %q", got)
+	}
 	plan, ok := resp["plan_url"]
 	if !ok {
 		t.Fatal("response must contain plan_url — guidance for attaching to a paid plan")
@@ -123,7 +133,7 @@ func TestHandleRegistration_RejectsNonEmptyBody(t *testing.T) {
 }
 
 func TestHandleRegistration_ProvisioningFails(t *testing.T) {
-	p := &fakeProvisioner{err: errors.New("mas unreachable")}
+	p := &fakeProvisioner{err: registrationfailure.WithKind(registrationfailure.StageOAuthClient, registrationfailure.KindTransport, errors.New("mas unreachable"))}
 	s := New(p, NewRateLimiter(60, time.Minute), "https://backend.telecrypt.io/plan")
 
 	req := httptest.NewRequest("POST", "/agents", nil)
@@ -135,6 +145,9 @@ func TestHandleRegistration_ProvisioningFails(t *testing.T) {
 	}
 	if w.Header().Get("Cache-Control") != "no-store" {
 		t.Errorf("Cache-Control = %q, want no-store", w.Header().Get("Cache-Control"))
+	}
+	if got, want := w.Header().Get(registrationErrorHeader), "oauth_client/transport"; got != want {
+		t.Errorf("registration error header = %q, want %q", got, want)
 	}
 }
 
@@ -155,7 +168,52 @@ func TestHandleRegistration_RateLimited(t *testing.T) {
 	if w2.Code != 429 {
 		t.Errorf("second global call: status = %d, want 429", w2.Code)
 	}
+	if got := w2.Header().Get(registrationErrorHeader); got != "" {
+		t.Errorf("rate-limited response has registration error header %q", got)
+	}
 	if p.calls != 1 {
 		t.Errorf("provisioner should not be called once rate-limited, calls = %d", p.calls)
+	}
+}
+
+func TestHandleRegistration_MapsEveryBoundedStageAndKind(t *testing.T) {
+	stages := []registrationfailure.Stage{
+		registrationfailure.StageLocalGeneration,
+		registrationfailure.StageRegistrationForm,
+		registrationfailure.StageRegistrationPassword,
+		registrationfailure.StageRegistrationDisplayName,
+		registrationfailure.StageOAuthClient,
+		registrationfailure.StageDeviceAuthorization,
+		registrationfailure.StageDeviceConsent,
+		registrationfailure.StageDeviceToken,
+		registrationfailure.StageIdentity,
+		registrationfailure.StageInternal,
+	}
+	kinds := []registrationfailure.Kind{
+		registrationfailure.KindTimeout,
+		registrationfailure.KindCancelled,
+		registrationfailure.KindTransport,
+		registrationfailure.KindUpstream,
+		registrationfailure.KindProtocol,
+		registrationfailure.KindInvariant,
+		registrationfailure.KindInternal,
+	}
+	for _, stage := range stages {
+		for _, kind := range kinds {
+			t.Run(string(stage)+"/"+string(kind), func(t *testing.T) {
+				const secret = "credential=must-not-escape"
+				p := &fakeProvisioner{err: registrationfailure.WithKind(stage, kind, errors.New(secret))}
+				s := New(p, NewRateLimiter(60, time.Minute), "https://telecrypt.io/plan")
+				w := httptest.NewRecorder()
+				s.ServeHTTP(w, httptest.NewRequest("POST", "/agents", nil))
+				want := string(stage) + "/" + string(kind)
+				if w.Code != http.StatusInternalServerError || w.Header().Get(registrationErrorHeader) != want {
+					t.Fatalf("response = %d, header %q, want 500/%q", w.Code, w.Header().Get(registrationErrorHeader), want)
+				}
+				if strings.Contains(w.Body.String(), secret) {
+					t.Fatalf("response leaked secret: %s", w.Body.String())
+				}
+			})
+		}
 	}
 }

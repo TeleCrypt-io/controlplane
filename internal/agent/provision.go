@@ -5,10 +5,13 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"strings"
+
+	"github.com/TeleCrypt-io/controlplane/internal/registrationfailure"
 )
 
 type Provisioned struct {
@@ -78,26 +81,29 @@ func isLoopbackHost(u *url.URL) bool {
 func (p *Provisioner) ProvisionAgent(ctx context.Context) (*Provisioned, error) {
 	localpart, err := randomLocalpart()
 	if err != nil {
-		return nil, fmt.Errorf("generate localpart: %w", err)
+		return nil, registrationfailure.Wrap(registrationfailure.StageLocalGeneration, fmt.Errorf("generate localpart: %w", err))
 	}
 	mxid := fmt.Sprintf("@%s:%s", localpart, p.serverName)
 
 	password, err := randomPassword()
 	if err != nil {
-		return nil, fmt.Errorf("generate password: %w", err)
+		return nil, registrationfailure.Wrap(registrationfailure.StageLocalGeneration, fmt.Errorf("generate password: %w", err))
 	}
 
 	deviceID, err := randomDeviceID()
 	if err != nil {
-		return nil, fmt.Errorf("generate device id: %w", err)
+		return nil, registrationfailure.Wrap(registrationfailure.StageLocalGeneration, fmt.Errorf("generate device id: %w", err))
 	}
 
 	tokens, err := p.masReg.RegisterAndAuthorizeDevice(ctx, localpart, password, deviceID, p.backendPublicURL)
 	if err != nil {
-		return nil, fmt.Errorf("MAS public registration and OAuth device authorization: %w", err)
+		return nil, registrationfailure.Wrap(registrationfailure.StageInternal, fmt.Errorf("MAS public registration and OAuth device authorization: %w", err))
+	}
+	if tokens == nil {
+		return nil, registrationfailure.WithKind(registrationfailure.StageInternal, registrationfailure.KindInvariant, errors.New("MAS registration returned no token set"))
 	}
 	if tokens.UserID != mxid {
-		return nil, fmt.Errorf("OAuth token returned unexpected user_id %q, want %q", tokens.UserID, mxid)
+		return nil, registrationfailure.WithKind(registrationfailure.StageIdentity, registrationfailure.KindInvariant, errors.New("OAuth token returned unexpected user_id"))
 	}
 
 	return &Provisioned{

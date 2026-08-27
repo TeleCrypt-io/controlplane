@@ -26,9 +26,10 @@
 //   - templates/pages/register/password.html, templates/pages/register/steps/display_name.html —
 //     exact input names, including the hidden "csrf" and "action" fields.
 //
-// Every step's success response is a 303 redirect. net/http.Client's default redirect policy
-// converts a POST into a followed GET on a 303, so the registration part of
-// RegisterAndAuthorizeDevice issues one explicit HTTP call per logical step and lets the client
+// Registration form steps succeed through 303 redirects. The device-consent POST is the
+// exception: MAS 1.23 returns a 200 HTML response on the same consent route. net/http.Client's
+// default redirect policy converts a POST into a followed GET on a 303, so the registration part
+// of RegisterAndAuthorizeDevice issues one explicit HTTP call per logical step and lets the client
 // follow the intermediate hops transparently — the same way a browser would.
 package masreg
 
@@ -50,6 +51,7 @@ import (
 	"unicode"
 
 	"github.com/TeleCrypt-io/controlplane/internal/jsonbody"
+	"github.com/TeleCrypt-io/controlplane/internal/registrationfailure"
 )
 
 // Client drives the registration flow against one MAS deployment. Safe for concurrent use: each
@@ -190,10 +192,10 @@ func (c *Client) RegisterAndAuthorizeDevice(
 ) (*DeviceTokens, error) {
 	if !validRegistrationUsername(username) || !validMASField(password, maxMASOAuthFieldBytes) ||
 		!validMatrixDeviceID(deviceID) {
-		return nil, fmt.Errorf("registration identity or credential is invalid")
+		return nil, registrationfailure.WithKind(registrationfailure.StageInternal, registrationfailure.KindInvariant, errors.New("registration identity or credential is invalid"))
 	}
 	if err := validateSameOrigin(c.baseURL, clientURI); err != nil {
-		return nil, err
+		return nil, registrationfailure.WithKind(registrationfailure.StageInternal, registrationfailure.KindInvariant, err)
 	}
 	s, err := c.registerSession(ctx, username, password)
 	if err != nil {
@@ -223,7 +225,7 @@ func (c *Client) RegisterAndAuthorizeDevice(
 		return nil, fmt.Errorf("validate OAuth token identity: %w", err)
 	}
 	if returnedDeviceID != deviceID {
-		return nil, fmt.Errorf("OAuth token returned unexpected device_id %q", returnedDeviceID)
+		return nil, registrationfailure.WithKind(registrationfailure.StageIdentity, registrationfailure.KindInvariant, errors.New("OAuth token returned unexpected device_id"))
 	}
 	tokens.UserID = userID
 	return tokens, nil
@@ -233,7 +235,7 @@ func (c *Client) registerSession(ctx context.Context, username, password string)
 	jar, _ := cookiejar.New(nil) // nil PublicSuffixList: this client only ever talks to one host
 	base, err := url.Parse(c.baseURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse MAS base URL: %w", err)
+		return nil, registrationfailure.WithKind(registrationfailure.StageInternal, registrationfailure.KindInvariant, err)
 	}
 	s := &session{baseURL: c.baseURL}
 	s.httpClient = &http.Client{
@@ -335,7 +337,9 @@ func validRegistrationTransition(base *url.URL, method string, from, to *url.URL
 			return targetOK && toID == fromID && toStep == "finish"
 		}
 		if isDeviceConsentRelativePath(fromPath) {
-			return toPath == "/device/complete"
+			// MAS 1.23 completes consent with HTTP 200 on the same route. A redirect to
+			// /device/complete is not an upstream contract and must remain rejected.
+			return false
 		}
 		return !ok && fromPath == "/link" && isDeviceConsentRelativePath(toPath)
 	default:
@@ -409,15 +413,15 @@ func noProxyTransport() http.RoundTripper {
 
 func (c *session) register(ctx context.Context, username, password string) error {
 	// Step 1: GET /register -> (redirect, followed automatically) -> /register/password form.
-	csrf, formURL, body, err := c.getForm(ctx, c.baseURL+"/register")
+	csrf, formURL, _, err := c.getForm(ctx, c.baseURL+"/register")
 	if err != nil {
-		return fmt.Errorf("masreg: load register form: %w", err)
+		return registrationfailure.Wrap(registrationfailure.StageRegistrationForm, fmt.Errorf("masreg: load register form: %w", err))
 	}
 	if !c.isRegistrationPath(formURL.Path) || !strings.HasSuffix(formURL.Path, "/register/password") {
-		return errors.New("masreg: expected the password-registration form; is an upstream OAuth provider configured?")
+		return registrationfailure.Wrap(registrationfailure.StageRegistrationForm, registrationfailure.Protocol(errors.New("masreg: expected the password-registration form; is an upstream OAuth provider configured?")))
 	}
 	if !validMASField(csrf, maxMASOAuthFieldBytes) {
-		return fmt.Errorf("masreg: no valid csrf token found on the password registration page: %s", sniffError(body))
+		return registrationfailure.Wrap(registrationfailure.StageRegistrationForm, registrationfailure.Protocol(errors.New("masreg: no valid csrf token found on the password registration page")))
 	}
 
 	// Step 2: POST /register/password. Field names from password.html / password.rs's
@@ -430,15 +434,15 @@ func (c *session) register(ctx context.Context, username, password string) error
 		"password_confirm": {password},
 		"accept_terms":     {"on"}, // no-op if this deployment has no tos_uri configured
 	}
-	csrf, formURL, body, err = c.postForm(ctx, formURL.String(), form)
+	csrf, formURL, _, err = c.postForm(ctx, formURL.String(), form)
 	if err != nil {
-		return fmt.Errorf("masreg: submit password form: %w", err)
+		return registrationfailure.Wrap(registrationfailure.StageRegistrationPassword, fmt.Errorf("masreg: submit password form: %w", err))
 	}
 	if !c.isRegistrationPath(formURL.Path) || !strings.Contains(formURL.Path, "/register/steps/") || !strings.HasSuffix(formURL.Path, "/display-name") {
-		return fmt.Errorf("masreg: password registration did not reach the expected display-name step: %s", sniffError(body))
+		return registrationfailure.Wrap(registrationfailure.StageRegistrationPassword, registrationfailure.Protocol(errors.New("masreg: password registration did not reach the expected display-name step")))
 	}
 	if !validMASField(csrf, maxMASOAuthFieldBytes) {
-		return fmt.Errorf("masreg: no valid csrf token found on the display-name step page: %s", sniffError(body))
+		return registrationfailure.Wrap(registrationfailure.StageRegistrationPassword, registrationfailure.Protocol(errors.New("masreg: no valid csrf token found on the display-name step page")))
 	}
 
 	// Step 3: POST .../display-name with action=skip (display_name.rs: skip defaults the
@@ -448,13 +452,13 @@ func (c *session) register(ctx context.Context, username, password string) error
 		"csrf":   {csrf},
 		"action": {"skip"},
 	}
-	_, formURL, body, err = c.postForm(ctx, formURL.String(), form)
+	_, formURL, _, err = c.postForm(ctx, formURL.String(), form)
 	if err != nil {
-		return fmt.Errorf("masreg: submit display-name step: %w", err)
+		return registrationfailure.Wrap(registrationfailure.StageRegistrationDisplayName, fmt.Errorf("masreg: submit display-name step: %w", err))
 	}
 	relativePath, completionOK := relativeMASPath(mustParseURL(c.baseURL), formURL)
 	if c.isRegistrationPath(formURL.Path) || !completionOK || !isRegistrationCompletionPath(relativePath) {
-		return fmt.Errorf("masreg: registration did not complete at the expected landing page: %s", sniffError(body))
+		return registrationfailure.Wrap(registrationfailure.StageRegistrationDisplayName, registrationfailure.Protocol(errors.New("masreg: registration did not complete at the expected landing page")))
 	}
 
 	return nil
@@ -481,7 +485,7 @@ type deviceAuthorization struct {
 
 func (s *session) registerPublicNativeClient(ctx context.Context, clientURI string) (string, error) {
 	if !validMASField(clientURI, maxMASOAuthFieldBytes) {
-		return "", fmt.Errorf("client_uri is invalid or too large")
+		return "", registrationfailure.Wrap(registrationfailure.StageOAuthClient, registrationfailure.Invariant(errors.New("client_uri is invalid or too large")))
 	}
 	payload := struct {
 		ClientName              string   `json:"client_name"`
@@ -505,39 +509,39 @@ func (s *session) registerPublicNativeClient(ctx context.Context, clientURI stri
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
-		return "", err
+		return "", registrationfailure.Wrap(registrationfailure.StageOAuthClient, err)
 	}
 	// MAS 1.23.0's DynamicClientRegistration route is /oauth2/registration. The grant types
 	// are explicit: MAS otherwise defaults to authorization_code, which cannot issue this device
 	// grant or its refresh token.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/oauth2/registration", bytes.NewReader(b))
 	if err != nil {
-		return "", err
+		return "", registrationfailure.Wrap(registrationfailure.StageOAuthClient, registrationfailure.Invariant(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.publicClient().Do(req)
 	if err != nil {
-		return "", boundedMASRequestError(ctx, "register public OAuth client", err)
+		return "", registrationfailure.Wrap(registrationfailure.StageOAuthClient, boundedMASRequestError(ctx, "register public OAuth client", err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return "", unexpectedStatus(resp)
+		return "", registrationfailure.Wrap(registrationfailure.StageOAuthClient, unexpectedStatus(resp))
 	}
 	var out struct {
 		ClientID string `json:"client_id"`
 	}
 	if err := jsonbody.Decode(resp.Body, maxMASJSONBodyBytes, &out); err != nil {
-		return "", fmt.Errorf("decode OAuth client response failed")
+		return "", registrationfailure.Wrap(registrationfailure.StageOAuthClient, registrationfailure.Protocol(errors.New("decode OAuth client response failed")))
 	}
 	if !validMASField(out.ClientID, maxMASOAuthFieldBytes) {
-		return "", fmt.Errorf("response has no client_id")
+		return "", registrationfailure.Wrap(registrationfailure.StageOAuthClient, registrationfailure.Protocol(errors.New("response has no client_id")))
 	}
 	return out.ClientID, nil
 }
 
 func (s *session) startDeviceAuthorization(ctx context.Context, clientID, deviceID string) (*deviceAuthorization, error) {
 	if !validMASField(clientID, maxMASOAuthFieldBytes) || !validMASField(deviceID, maxMatrixIdentityBytes) {
-		return nil, fmt.Errorf("device authorization identity is invalid")
+		return nil, registrationfailure.Wrap(registrationfailure.StageDeviceAuthorization, registrationfailure.Invariant(errors.New("device authorization identity is invalid")))
 	}
 	form := url.Values{
 		"client_id": {clientID},
@@ -545,29 +549,29 @@ func (s *session) startDeviceAuthorization(ctx context.Context, clientID, device
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/oauth2/device", strings.NewReader(form.Encode()))
 	if err != nil {
-		return nil, err
+		return nil, registrationfailure.Wrap(registrationfailure.StageDeviceAuthorization, registrationfailure.Invariant(err))
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := s.publicClient().Do(req)
 	if err != nil {
-		return nil, boundedMASRequestError(ctx, "start device authorization", err)
+		return nil, registrationfailure.Wrap(registrationfailure.StageDeviceAuthorization, boundedMASRequestError(ctx, "start device authorization", err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, unexpectedStatus(resp)
+		return nil, registrationfailure.Wrap(registrationfailure.StageDeviceAuthorization, unexpectedStatus(resp))
 	}
 	var out deviceAuthorization
 	if err := jsonbody.Decode(resp.Body, maxMASJSONBodyBytes, &out); err != nil {
-		return nil, fmt.Errorf("decode device authorization response failed")
+		return nil, registrationfailure.Wrap(registrationfailure.StageDeviceAuthorization, registrationfailure.Protocol(errors.New("decode device authorization response failed")))
 	}
 	if !validMASField(out.DeviceCode, maxMASOAuthFieldBytes) || !validMASField(out.UserCode, maxMASOAuthFieldBytes) || out.ExpiresIn <= 0 || out.ExpiresIn > int(maxMASDeviceLifetime/time.Second) {
-		return nil, fmt.Errorf("response is missing device authorization fields")
+		return nil, registrationfailure.Wrap(registrationfailure.StageDeviceAuthorization, registrationfailure.Protocol(errors.New("response is missing device authorization fields")))
 	}
 	if out.Interval <= 0 {
 		out.Interval = 5
 	}
 	if out.Interval > int(maxMASDeviceInterval/time.Second) {
-		return nil, fmt.Errorf("response has an invalid polling interval")
+		return nil, registrationfailure.Wrap(registrationfailure.StageDeviceAuthorization, registrationfailure.Protocol(errors.New("response has an invalid polling interval")))
 	}
 	return &out, nil
 }
@@ -580,44 +584,46 @@ func (s *session) approveDeviceAuthorization(ctx context.Context, userCode strin
 	// templates/pages/device_link.html in matrix-authentication-service v1.23.0.
 	linkURL, err := url.Parse(s.baseURL + "/link")
 	if err != nil {
-		return fmt.Errorf("parse device link URL: %w", err)
+		return registrationfailure.Wrap(registrationfailure.StageDeviceConsent, registrationfailure.Invariant(err))
 	}
-	csrf, formURL, body, err := s.getForm(ctx, linkURL.String())
+	csrf, formURL, _, err := s.getForm(ctx, linkURL.String())
 	if err != nil {
-		return fmt.Errorf("load device link: %w", err)
+		return registrationfailure.Wrap(registrationfailure.StageDeviceConsent, fmt.Errorf("load device link: %w", err))
 	}
 	if formURL == nil || formURL.Path != linkURL.Path {
-		return fmt.Errorf("device link form landed outside the expected path: %s", sniffError(body))
+		return registrationfailure.Wrap(registrationfailure.StageDeviceConsent, registrationfailure.Protocol(errors.New("device link form landed outside the expected path")))
 	}
 	if !validMASField(csrf, maxMASOAuthFieldBytes) {
-		return fmt.Errorf("no valid csrf token found on device link form: %s", sniffError(body))
+		return registrationfailure.Wrap(registrationfailure.StageDeviceConsent, registrationfailure.Protocol(errors.New("no valid csrf token found on device link form")))
 	}
-	csrf, consentURL, body, err := s.postForm(ctx, formURL.String(), url.Values{
+	csrf, consentURL, _, err := s.postForm(ctx, formURL.String(), url.Values{
 		"csrf": {csrf},
 		"code": {userCode},
 	})
 	if err != nil {
-		return fmt.Errorf("submit device code: %w", err)
+		return registrationfailure.Wrap(registrationfailure.StageDeviceConsent, fmt.Errorf("submit device code: %w", err))
 	}
 	if consentURL == nil || !s.isDeviceConsentPath(consentURL.Path) {
-		return fmt.Errorf("device link did not redirect to the expected consent path: %s", sniffError(body))
+		return registrationfailure.Wrap(registrationfailure.StageDeviceConsent, registrationfailure.Protocol(errors.New("device link did not redirect to the expected consent path")))
 	}
 	if !validMASField(csrf, maxMASOAuthFieldBytes) {
-		return fmt.Errorf("no valid csrf token found on device consent page: %s", sniffError(body))
+		return registrationfailure.Wrap(registrationfailure.StageDeviceConsent, registrationfailure.Protocol(errors.New("no valid csrf token found on device consent page")))
 	}
-	_, completionURL, body, err := s.postForm(ctx, consentURL.String(), url.Values{
+	_, completionURL, _, err := s.postForm(ctx, consentURL.String(), url.Values{
 		"csrf":           {csrf},
 		"confirm_device": {"on"},
 		"action":         {"consent"},
 	})
 	if err != nil {
-		return fmt.Errorf("submit device consent: %w", err)
+		return registrationfailure.Wrap(registrationfailure.StageDeviceConsent, fmt.Errorf("submit device consent: %w", err))
 	}
-	relativePath, completionOK := relativeMASPath(mustParseURL(s.baseURL), completionURL)
-	// /device/complete is the sole completion location in the current MAS 1.23 fixture. Keep
-	// this fail-closed until the required disposable exact-image release test observes a change.
-	if !completionOK || relativePath != "/device/complete" {
-		return fmt.Errorf("device consent did not complete at the expected landing page: %s", sniffError(body))
+	consentPath, consentOK := relativeMASPath(mustParseURL(s.baseURL), consentURL)
+	completionPath, completionOK := relativeMASPath(mustParseURL(s.baseURL), completionURL)
+	// MAS 1.23 completes consent with HTTP 200 HTML on the same /device/{id} route. The
+	// request helper has already rejected non-200 responses and unsafe URLs; this explicit
+	// same-route check rejects fabricated completion redirects while retaining fail-closed flow.
+	if !consentOK || !completionOK || consentPath != completionPath {
+		return registrationfailure.Wrap(registrationfailure.StageDeviceConsent, registrationfailure.Protocol(errors.New("device consent did not complete on the consent route")))
 	}
 	return nil
 }
@@ -640,7 +646,7 @@ func (s *session) isDeviceConsentPath(path string) bool {
 
 func (s *session) pollDeviceToken(ctx context.Context, clientID string, device *deviceAuthorization) (*DeviceTokens, error) {
 	if device == nil || !validMASField(clientID, maxMASOAuthFieldBytes) || !validMASField(device.DeviceCode, maxMASOAuthFieldBytes) || !validMASField(device.UserCode, maxMASOAuthFieldBytes) || device.ExpiresIn <= 0 || device.ExpiresIn > int(maxMASDeviceLifetime/time.Second) || device.Interval <= 0 || device.Interval > int(maxMASDeviceInterval/time.Second) {
-		return nil, fmt.Errorf("invalid device authorization state")
+		return nil, registrationfailure.Wrap(registrationfailure.StageDeviceToken, registrationfailure.Invariant(errors.New("invalid device authorization state")))
 	}
 	deadline := time.Now().Add(time.Duration(device.ExpiresIn) * time.Second)
 	interval := time.Duration(device.Interval) * time.Second
@@ -652,16 +658,16 @@ func (s *session) pollDeviceToken(ctx context.Context, clientID string, device *
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/oauth2/token", strings.NewReader(form.Encode()))
 		if err != nil {
-			return nil, err
+			return nil, registrationfailure.Wrap(registrationfailure.StageDeviceToken, registrationfailure.Invariant(err))
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		resp, err := s.publicClient().Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, ctx.Err()
+				return nil, registrationfailure.Wrap(registrationfailure.StageDeviceToken, ctx.Err())
 			}
 			if err := waitForRetry(ctx, interval, deadline); err != nil {
-				return nil, err
+				return nil, registrationfailure.Wrap(registrationfailure.StageDeviceToken, err)
 			}
 			continue
 		}
@@ -682,38 +688,38 @@ func (s *session) pollDeviceToken(ctx context.Context, clientID string, device *
 		decodeErr := jsonbody.Decode(resp.Body, maxMASJSONBodyBytes, &out)
 		resp.Body.Close()
 		if decodeErr != nil {
-			return nil, fmt.Errorf("decode token response failed")
+			return nil, registrationfailure.Wrap(registrationfailure.StageDeviceToken, registrationfailure.Protocol(errors.New("decode token response failed")))
 		}
 		if resp.StatusCode == http.StatusOK {
 			if !validMASField(out.AccessToken, maxMASOAuthFieldBytes) || !validMASField(out.RefreshToken, maxMASOAuthFieldBytes) || out.ExpiresIn <= 0 || out.ExpiresIn > int(maxMASAccessLifetime/time.Second) {
-				return nil, fmt.Errorf("token response is missing access_token, refresh_token, or expires_in")
+				return nil, registrationfailure.Wrap(registrationfailure.StageDeviceToken, registrationfailure.Protocol(errors.New("token response is missing access_token, refresh_token, or expires_in")))
 			}
 			return &DeviceTokens{AccessToken: out.AccessToken, RefreshToken: out.RefreshToken, ExpiresIn: out.ExpiresIn}, nil
 		}
 		if out.Error != "authorization_pending" && out.Error != "slow_down" {
-			return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
+			return nil, registrationfailure.Wrap(registrationfailure.StageDeviceToken, registrationfailure.Upstream(errors.New("unexpected token response")))
 		}
 		if out.Error == "slow_down" {
 			if interval > maxMASDeviceInterval-5*time.Second {
-				return nil, fmt.Errorf("device authorization polling interval exceeded limit")
+				return nil, registrationfailure.Wrap(registrationfailure.StageDeviceToken, registrationfailure.Protocol(errors.New("device authorization polling interval exceeded limit")))
 			}
 			interval += 5 * time.Second
 		}
 		if err := waitForRetry(ctx, interval, deadline); err != nil {
-			return nil, err
+			return nil, registrationfailure.Wrap(registrationfailure.StageDeviceToken, err)
 		}
 	}
 }
 
 func waitForRetry(ctx context.Context, interval time.Duration, deadline time.Time) error {
 	if time.Now().Add(interval).After(deadline) {
-		return fmt.Errorf("device authorization expired")
+		return registrationfailure.WithKind(registrationfailure.StageDeviceToken, registrationfailure.KindTimeout, errors.New("device authorization expired"))
 	}
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return registrationfailure.Wrap(registrationfailure.StageDeviceToken, ctx.Err())
 	case <-timer.C:
 		return nil
 	}
@@ -721,14 +727,14 @@ func waitForRetry(ctx context.Context, interval time.Duration, deadline time.Tim
 
 func (s *session) whoAmI(ctx context.Context, homeserver, accessToken string) (string, string, error) {
 	if !validMASField(accessToken, maxMASOAuthFieldBytes) {
-		return "", "", fmt.Errorf("invalid access token")
+		return "", "", registrationfailure.Wrap(registrationfailure.StageIdentity, registrationfailure.Invariant(errors.New("invalid access token")))
 	}
 	if err := validateSameOrigin(s.baseURL, homeserver); err != nil {
-		return "", "", err
+		return "", "", registrationfailure.Wrap(registrationfailure.StageIdentity, registrationfailure.Invariant(err))
 	}
 	u, err := url.Parse(homeserver)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		return "", "", fmt.Errorf("invalid homeserver URL")
+		return "", "", registrationfailure.Wrap(registrationfailure.StageIdentity, registrationfailure.Invariant(errors.New("invalid homeserver URL")))
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + "/_matrix/client/v3/account/whoami"
 	u.RawQuery = ""
@@ -736,19 +742,19 @@ func (s *session) whoAmI(ctx context.Context, homeserver, accessToken string) (s
 	for attempt, delay := 0, 100*time.Millisecond; attempt < 6; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 		if err != nil {
-			return "", "", err
+			return "", "", registrationfailure.Wrap(registrationfailure.StageIdentity, registrationfailure.Invariant(err))
 		}
 		req.Header.Set("Authorization", "Bearer "+accessToken)
 		resp, err := s.publicClient().Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
-				return "", "", ctx.Err()
+				return "", "", registrationfailure.Wrap(registrationfailure.StageIdentity, ctx.Err())
 			}
 			if attempt == 5 {
-				return "", "", boundedMASRequestError(ctx, "identity transport after retries", err)
+				return "", "", registrationfailure.Wrap(registrationfailure.StageIdentity, boundedMASRequestError(ctx, "identity transport after retries", err))
 			}
 			if err := waitForContext(ctx, delay); err != nil {
-				return "", "", err
+				return "", "", registrationfailure.Wrap(registrationfailure.StageIdentity, err)
 			}
 			delay *= 2
 			continue
@@ -761,27 +767,28 @@ func (s *session) whoAmI(ctx context.Context, homeserver, accessToken string) (s
 			err := jsonbody.Decode(resp.Body, maxMASJSONBodyBytes, &out)
 			resp.Body.Close()
 			if err != nil {
-				return "", "", fmt.Errorf("decode identity response failed")
+				return "", "", registrationfailure.Wrap(registrationfailure.StageIdentity, registrationfailure.Protocol(errors.New("decode identity response failed")))
 			}
 			if !validMatrixUserID(out.UserID) || !validMatrixDeviceID(out.DeviceID) {
-				return "", "", fmt.Errorf("response is missing user_id or device_id")
+				return "", "", registrationfailure.Wrap(registrationfailure.StageIdentity, registrationfailure.Protocol(errors.New("response is missing user_id or device_id")))
 			}
 			return out.UserID, out.DeviceID, nil
 		}
 		if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < http.StatusInternalServerError {
 			err := unexpectedStatus(resp)
-			return "", "", err
+			resp.Body.Close()
+			return "", "", registrationfailure.Wrap(registrationfailure.StageIdentity, err)
 		}
 		resp.Body.Close()
 		if attempt == 5 {
-			return "", "", fmt.Errorf("identity was not ready after retries")
+			return "", "", registrationfailure.Wrap(registrationfailure.StageIdentity, registrationfailure.Upstream(errors.New("identity was not ready after retries")))
 		}
 		if err := waitForContext(ctx, delay); err != nil {
-			return "", "", err
+			return "", "", registrationfailure.Wrap(registrationfailure.StageIdentity, err)
 		}
 		delay *= 2
 	}
-	return "", "", fmt.Errorf("identity was not ready")
+	return "", "", registrationfailure.Wrap(registrationfailure.StageIdentity, registrationfailure.Upstream(errors.New("identity was not ready")))
 }
 
 func validMASField(value string, maxBytes int) bool {
@@ -921,27 +928,27 @@ func boundedMASRequestError(ctx context.Context, operation string, err error) er
 	}
 	for _, known := range boundedMASRequestErrors {
 		if errors.Is(err, known) {
-			return fmt.Errorf("%s: %w", operation, known)
+			return registrationfailure.Protocol(fmt.Errorf("%s: %w", operation, known))
 		}
 	}
-	return fmt.Errorf("%s failed", operation)
+	return registrationfailure.Transport(errors.New(operation + " failed"))
 }
 
 func unexpectedStatus(resp *http.Response) error {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxMASHTMLBodyBytes+1))
 	if err != nil {
-		return fmt.Errorf("read status response failed")
+		return registrationfailure.Transport(errors.New("read status response failed"))
 	}
 	if len(body) > maxMASHTMLBodyBytes {
-		return fmt.Errorf("unexpected status %d: response body too large", resp.StatusCode)
+		return registrationfailure.Protocol(errors.New("upstream status response body too large"))
 	}
-	return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, sniffError(body))
+	return registrationfailure.Upstream(errors.New("unexpected upstream status"))
 }
 
 func (c *session) getForm(ctx context.Context, target string) (csrf string, finalURL *url.URL, body []byte, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, registrationfailure.Invariant(err)
 	}
 	return c.do(req)
 }
@@ -949,7 +956,7 @@ func (c *session) getForm(ctx context.Context, target string) (csrf string, fina
 func (c *session) postForm(ctx context.Context, target string, form url.Values) (csrf string, finalURL *url.URL, body []byte, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, registrationfailure.Invariant(err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	return c.do(req)
@@ -966,31 +973,18 @@ func (c *session) do(req *http.Request) (csrf string, finalURL *url.URL, body []
 
 	body, err = io.ReadAll(io.LimitReader(resp.Body, maxMASHTMLBodyBytes+1))
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("read MAS form response failed")
+		return "", nil, nil, registrationfailure.Transport(errors.New("read MAS form response failed"))
 	}
 	if len(body) > maxMASHTMLBodyBytes {
-		return "", nil, nil, fmt.Errorf("MAS response body too large")
+		return "", nil, nil, registrationfailure.Protocol(errors.New("MAS response body too large"))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", nil, nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, sniffError(body))
+		return "", nil, nil, registrationfailure.Upstream(errors.New("unexpected MAS form status"))
 	}
 	if resp.Request == nil || resp.Request.URL == nil || !sameOriginURL(mustParseURL(c.baseURL), resp.Request.URL) ||
 		resp.Request.URL.User != nil || resp.Request.URL.RawQuery != "" || resp.Request.URL.ForceQuery ||
 		resp.Request.URL.Fragment != "" || resp.Request.URL.RawPath != "" {
-		return "", nil, nil, fmt.Errorf("MAS form landed at an unsafe URL")
+		return "", nil, nil, registrationfailure.Protocol(errors.New("MAS form landed at an unsafe URL"))
 	}
 	return extractCSRF(body), resp.Request.URL, body, nil
-}
-
-var formErrorRe = regexp.MustCompile(`text-critical[^>]*>\s*([^<]+)`)
-
-// sniffError classifies a MAS-rendered error page without returning upstream text. MAS's form
-// renderer normally places validation text in a text-critical element, but that text can include
-// user-controlled values or future sensitive fields. Keep the caller's error stable and bounded.
-func sniffError(body []byte) string {
-	m := formErrorRe.FindSubmatch(body)
-	if m == nil {
-		return "no error text found in response body"
-	}
-	return "upstream validation error"
 }
