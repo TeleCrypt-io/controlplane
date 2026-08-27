@@ -37,11 +37,10 @@ The Go image builder resolves the exact modules recorded in `go.mod` and `go.sum
 graph exports both the tested local archive and a run-scoped GHCR staging reference; the archive is
 loaded and smoke-tested before the version tag is created from the exact verified full-manifest digest.
 The release workflow records that digest, source commit, and annotated tag object in the canonical
-JSON asset. It separately attaches one build-provenance attestation to the exact GHCR image digest
-before publishing the Release. GitHub's immutable-release feature supplies a distinct release
-attestation covering the published tag and its two release assets. The workflow proves that a
-version tag is absent before creating it and refuses every pre-existing exact version tag; an
-existing exact immutable Release is reused only as a complete, independently verified release.
+JSON asset. The resulting GitHub Release is immutable and covers the published tag and its two
+release assets. The workflow proves that a version tag is absent before creating it and refuses
+every pre-existing exact version tag; an existing exact immutable Release is reused only as a
+complete, independently verified release.
 
 ## Repository layout
 

@@ -3,8 +3,8 @@
 Before creating a release, the operator verifies that GitHub immutable releases are enabled for
 the repository. The Actions token cannot read or change that repository Administration setting, so
 the workflow does not attempt to query or mutate it. An exact annotated release tag and its peeled
-commit are revalidated against `main` immediately before every externally visible publish or
-attestation operation.
+commit are revalidated against `main` immediately before every externally visible publication
+operation.
 
 Before any image build, the workflow enumerates bounded authenticated Releases-list pages and fully
 verifies an exact final immutable Release, including its source binding, registry digest, and both
@@ -18,14 +18,12 @@ and repeat the bounded verification. Final verification requires the tag, peeled
 commit, complete asset set, API asset digests and sizes, downloaded bytes, numeric Release ID, and
 `immutable: true` state. Any mismatch or ambiguous draft identity fails closed.
 
-GitHub's immutable-release feature supplies a release attestation for the published tag and its
-assets. Separately, the workflow attaches one build-provenance attestation to the exact registry
-image digest before the immutable Release is created, after its single-platform smoke checks; it
-does not maintain a second signing system.
+The resulting GitHub Release is immutable and contains the published tag and its exact release
+assets.
 
 `controlplane-<tag>.digest.json` binds, in deterministic key order, the image repository, release
-tag, source commit, annotated tag object, and canonical registry digest. GitHub's immutable-release
-attestation covers this asset and the separately tested tier-controller wheel. The Go image build
+tag, source commit, annotated tag object, and canonical registry digest. The immutable GitHub
+Release contains this asset and the separately tested tier-controller wheel. The Go image build
 exports a tested local archive and a run-scoped GHCR staging reference; the version tag is created
 only after runtime checks from that exact full manifest digest. A pre-existing exact image tag is
 never reused. Only a complete exact immutable Release, or a complete exact draft that is verified

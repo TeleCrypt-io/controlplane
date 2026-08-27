@@ -171,7 +171,7 @@ func TestHTTPCashierClientReturnsBusinessStatus(t *testing.T) {
 	}
 }
 
-func TestHTTPCashierClientRequiresExactMutationStatusAndEmptyBody(t *testing.T) {
+func TestHTTPCashierClientCreatePlanResponseContract(t *testing.T) {
 	_, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate Ed25519 key: %v", err)
@@ -182,9 +182,12 @@ func TestHTTPCashierClientRequiresExactMutationStatusAndEmptyBody(t *testing.T) 
 		body      string
 		wantError bool
 	}{
-		{name: "success", status: http.StatusNoContent},
+		{name: "created", status: http.StatusCreated},
+		{name: "idempotent replay", status: http.StatusNoContent},
 		{name: "wrong success status", status: http.StatusOK, wantError: true},
-		{name: "unexpected body", status: http.StatusNoContent, body: "unexpected", wantError: true},
+		{name: "unexpected status", status: http.StatusAccepted, wantError: true},
+		{name: "created with unexpected body", status: http.StatusCreated, body: "unexpected", wantError: true},
+		{name: "idempotent replay with unexpected body", status: http.StatusNoContent, body: "unexpected", wantError: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -207,6 +210,33 @@ func TestHTTPCashierClientRequiresExactMutationStatusAndEmptyBody(t *testing.T) 
 				t.Fatalf("CreatePlan error = %v, wantError = %t", err, tc.wantError)
 			}
 		})
+	}
+}
+
+func TestHTTPCashierClientOtherMutationsRejectCreateStatus(t *testing.T) {
+	_, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate Ed25519 key: %v", err)
+	}
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost || r.URL.Path != "/internal/v1/team/seats" {
+			t.Errorf("request = %s %s, want POST /internal/v1/team/seats", r.Method, r.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusCreated,
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     make(http.Header),
+			Request:    r,
+		}, nil
+	})}
+	client, err := NewHTTPCashierClient("http://cashier.example", base64.RawURLEncoding.EncodeToString(private), httpClient)
+	if err != nil {
+		t.Fatalf("new HTTP Cashier client: %v", err)
+	}
+	err = client.AttachSeat(t.Context(), Principal{MXID: "@alice:telecrypt.io"}, "b3987ed2-51a4-4b04-b5f5-b915683d0cf5", "@bot:telecrypt.io")
+	var cashierError *CashierError
+	if !errors.As(err, &cashierError) || cashierError.StatusCode != http.StatusCreated {
+		t.Fatalf("AttachSeat error = %#v, want CashierError 201", err)
 	}
 }
 
