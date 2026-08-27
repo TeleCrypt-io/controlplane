@@ -86,7 +86,7 @@ Janitor runs one single-flight sweep per invocation and reads Cashier-owned enti
 `JANITOR_DB_URL`, using a separate database credential from Cashier's `CASHIER_DB_URL`. The
 URL must use the exact profile database and Janitor role: `telecrypt.io` uses
 `telecrypt_billing` with `telecrypt_janitor_user`, while `stage.telecrypt.io` uses
-`telecrypt_billing_stage` with `telecrypt_janitor_stage_user`. No other host label is an active
+`stage_telecrypt_billing` with `stage_telecrypt_janitor_user`. No other host label is an active
 billing profile. The Janitor role is owner-precreated for the private
 `janitor` schema, is read-only on Cashier's private `cashier` schema, and has schema-owner DDL
 authority (including CREATE, ALTER, and DROP) only within that private `janitor` schema so the
@@ -96,7 +96,7 @@ the Janitor schema. Cashier's billing migration history remains private to the C
 Cashier grants it schema usage and read access to only the
 `janitor_deployment_identity` and `janitor_lock_exclusions` views.
 The private `cashier` schema and both read-side views must remain owned by the exact profile Cashier role
-(`telecrypt_cashier_user` for `telecrypt.io` or `telecrypt_cashier_stage_user` for
+(`telecrypt_cashier_user` for `telecrypt.io` or `stage_telecrypt_cashier_user` for
 `stage.telecrypt.io`);
 Cashier durably binds both `SERVER_NAME` and the explicit billing environment (`live` or `test`) in
 that identity row. Janitor rejects any server or billing-environment drift before it can sweep.

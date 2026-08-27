@@ -41,7 +41,7 @@ func setRequiredJanitorEnv(t *testing.T) {
 		"JANITOR_DRY_RUN":         "1",
 		"MAS_ADMIN_CLIENT_ID":     testJanitorClientID,
 		"MAS_ADMIN_CLIENT_SECRET": "secret",
-		"JANITOR_DB_URL":          "postgres://telecrypt_janitor_stage_user:secret@db/telecrypt_billing_stage",
+		"JANITOR_DB_URL":          "postgres://stage_telecrypt_janitor_user:secret@db/stage_telecrypt_billing",
 		"SERVER_NAME":             "stage.telecrypt.io",
 		"BILLING_ENVIRONMENT":     "test",
 		"SMTP_HOST":               "",
@@ -256,15 +256,15 @@ func TestLoadJanitorUsesExactDatabaseIdentity(t *testing.T) {
 	if got, want := cfg.MASAdminURL, "http://mas-admin:8081"; got != want {
 		t.Fatalf("MASAdminURL = %q, want %q", got, want)
 	}
-	if got, want := cfg.CashierDBRole, "telecrypt_cashier_stage_user"; got != want {
+	if got, want := cfg.CashierDBRole, "stage_telecrypt_cashier_user"; got != want {
 		t.Fatalf("CashierDBRole = %q, want %q", got, want)
 	}
 
-	t.Setenv("JANITOR_DB_URL", "postgres://wrong_user:secret@db/telecrypt_billing_stage")
+	t.Setenv("JANITOR_DB_URL", "postgres://wrong_user:secret@db/stage_telecrypt_billing")
 	if _, err := LoadJanitor(); err == nil || !strings.Contains(err.Error(), "JANITOR_DB_URL") {
 		t.Fatalf("LoadJanitor error = %v, want identity error", err)
 	}
-	t.Setenv("JANITOR_DB_URL", "postgres://telecrypt_janitor_stage:secret@db/wrong_database")
+	t.Setenv("JANITOR_DB_URL", "postgres://stage_telecrypt_janitor:secret@db/wrong_database")
 	if _, err := LoadJanitor(); err == nil || !strings.Contains(err.Error(), "JANITOR_DB_URL") {
 		t.Fatalf("LoadJanitor error = %v, want database error", err)
 	}
@@ -460,7 +460,7 @@ func TestRegistrationLoadRejectsUnprovisionedSubdomain(t *testing.T) {
 }
 
 func TestLoadJanitorRejectsUnsafeDatabaseQuery(t *testing.T) {
-	base := "postgres://telecrypt_janitor_stage_user:secret@db/telecrypt_billing_stage"
+	base := "postgres://stage_telecrypt_janitor_user:secret@db/stage_telecrypt_billing"
 	for _, query := range []string{
 		"host=other.example",
 		"hostaddr=127.0.0.1",
@@ -500,7 +500,7 @@ func TestLoadJanitorRejectsUnsafeDatabaseQuery(t *testing.T) {
 
 func TestLoadJanitorAllowsSafeDatabaseConnectionOptions(t *testing.T) {
 	setRequiredJanitorEnv(t)
-	t.Setenv("JANITOR_DB_URL", "postgres://telecrypt_janitor_stage_user:secret@db/telecrypt_billing_stage?sslmode=require&connect_timeout=5&application_name=janitor-sweep")
+	t.Setenv("JANITOR_DB_URL", "postgres://stage_telecrypt_janitor_user:secret@db/stage_telecrypt_billing?sslmode=require&connect_timeout=5&application_name=janitor-sweep")
 	if _, err := LoadJanitor(); err != nil {
 		t.Fatalf("LoadJanitor rejected safe query options: %v", err)
 	}

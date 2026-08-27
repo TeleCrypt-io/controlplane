@@ -416,7 +416,7 @@ func expectedJanitorDatabaseIdentity(serverName string) (string, string, error) 
 	case "telecrypt.io":
 		return "telecrypt_billing", "telecrypt_janitor_user", nil
 	case "stage.telecrypt.io":
-		return "telecrypt_billing_stage", "telecrypt_janitor_stage_user", nil
+		return "stage_telecrypt_billing", "stage_telecrypt_janitor_user", nil
 	default:
 		return "", "", fmt.Errorf("SERVER_NAME must be telecrypt.io or stage.telecrypt.io for Janitor")
 	}
@@ -427,7 +427,7 @@ func expectedCashierDatabaseRole(serverName string) (string, error) {
 	case "telecrypt.io":
 		return "telecrypt_cashier_user", nil
 	case "stage.telecrypt.io":
-		return "telecrypt_cashier_stage_user", nil
+		return "stage_telecrypt_cashier_user", nil
 	default:
 		return "", fmt.Errorf("SERVER_NAME must be telecrypt.io or stage.telecrypt.io for Janitor")
 	}
