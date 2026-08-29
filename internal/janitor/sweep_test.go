@@ -176,6 +176,55 @@ func TestSweepLiveLocksEligibleUserWithoutUnlockSurface(t *testing.T) {
 	}
 }
 
+func TestSweepExcludesFixedMASServiceIdentityOnSupportedServers(t *testing.T) {
+	for _, tc := range []struct {
+		name, server, billing string
+		dryRun                bool
+	}{
+		{name: "live", server: "telecrypt.io", billing: "live"},
+		{name: "stage test", server: testServerName, billing: "test", dryRun: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service := staleUser(testID(1), "cashier-admin")
+			human := staleUser(testID(2), "alice")
+			similarlyNamed := staleUser(testID(3), "cashier-admin-helper")
+			mas := &fakeMAS{users: []masadmin.User{service, human, similarlyNamed}}
+			store := &fakeStore{exclusions: map[string]struct{}{}}
+			cfg := Config{ServerName: tc.server, BillingEnvironment: tc.billing, DryRun: tc.dryRun, OwnerEmail: "owner@example.test"}
+
+			if err := NewSweeper(mas, store, &fakeMailer{}, cfg).Sweep(context.Background()); err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if service.LockedAt != nil || mas.users[0].LockedAt != nil {
+				t.Fatal("fixed cashier-admin service identity was locked")
+			}
+			if tc.dryRun {
+				if mas.getUserCalls != 2 || mas.emailChecks != 2 {
+					t.Fatalf("dry-run MAS candidate calls = (get=%d, email=%d), want human accounts only", mas.getUserCalls, mas.emailChecks)
+				}
+			} else if mas.getUserCalls != 4 || mas.emailChecks != 4 {
+				t.Fatalf("live MAS candidate calls = (get=%d, email=%d), want human accounts only", mas.getUserCalls, mas.emailChecks)
+			}
+			finished := store.events[1]
+			if got, want := finished.LockedOrWouldLock, int64(2); got != want {
+				t.Fatalf("locked-or-would-lock = %d, want %d human accounts", got, want)
+			}
+			if tc.dryRun {
+				if mas.lockCalls != 0 {
+					t.Fatalf("dry-run called MAS lock %d times", mas.lockCalls)
+				}
+				return
+			}
+			if mas.lockCalls != 2 {
+				t.Fatalf("MAS lock calls = %d, want two human accounts", mas.lockCalls)
+			}
+			if mas.users[1].LockedAt == nil || mas.users[2].LockedAt == nil {
+				t.Fatal("eligible human accounts were not locked")
+			}
+		})
+	}
+}
+
 func TestSweepEntitlementViewFailurePreventsMASEnumeration(t *testing.T) {
 	mas := &fakeMAS{}
 	store := &fakeStore{viewErr: errors.New("private view unavailable")}

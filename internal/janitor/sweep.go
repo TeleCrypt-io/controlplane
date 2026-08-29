@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	lockAfter           = 48 * time.Hour
-	maxDigestCandidates = 10_000
-	maxDigestBodyBytes  = 1 << 20
-	auditCleanupTimeout = 2 * time.Second
+	lockAfter             = 48 * time.Hour
+	cashierAdminLocalpart = "cashier-admin"
+	maxDigestCandidates   = 10_000
+	maxDigestBodyBytes    = 1 << 20
+	auditCleanupTimeout   = 2 * time.Second
 )
 
 type Config struct {
@@ -262,6 +263,13 @@ func (s *Sweeper) sweepLocks(ctx context.Context, users []masadmin.User, exclusi
 			state.skipped++
 			state.fail("mas", "candidate_recheck")
 			return fmt.Errorf("janitor: MAS candidate identity is invalid")
+		}
+		// This fixed MAS service identity is not a human or test account. Keep the
+		// exclusion local and unconditional rather than manufacturing an email or
+		// paid-entitlement projection for it.
+		if snapshot.Username == cashierAdminLocalpart {
+			state.skipped++
+			continue
 		}
 		if snapshot.LockedAt != nil || snapshot.DeactivatedAt != nil || !snapshot.CreatedAt.Before(cutoff) {
 			state.skipped++
