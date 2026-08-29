@@ -55,11 +55,17 @@ async function checkout(e) {
 }
 
 async function openPortal() {
-  const r = await command("/api/plan/portal", { method: "POST" });
-  if (!r.ok) { alert(await r.text()); return; }
+  // Open while the click still carries browser user activation. Waiting for the portal-session
+  // request first lets browsers classify the later window.open as an unsolicited popup.
+  const portal = window.open("about:blank", "_blank");
+  if (!portal) { alert("The customer portal window was blocked."); return; }
   try {
-    window.open(await responseLink(r, "link"), "_blank", "noopener,noreferrer");
+    portal.opener = null;
+    const r = await command("/api/plan/portal", { method: "POST" });
+    if (!r.ok) { portal.close(); alert(await r.text()); return; }
+    portal.location.replace(await responseLink(r, "link"));
   } catch (error) {
+    portal.close();
     alert(error.message);
   }
 }

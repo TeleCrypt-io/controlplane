@@ -357,6 +357,33 @@ func TestPlanAssetsAreLocalAndCarryCommandContract(t *testing.T) {
 	}
 }
 
+func TestPlanCustomerPortalWindowPrecedesAsyncSessionRequest(t *testing.T) {
+	srv := testServer()
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/plan/assets/plan.js", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("plan JavaScript status = %d", rec.Code)
+	}
+	source := rec.Body.String()
+	open := strings.Index(source, `window.open("about:blank", "_blank")`)
+	request := strings.Index(source, `await command("/api/plan/portal"`)
+	if open < 0 || request < 0 || open >= request {
+		t.Fatal("customer portal window must open synchronously before the session request")
+	}
+	for _, marker := range []string{
+		"portal.opener = null",
+		"portal.location.replace(await responseLink(r, \"link\"))",
+		"portal.close()",
+	} {
+		if !strings.Contains(source, marker) {
+			t.Fatalf("customer portal script is missing %q", marker)
+		}
+	}
+	if strings.Contains(source, "window.open(await responseLink") {
+		t.Fatal("customer portal window is still opened after the asynchronous session request")
+	}
+}
+
 func TestPlanSharedUIAssetMatchesProvenance(t *testing.T) {
 	var provenance struct {
 		Version          string `json:"version"`
