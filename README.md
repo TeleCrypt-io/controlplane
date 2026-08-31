@@ -59,8 +59,8 @@ signed to the private Cashier service, which alone handles checkout, payment web
 mutation, and Dodo customer portal links.
 
 The two test profiles, `telecrypt.io` with `BILLING_ENVIRONMENT=test` during the temporary
-pre-launch acceptance and `stage.telecrypt.io` with `BILLING_ENVIRONMENT=test` after the owner
-creates the isolated stage environment, visibly render `TEST / SANDBOX — no real charges` on every
+pre-launch acceptance and `stage.telecrypt.io` with `BILLING_ENVIRONMENT=test` after the isolated
+stage environment is activated, visibly render `TEST / SANDBOX — no real charges` on every
 Plan page. The later `telecrypt.io` with `BILLING_ENVIRONMENT=live` profile never renders that
 banner. Payment card data is entered only on the Dodo-hosted checkout or customer-portal page,
 never at TeleCrypt.
